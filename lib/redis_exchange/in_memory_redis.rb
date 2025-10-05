@@ -65,6 +65,17 @@ module RedisExchange
       store[field.to_s].to_i
     end
 
+    def hdel(key, *fields)
+      store = hash_value(key)
+      return 0 unless store
+
+      removed = 0
+      fields.flatten.each do |field|
+        removed += 1 if store.delete(field.to_s)
+      end
+      removed
+    end
+
     def lrange(key, start, stop)
       list = list_value(key)
       return [] unless list
@@ -95,33 +106,58 @@ module RedisExchange
       list.shift
     end
 
+    def lrem(key, count, value)
+      list = list_value(key)
+      return 0 unless list
+
+      removed = 0
+      if count.zero?
+        list.delete_if do |item|
+          if item == value
+            removed += 1
+            true
+          else
+            false
+          end
+        end
+      elsif count.positive?
+        list.each_index do |idx|
+          break if removed >= count
+          next unless list[idx] == value
+
+          list[idx] = nil
+          removed += 1
+        end
+        list.compact!
+      else # count negative removes from tail
+        reverse = list.reverse
+        reverse.each_index do |idx|
+          break if removed >= count.abs
+          next unless reverse[idx] == value
+
+          reverse[idx] = nil
+          removed += 1
+        end
+        list.replace(reverse.reverse.compact)
+      end
+
+      removed
+    end
+
     def llen(key)
       list_value(key)&.length.to_i
+    end
+
+    def keys(pattern = '*')
+      regex = glob_to_regex(pattern)
+      @data.keys.select { |key| regex.match?(key) }
     end
 
     def register_script(_source)
       MatchingScript.new(self)
     end
 
-    # Convenience helpers for storing structured order data.
-    def fetch_order(order_id)
-      payload = @data[order_key(order_id)]
-      payload && JSON.parse(payload[:value])
-    end
-
-    def store_order(order_id, attributes)
-      set(order_key(order_id), JSON.generate(attributes))
-    end
-
-    def delete_order(order_id)
-      @data.delete(order_key(order_id))
-    end
-
     private
-
-    def order_key(order_id)
-      "order:#{order_id}"
-    end
 
     def ensure_hash(key)
       entry = @data[key]
@@ -157,6 +193,22 @@ module RedisExchange
       return length + index if index.negative?
 
       index
+    end
+
+    def glob_to_regex(pattern)
+      escaped = pattern.chars.map do |char|
+        case char
+        when '*'
+          '.*'
+        when '?'
+          '.'
+        when '.'
+          '\\.'
+        else
+          Regexp.escape(char)
+        end
+      end.join
+      Regexp.new("^#{escaped}$")
     end
 
     # Script wrapper used by the client when fakeredis is unavailable.

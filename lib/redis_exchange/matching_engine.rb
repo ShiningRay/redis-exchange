@@ -42,7 +42,7 @@ module RedisExchange
       return error_result('UNKNOWN_MARKET') if market.empty?
       return error_result('MARKET_HALTED') if market['status'] && market['status'] != 'OPEN'
 
-      existing_order = @redis.fetch_order(order_id)
+      existing_order = load_order(order_id)
       return error_result('DUPLICATE_ORDER_ID') if active_order?(existing_order)
 
       return error_result('INVALID_SIDE') unless %w[BUY SELL].include?(side)
@@ -190,7 +190,7 @@ module RedisExchange
         level_price = level[:price]
         break if price_limit.positive? && ((side == 'BUY' && level_price > price_limit) || (side == 'SELL' && level_price < price_limit))
 
-        order = @redis.fetch_order(level[:order_id])
+        order = load_order(level[:order_id])
         break unless order
 
         current_remaining = order_remaining(order)
@@ -207,13 +207,13 @@ module RedisExchange
         order['remaining'] = current_remaining - match_quantity
 
         if order['remaining'] <= 0
-          @redis.delete_order(order['order_id'])
+          delete_order(order['order_id'])
           @redis.lpop(queue_key(symbol, opposite_side, level_price))
-          @redis.hset(volume_key(symbol, opposite_side), level_price.to_s => '0')
+          @redis.hset(volume_key(symbol, opposite_side), level_price.to_s, '0')
         else
           order['status'] = 'PARTIALLY_FILLED'
-          @redis.store_order(order['order_id'], order)
-          @redis.hset(volume_key(symbol, opposite_side), level_price.to_s => order['remaining'].to_s)
+          write_order(order['order_id'], order)
+          @redis.hset(volume_key(symbol, opposite_side), level_price.to_s, order['remaining'].to_s)
         end
 
         trades << {
@@ -313,7 +313,7 @@ module RedisExchange
         'status' => status,
         'created_at' => created_at
       }
-      @redis.store_order(order_id, payload)
+      write_order(order_id, payload)
     end
 
     def queue_key(symbol, side, price)
@@ -322,6 +322,10 @@ module RedisExchange
 
     def volume_key(symbol, side)
       "volume:#{symbol}:#{side}"
+    end
+
+    def order_key(order_id)
+      "order:#{order_id}"
     end
 
     def best_price(symbol, side, order)
@@ -382,9 +386,9 @@ module RedisExchange
                                    end
 
       payload = TICKER_FIELDS.to_h do |field|
-        [field, snapshot[field.to_sym].to_i.to_s]
+        [field, snapshot[field.to_sym].to_i]
       end
-      @redis.hset(ticker_key, payload)
+      write_hash(ticker_key, payload)
     end
 
     def order_remaining(order)
@@ -400,6 +404,64 @@ module RedisExchange
       status = order['status']
       remaining = order_remaining(order)
       remaining.positive? || %w[OPEN PARTIALLY_FILLED].include?(status)
+    end
+
+    def write_hash(key, mapping)
+      return if mapping.nil? || mapping.empty?
+
+      if @redis.respond_to?(:hset)
+        mapping.each do |field, value|
+          @redis.hset(key, field.to_s, value.to_s)
+        end
+      elsif @redis.respond_to?(:mapped_hmset)
+        @redis.mapped_hmset(key, mapping.transform_keys(&:to_s).transform_values(&:to_s))
+      elsif @redis.respond_to?(:hmset)
+        args = mapping.flat_map { |field, value| [field.to_s, value.to_s] }
+        @redis.hmset(key, *args)
+      end
+    end
+
+    def write_order(order_id, attributes)
+      write_hash(order_key(order_id), attributes)
+    end
+
+    def load_order(order_id)
+      key = order_key(order_id)
+
+      if @redis.respond_to?(:hgetall)
+        data = @redis.hgetall(key)
+        order = normalize_order(data, order_id)
+        return order unless order.empty?
+      end
+
+      if @redis.respond_to?(:get)
+        raw = @redis.get(key)
+        if raw
+          data = JSON.parse(raw)
+          order = normalize_order(data, order_id)
+          return order unless order.empty?
+        end
+      end
+
+      {}
+    end
+
+    def delete_order(order_id)
+      key = order_key(order_id)
+      if @redis.respond_to?(:del)
+        @redis.del(key)
+      end
+    end
+
+    def normalize_order(order, order_id)
+      return {} unless order.is_a?(Hash) && !order.empty?
+
+      normalized = {}
+      order.each do |key, value|
+        normalized[key.to_s] = value.nil? ? nil : value.to_s
+      end
+      normalized['order_id'] ||= order_id
+      normalized
     end
 
     def integer_field(value, fallback: 0)

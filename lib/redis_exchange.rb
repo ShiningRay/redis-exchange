@@ -47,9 +47,14 @@ module RedisExchange
       @redis = redis
       @engine = MatchingEngine.new(@redis)
 
-      path = script_path || default_script_path
-      @lua_source = File.exist?(path) ? File.read(path) : nil
-      @script = register_script(@lua_source)
+      match_script_path = script_path || default_script_path
+      @match_script = register_script(read_script(match_script_path))
+
+      cancel_path = File.expand_path('../redis_scripts/cancel_order.lua', __dir__)
+      @cancel_script = register_script(read_script(cancel_path))
+
+      cancel_all_path = File.expand_path('../redis_scripts/cancel_all_orders.lua', __dir__)
+      @cancel_all_script = register_script(read_script(cancel_all_path))
     end
 
     # Submit a limit order and return the Redis/Lua response hash.
@@ -136,6 +141,34 @@ module RedisExchange
       @redis.hset(key, mapping)
     end
 
+    # Fetch all balance fields for a user as integers keyed by symbols.
+    # @param user_id [String]
+    # @return [Hash{Symbol=>Integer}]
+    def balances(user_id)
+      raw = @redis.hgetall("balance:#{user_id}")
+      raw.each_with_object({}) do |(field, value), result|
+        result[field.to_sym] = value.to_i
+      end
+    end
+
+    # Cancel a resting order and release any reserved balances.
+    # Returns a status hash mirroring Lua responses.
+    def cancel_order(order_id)
+      payload = { keys: ["order:#{order_id}"], argv: [order_id] }
+      raw = call_script(@cancel_script, payload)
+      return JSON.parse(raw) if raw
+
+      cancel_order_fallback(order_id)
+    end
+
+    def cancel_all_orders(user_id)
+      payload = { keys: [], argv: [user_id] }
+      raw = call_script(@cancel_all_script, payload)
+      return JSON.parse(raw) if raw
+
+      cancel_all_orders_fallback(user_id)
+    end
+
     # Remove book, volume, sequence, trades, and ticker keys for tests.
     def clear_books(symbol)
       keys = [
@@ -148,6 +181,17 @@ module RedisExchange
         "ticker:#{symbol}"
       ]
       @redis.del(*keys)
+    end
+
+    # Snapshot the current book depth for both sides.
+    # @param limit [Integer,nil] maximum number of price levels per side
+    # @return [Hash{Symbol=>Array<Hash{Symbol=>Integer}>}]
+    def order_book(symbol, limit: nil)
+      limit = limit&.to_i
+      {
+        bids: fetch_book_side(symbol, 'BUY', descending: true, limit: limit),
+        asks: fetch_book_side(symbol, 'SELL', descending: false, limit: limit)
+      }
     end
 
     private
@@ -185,11 +229,8 @@ module RedisExchange
         ]
       }
 
-      raw = if @script
-              @script.call(**script_payload)
-            else
-              JSON.generate(@engine.process_keys_and_args(**script_payload))
-            end
+      raw = execute_via_match_script(script_payload)
+      raw ||= JSON.generate(@engine.process_keys_and_args(**script_payload))
       JSON.parse(raw)
     end
 
@@ -222,6 +263,198 @@ module RedisExchange
       return nil unless @redis.respond_to?(:register_script)
 
       @redis.register_script(lua_source)
+    rescue StandardError
+      puts "Error registering script: #{$ERROR_INFO}"
+      nil
+    end
+
+    def execute_via_match_script(script_payload)
+      call_script(@match_script, script_payload)
+    end
+
+    def read_script(path)
+      return nil unless path && File.exist?(path)
+
+      File.read(path)
+    end
+
+    def call_script(script, payload)
+      return nil unless script
+
+      script.call(@redis, **payload)
+    rescue StandardError
+      nil
+    end
+
+    def cancel_order_fallback(order_id)
+      order_key = "order:#{order_id}"
+      order = @redis.hgetall(order_key)
+      return { 'status' => 'NOT_FOUND', 'order_id' => order_id } if order.empty?
+
+      remaining = order['remaining'].to_i
+      status = order['status'] || 'UNKNOWN'
+      return { 'status' => status, 'order_id' => order_id, 'symbol' => order['symbol'] } if remaining <= 0
+
+      symbol = order['symbol']
+      side = order['side']
+      price = order['price'].to_i
+      user_id = order['user_id']
+
+      market = @redis.hgetall("market:#{symbol}")
+      raise ArgumentError, 'unknown market' if market.empty?
+
+      release_reserved_funds(market: market, side: side, user_id: user_id, price: price, remaining: remaining)
+      remove_from_order_book(symbol: symbol, side: side, price: price, order_id: order_id, quantity: remaining)
+      update_order_status(order_key, remaining: 0, status: 'CANCELLED')
+      refresh_ticker_snapshot(symbol)
+
+      {
+        'status' => 'CANCELLED',
+        'order_id' => order_id,
+        'symbol' => symbol,
+        'remaining_quantity' => 0
+      }
+    end
+
+    def cancel_all_orders_fallback(user_id)
+      results = []
+      collect_order_keys.each do |order_key|
+        next unless @redis.hget(order_key, 'user_id') == user_id
+        status = @redis.hget(order_key, 'status')
+        next if status && !%w[OPEN PARTIALLY_FILLED].include?(status)
+
+        order_id = order_key.split(':', 2).last
+        result = cancel_order_fallback(order_id)
+        results << result if result['status'] == 'CANCELLED'
+      end
+      results
+    end
+
+    def collect_order_keys
+      collect_keys('order:*')
+    end
+
+    def collect_queue_keys(symbol, side)
+      collect_keys("queue:#{symbol}:#{side}:*")
+    end
+
+    def collect_keys(pattern)
+      if @redis.respond_to?(:scan)
+        cursor = '0'
+        keys = []
+        loop do
+          scan_result = @redis.scan(cursor, match: pattern, count: 200)
+          cursor = scan_result[0]
+          keys.concat(Array(scan_result[1]))
+          break if cursor == '0'
+        end
+        keys
+      elsif @redis.respond_to?(:keys)
+        Array(@redis.keys(pattern))
+      else
+        []
+      end
+    end
+
+    def fetch_book_side(symbol, side, descending:, limit:)
+      if supports_sorted_book?
+        return fetch_sorted_book_side(symbol, side, descending: descending, limit: limit)
+      end
+
+      queue_keys = collect_queue_keys(symbol, side)
+      entries = queue_keys.map do |key|
+        price = key.split(':').last
+        {
+          price: price.to_i,
+          volume: @redis.hget("volume:#{symbol}:#{side}", price).to_i
+        }
+      end
+      entries.select! { |row| row[:volume].positive? }
+      entries.sort_by! { |row| descending ? -row[:price] : row[:price] }
+      limit ? entries.first(limit) : entries
+    end
+
+    def supports_sorted_book?
+      @redis.respond_to?(:zrange) && @redis.respond_to?(:zrevrange)
+    end
+
+    def fetch_sorted_book_side(symbol, side, descending:, limit:)
+      book_key = "book:#{symbol}:#{side}"
+      volume_key = "volume:#{symbol}:#{side}"
+
+      range_method = descending ? :zrevrange : :zrange
+      args = [book_key, 0, limit ? limit - 1 : -1, { withscores: true }]
+      raw = @redis.public_send(range_method, *args)
+      list = Array(raw).each_slice(2).map do |member, score|
+        price_str = member.to_s
+        {
+          price: price_str.to_i,
+          volume: @redis.hget(volume_key, price_str).to_i,
+          score: score.to_f
+        }
+      end
+      list.select! { |row| row[:volume].positive? }
+      limit ? list.first(limit) : list
+    end
+    def release_reserved_funds(market:, side:, user_id:, price:, remaining:)
+      base_asset = market['base_asset']
+      quote_asset = market['quote_asset']
+      quantity_scale = [(market['quantity_scale'] || '1').to_i, 1].max
+      maker_fee_bps = (market['maker_fee_bps'] || '0').to_i
+      balance_key = "balance:#{user_id}"
+
+      if side == 'SELL'
+        @redis.hincrby(balance_key, "#{base_asset}:reserved", -remaining)
+        @redis.hincrby(balance_key, "#{base_asset}:available", remaining)
+      else
+        notional = (price * remaining) / quantity_scale
+        fee = (notional * maker_fee_bps) / 10_000
+        total = notional + fee
+        @redis.hincrby(balance_key, "#{quote_asset}:reserved", -total)
+        @redis.hincrby(balance_key, "#{quote_asset}:available", total)
+      end
+    end
+
+    def remove_from_order_book(symbol:, side:, price:, order_id:, quantity:)
+      queue_key = "queue:#{symbol}:#{side}:#{price}"
+      prune_queue(queue_key, order_id)
+
+      volume_key = "volume:#{symbol}:#{side}"
+      remaining_volume = @redis.hincrby(volume_key, price.to_s, -quantity)
+      if remaining_volume <= 0
+        @redis.hdel(volume_key, price.to_s) if @redis.respond_to?(:hdel)
+        @redis.del(queue_key)
+
+        book_key = side == 'BUY' ? "book:#{symbol}:BUY" : "book:#{symbol}:SELL"
+        @redis.zrem(book_key, price.to_s) if @redis.respond_to?(:zrem)
+      end
+    end
+
+    def prune_queue(queue_key, order_id)
+      if @redis.respond_to?(:lrem)
+        @redis.lrem(queue_key, 0, order_id)
+      else
+        entries = @redis.lrange(queue_key, 0, -1) || []
+        filtered = entries.reject { |entry| entry == order_id }
+        return if filtered == entries
+
+        @redis.del(queue_key)
+        filtered.each { |entry| @redis.rpush(queue_key, entry) }
+      end
+    end
+
+    def update_order_status(order_key, remaining:, status:)
+      fields = { 'remaining' => remaining.to_s, 'status' => status }
+      if @redis.respond_to?(:hset)
+        @redis.hset(order_key, fields)
+      else
+        current = @redis.hgetall(order_key)
+        @redis.hset(order_key, current.merge(fields))
+      end
+    end
+
+    def refresh_ticker_snapshot(symbol)
+      @engine.send(:refresh_ticker, symbol, last_trade: nil)
     rescue StandardError
       nil
     end

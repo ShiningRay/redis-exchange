@@ -5,7 +5,8 @@ Redis Exchange is a Ruby gem that bundles a Redis-backed central limit order boo
 ## Features
 
 - Lua matching engine stored in `redis_scripts/match_order.lua`
-- Ruby client (`RedisExchange::Client`) for seeding markets, managing balances, submitting limit/market orders, and querying tickers
+- Atomic cancellation scripts for single orders (`redis_scripts/cancel_order.lua`) and bulk user cancellations (`redis_scripts/cancel_all_orders.lua`)
+- Ruby client (`RedisExchange::Client`) for seeding markets, managing balances, submitting limit/market orders, cancelling orders, and querying tickers
 - Per-market ticker hash exposing last trade plus top-of-book bid/ask
 - RSpec suite covering core behaviours (resting limit orders, market order execution)
 - Documentation of Redis data layout in [`docs/architecture.md`](docs/architecture.md)
@@ -59,6 +60,17 @@ exchange.place_limit_order(
   quantity: 100_000_000
 )
 
+# Later Bob can cancel the resting order and release his BTC:
+exchange.cancel_order('sell-1')
+
+# Cancel every open order for Bob in one shot:
+cancellations = exchange.cancel_all_orders('bob')
+# => array of hashes describing each cancelled order
+
+# Inspect the current order book snapshot (bids and asks arrays):
+book = exchange.order_book('BTCUSDT', limit: 5)
+pp book
+
 # Alice crosses the book with a market buy capped at 31,000 USDT.
 response = exchange.place_market_order(
   symbol: 'BTCUSDT',
@@ -85,6 +97,21 @@ Ensure Redis 6+ is running locally. Install gem dependencies and run specs:
 bundle install
 bundle exec rspec
 ```
+
+## Benchmarking
+
+Run the provided script to gauge Lua matching throughput. The script seeds a sell book and executes BUY market orders while reporting runtime and derived orders-per-second metrics. By default it uses the in-memory Redis shim; specify `--redis-url` (or set `BENCH_REDIS_URL`) to target a real instance. **Warning:** the chosen database is flushed before each run.
+
+```bash
+# In-memory benchmark with smaller order counts
+ruby script/benchmark_matching.rb --resting=1_000 --taker=1_000 --quantity=100_000
+
+# Against a specific Redis host
+BENCH_REDIS_URL=redis://127.0.0.1:6379/15 \
+  ruby script/benchmark_matching.rb --resting=10_000 --taker=10_000 --price=3_000_000
+```
+
+The script prints total time and computed orders/sec. Tune `--price`, `--quantity`, or `--symbol` to match your production scales.
 
 ## Numeric Precision
 

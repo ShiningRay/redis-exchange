@@ -101,20 +101,22 @@ client.set_balance(user_id: 'maker', asset: 'BTC', available: quantity * resting
 client.set_balance(user_id: 'taker', asset: 'USDT', available: price * taker_orders * 2)
 
 puts "[benchmark] Seeding #{resting_orders} resting sell limit orders..."
-resting_orders.times do |i|
-  client.place_limit_order(
-    symbol: symbol,
-    side: 'SELL',
-    order_id: "rest-#{i}",
-    user_id: 'maker',
-    price: price,
-    quantity: quantity
-  )
+resting_timing = Benchmark.measure do
+  resting_orders.times do |i|
+    client.place_limit_order(
+      symbol: symbol,
+      side: 'SELL',
+      order_id: "rest-#{i}",
+      user_id: 'maker',
+      price: price,
+      quantity: quantity
+    )
+  end
 end
 
 puts "[benchmark] Executing #{taker_orders} taker market buy orders..."
 
-timing = Benchmark.measure do
+matching_timing = Benchmark.measure do
   taker_orders.times do |i|
     client.place_market_order(
       symbol: symbol,
@@ -127,8 +129,10 @@ timing = Benchmark.measure do
   end
 end
 
-ops = taker_orders.to_f / timing.real
-puts format('[benchmark] Total time: %.4fs', timing.real)
-puts format('[benchmark] Throughput: %.2f orders/sec', ops)
+placement_rate = resting_orders.to_f / resting_timing.real
+matching_rate = taker_orders.to_f / matching_timing.real
+
+puts format('[benchmark] Placement time: %.4fs (%.2f orders/sec)', resting_timing.real, placement_rate)
+puts format('[benchmark] Matching time: %.4fs (%.2f orders/sec)', matching_timing.real, matching_rate)
 
 redis.close if redis.respond_to?(:close)
