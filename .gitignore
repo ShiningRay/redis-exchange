@@ -1,0 +1,11 @@
+/.bundle/
+/vendor/bundle/
+/coverage/
+/tmp/
+/log/
+/pkg/
+*.log
+*.tmp
+*.swp
+.env
+.DS_Store
