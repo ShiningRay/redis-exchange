@@ -25,7 +25,8 @@ Returns a JSON blob describing execution outcome or an error code.
 The ticker hash (`ticker:{symbol}`) is also refreshed with last trade and top-of-book data.
 ]]
 
-local cjson = require('cjson.safe')
+-- Redis Lua environment provides global `cjson`; no `require` is allowed.
+local cjson = cjson
 
 -- Convert a flat array (HGETALL result) into a key/value table.
 local function to_map(array)
@@ -139,11 +140,22 @@ local min_notional = tonumber(market['min_notional'] or '0')
 local maker_fee_bps = tonumber(market['maker_fee_bps'] or '0')
 local taker_fee_bps = tonumber(market['taker_fee_bps'] or '0')
 
+-- Precision guard: Lua uses 64-bit double; keep intermediates below ~9e15
+local PRECISION_BOUND = 9000000000000000 -- ~9e15
+local function would_overflow_mul(a, b)
+  -- both a,b are integers represented in double; compare against bound
+  -- allow product equal to bound, overflow only when strictly greater
+  return (a > 0 and b > 0) and (a >= PRECISION_BOUND or b >= PRECISION_BOUND or (a * b) > PRECISION_BOUND)
+end
+
 if quantity < min_qty then
   return cjson.encode({ error = 'MIN_QTY_NOT_SATISFIED' })
 end
 
 if order_type == 'LIMIT' then
+  if has_price_limit and would_overflow_mul(price_limit, quantity) then
+    return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+  end
   local notional = math.floor((price_limit * quantity) / quantity_scale)
   if notional < min_notional then
     return cjson.encode({ error = 'MIN_NOTIONAL_NOT_SATISFIED' })
@@ -163,6 +175,9 @@ local taker_reserved_quote = as_number(redis.call('HGET', taker_balance_key, quo
 local taker_available_base_after = taker_available_base
 local taker_available_quote_after = taker_available_quote
 
+if has_price_limit and would_overflow_mul(price_limit, quantity) then
+  return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+end
 local max_quote_needed = math.floor((price_limit * quantity) / quantity_scale)
 local taker_fee_estimate = math.floor((max_quote_needed * taker_fee_bps) / 10000)
 local maker_fee_estimate = math.floor((max_quote_needed * maker_fee_bps) / 10000)
@@ -289,117 +304,128 @@ while remaining > 0 do
 
   local queue_key = 'queue:' .. symbol .. ':' .. opposite_side .. ':' .. price_member
   local maker_order_id = redis.call('LINDEX', queue_key, 0)
-  if not maker_order_id then
-    pop_empty_price_level(opposite_book_key, opposite_volume_key, queue_key, price_member)
-    goto continue
-  end
 
-  local maker_order_key = 'order:' .. maker_order_id
-  local maker_order = load_order_map(maker_order_key)
-  if next(maker_order) == nil then
-    redis.call('LPOP', queue_key)
-    pop_empty_price_level(opposite_book_key, opposite_volume_key, queue_key, price_member)
-    goto continue
-  end
-
-  local maker_remaining = tonumber(maker_order['remaining'] or '0')
-  if maker_remaining <= 0 then
-    redis.call('LPOP', queue_key)
-    pop_empty_price_level(opposite_book_key, opposite_volume_key, queue_key, price_member)
-    goto continue
-  end
-
-  local trade_qty = remaining
-  if maker_remaining < trade_qty then
-    trade_qty = maker_remaining
-  end
-
-  local trade_price = tonumber(maker_order['price'] or level_price)
-  local trade_quote = math.floor((trade_price * trade_qty) / quantity_scale)
-  local maker_side = maker_order['side']
-  local maker_user_id = maker_order['user_id']
-
-  local taker_fee = math.floor((trade_quote * taker_fee_bps) / 10000)
-  local maker_fee = math.floor((trade_quote * maker_fee_bps) / 10000)
-
-  if is_buy then
-    local debit = trade_quote + taker_fee
-    if taker_available_quote_after < debit then
-      return cjson.encode({ error = 'INSUFFICIENT_FUNDS_DURING_MATCH', asset = quote_asset })
+  repeat
+    if not maker_order_id then
+      pop_empty_price_level(opposite_book_key, opposite_volume_key, queue_key, price_member)
+      break
     end
-    taker_available_quote_after = taker_available_quote_after - debit
-    hincrby(taker_balance_key, quote_available_field, -debit)
-    hincrby(taker_balance_key, base_available_field, trade_qty)
-    taker_quote_spent = taker_quote_spent + debit
-    taker_base_received = taker_base_received + trade_qty
-  else
-    if taker_available_base_after < trade_qty then
-      return cjson.encode({ error = 'INSUFFICIENT_FUNDS_DURING_MATCH', asset = base_asset })
+
+    local maker_order_key = 'order:' .. maker_order_id
+    local maker_order = load_order_map(maker_order_key)
+    if next(maker_order) == nil then
+      redis.call('LPOP', queue_key)
+      pop_empty_price_level(opposite_book_key, opposite_volume_key, queue_key, price_member)
+      break
     end
-    taker_available_base_after = taker_available_base_after - trade_qty
-    hincrby(taker_balance_key, base_available_field, -trade_qty)
-    local credit = trade_quote - taker_fee
-    hincrby(taker_balance_key, quote_available_field, credit)
-    taker_quote_received = taker_quote_received + credit
-    taker_base_sold = taker_base_sold + trade_qty
-  end
 
-  taker_fees_collected = taker_fees_collected + taker_fee
-  maker_fees_collected = maker_fees_collected + maker_fee
-  add_fee(quote_asset, taker_fee + maker_fee)
+    local maker_remaining = tonumber(maker_order['remaining'] or '0')
+    if maker_remaining <= 0 then
+      redis.call('LPOP', queue_key)
+      pop_empty_price_level(opposite_book_key, opposite_volume_key, queue_key, price_member)
+      break
+    end
 
-  -- Update maker balances.
-  local maker_balance_key = 'balance:' .. maker_user_id
-  if maker_side == 'SELL' then
-    hincrby(maker_balance_key, base_reserved_field, -trade_qty)
-    local credit = trade_quote - maker_fee
-    hincrby(maker_balance_key, quote_available_field, credit)
-  else
-    local debit = trade_quote + maker_fee
-    hincrby(maker_balance_key, quote_reserved_field, -debit)
-    hincrby(maker_balance_key, base_available_field, trade_qty)
-  end
+    local trade_qty = remaining
+    if maker_remaining < trade_qty then
+      trade_qty = maker_remaining
+    end
 
-  maker_remaining = maker_remaining - trade_qty
-  remaining = remaining - trade_qty
-  executed_quantity = executed_quantity + trade_qty
+    local trade_price = tonumber(maker_order['price'] or level_price)
+    if would_overflow_mul(trade_price, trade_qty) then
+      return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+    end
+    local trade_quote = math.floor((trade_price * trade_qty) / quantity_scale)
+    local maker_side = maker_order['side']
+    local maker_user_id = maker_order['user_id']
 
-  redis.call('HSET', maker_order_key, 'remaining', maker_remaining)
+    local taker_fee = math.floor((trade_quote * taker_fee_bps) / 10000)
+    local maker_fee = math.floor((trade_quote * maker_fee_bps) / 10000)
 
-  if maker_remaining == 0 then
-    redis.call('HSET', maker_order_key, 'status', 'FILLED')
-    redis.call('LPOP', queue_key)
-    pop_empty_price_level(opposite_book_key, opposite_volume_key, queue_key, price_member)
-  else
-    redis.call('HSET', maker_order_key, 'status', 'PARTIALLY_FILLED')
-  end
+    if is_buy then
+      local debit = trade_quote + taker_fee
+      if taker_available_quote_after < debit then
+        return cjson.encode({ error = 'INSUFFICIENT_FUNDS_DURING_MATCH', asset = quote_asset })
+      end
+      taker_available_quote_after = taker_available_quote_after - debit
+      hincrby(taker_balance_key, quote_available_field, -debit)
+      hincrby(taker_balance_key, base_available_field, trade_qty)
+      taker_quote_spent = taker_quote_spent + debit
+      taker_base_received = taker_base_received + trade_qty
+    else
+      if taker_available_base_after < trade_qty then
+        return cjson.encode({ error = 'INSUFFICIENT_FUNDS_DURING_MATCH', asset = base_asset })
+      end
+      taker_available_base_after = taker_available_base_after - trade_qty
+      hincrby(taker_balance_key, base_available_field, -trade_qty)
+      local credit = trade_quote - taker_fee
+      hincrby(taker_balance_key, quote_available_field, credit)
+      taker_quote_received = taker_quote_received + credit
+      taker_base_sold = taker_base_sold + trade_qty
+    end
 
-  redis.call('HINCRBY', opposite_volume_key, price_member, -trade_qty)
+    taker_fees_collected = taker_fees_collected + taker_fee
+    maker_fees_collected = maker_fees_collected + maker_fee
+    add_fee(quote_asset, taker_fee + maker_fee)
 
-  local trade_payload = {
-    taker_order_id = order_id,
-    maker_order_id = maker_order_id,
-    price = trade_price,
-    quantity = trade_qty,
-    quote = trade_quote,
-    taker_fee = taker_fee,
-    maker_fee = maker_fee,
-    timestamp = timestamp
-  }
-  append_trade(trades, trade_payload)
-  redis.call('XADD', trades_key, '*',
-    'taker_order_id', order_id,
-    'maker_order_id', maker_order_id,
-    'price', tostring(trade_price),
-    'quantity', tostring(trade_qty),
-    'quote', tostring(trade_quote),
-    'taker_fee', tostring(taker_fee),
-    'maker_fee', tostring(maker_fee),
-    'symbol', symbol,
-    'ts', tostring(timestamp)
-  )
+    -- Update maker balances.
+    local maker_balance_key = 'balance:' .. maker_user_id
+    if maker_side == 'SELL' then
+      hincrby(maker_balance_key, base_reserved_field, -trade_qty)
+      local credit = trade_quote - maker_fee
+      hincrby(maker_balance_key, quote_available_field, credit)
+    else
+      local debit = trade_quote + maker_fee
+      hincrby(maker_balance_key, quote_reserved_field, -debit)
+      hincrby(maker_balance_key, base_available_field, trade_qty)
+    end
 
-  ::continue::
+    maker_remaining = maker_remaining - trade_qty
+    remaining = remaining - trade_qty
+    executed_quantity = executed_quantity + trade_qty
+
+    redis.call('HSET', maker_order_key, 'remaining', maker_remaining)
+
+    if maker_remaining == 0 then
+      redis.call('HSET', maker_order_key, 'status', 'FILLED')
+      redis.call('LPOP', queue_key)
+      pop_empty_price_level(opposite_book_key, opposite_volume_key, queue_key, price_member)
+    else
+      redis.call('HSET', maker_order_key, 'status', 'PARTIALLY_FILLED')
+    end
+
+    redis.call('HINCRBY', opposite_volume_key, price_member, -trade_qty)
+
+    local trade_payload = {
+      taker_order_id = order_id,
+      maker_order_id = maker_order_id,
+      -- normalized identifiers for convenience
+      buy_order_id = is_buy and order_id or maker_order_id,
+      sell_order_id = is_buy and maker_order_id or order_id,
+      taker_side = is_buy and 'buy' or 'sell',
+      price = trade_price,
+      quantity = trade_qty,
+      quote = trade_quote,
+      taker_fee = taker_fee,
+      maker_fee = maker_fee,
+      timestamp = timestamp
+    }
+    append_trade(trades, trade_payload)
+    redis.call('XADD', trades_key, '*',
+      'taker_order_id', order_id,
+      'maker_order_id', maker_order_id,
+      'buy_order_id', is_buy and order_id or maker_order_id,
+      'sell_order_id', is_buy and maker_order_id or order_id,
+      'taker_side', is_buy and 'buy' or 'sell',
+      'price', tostring(trade_price),
+      'quantity', tostring(trade_qty),
+      'quote', tostring(trade_quote),
+      'taker_fee', tostring(taker_fee),
+      'maker_fee', tostring(maker_fee),
+      'symbol', symbol,
+      'ts', tostring(timestamp)
+    )
+  until true
 end
 
 local remaining_before_post = remaining

@@ -5,32 +5,30 @@ require 'rspec'
 module SpecRedis
   class << self
     def factory
-      url = ENV['SPEC_REDIS_URL'] || ENV['REDIS_URL']
-      return fallback_factory unless url && !url.empty?
-
-      begin
-        require 'redis'
+      url = ENV['SPEC_REDIS_URL'] || ENV['REDIS_URL'] || 'redis://127.0.0.1:6379/15'
+      require 'redis'
+      # Prefer hiredis driver if gem is available
+      driver = begin
+        require 'hiredis'
+        :hiredis
       rescue LoadError
-        return fallback_factory
+        nil
       end
-
       lambda do
-        client = ::Redis.new(url: url)
-        begin
-          client.ping
-          client
-        rescue StandardError
-          client.close if client.respond_to?(:close)
-          fallback_factory.call
+        opts = { url: url }
+        client = nil
+        if driver
+          begin
+            client = ::Redis.new(**opts.merge(driver: :hiredis))
+          rescue ArgumentError
+            client = ::Redis.new(**opts)
+          end
+        else
+          client = ::Redis.new(**opts)
         end
+        client.ping # raises if unavailable
+        client
       end
-    end
-
-    private
-
-    def fallback_factory
-      require 'redis_exchange/in_memory_redis'
-      lambda { RedisExchange::InMemoryRedis.new }
     end
   end
 end

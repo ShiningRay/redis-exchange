@@ -5,7 +5,8 @@
 --
 -- Returns JSON array where each element mirrors cancel_order.lua payload.
 
-local cjson = require('cjson.safe')
+-- Redis Lua environment provides global `cjson`; no `require` is allowed.
+local cjson = cjson
 
 local function to_map(array)
   local map = {}

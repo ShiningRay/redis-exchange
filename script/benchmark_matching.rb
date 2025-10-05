@@ -11,7 +11,7 @@ DEFAULT_OPTIONS = {
   symbol: DEFAULT_SYMBOL,
   resting_orders: 10_000,
   taker_orders: 10_000,
-  redis_url: ENV['BENCH_REDIS_URL'] || ENV['SPEC_REDIS_URL'] || ENV['REDIS_URL'],
+  redis_url: ENV['BENCH_REDIS_URL'] || ENV['SPEC_REDIS_URL'] || ENV['REDIS_URL'] || 'redis://127.0.0.1:6379/15',
   price: 30_000_00,
   quantity: 1_000_000
 }.freeze
@@ -35,7 +35,7 @@ OptionParser.new do |parser|
   parser.on('--taker=N', Integer, 'Number of taker market buy orders to execute (default: 10000)') do |value|
     options[:taker_orders] = value
   end
-  parser.on('--redis-url=URL', 'Target Redis URL (default: BENCH_REDIS_URL | SPEC_REDIS_URL | REDIS_URL | in-memory)') do |value|
+  parser.on('--redis-url=URL', 'Target Redis URL (default: BENCH_REDIS_URL | SPEC_REDIS_URL | REDIS_URL | local)') do |value|
     options[:redis_url] = value
   end
   parser.on('--price=INTEGER', Integer, 'Scaled price for resting limit orders (default: 3_000_000)') do |value|
@@ -56,23 +56,18 @@ taker_orders = options[:taker_orders]
 price = options[:price]
 quantity = options[:quantity]
 
-redis = if options[:redis_url]
-          require 'redis'
-          client = Redis.new(url: options[:redis_url])
-          begin
-            client.ping
-          rescue StandardError => e
-            warn "[benchmark] Failed to connect to Redis at #{options[:redis_url]}: #{e.message}"
-            warn '[benchmark] Falling back to in-memory Redis'
-            require 'redis_exchange/in_memory_redis'
-            RedisExchange::InMemoryRedis.new
-          else
-            client
-          end
-        else
-          require 'redis_exchange/in_memory_redis'
-          RedisExchange::InMemoryRedis.new
-        end
+require 'redis'
+begin
+  require "redis/connection/hiredis"
+rescue LoadError
+  nil
+end
+redis = Redis.new(url: options[:redis_url])
+begin
+  redis.ping
+rescue StandardError => e
+  abort "[benchmark] Failed to connect to Redis at #{options[:redis_url]}: #{e.message}"
+end
 
 client = RedisExchange::Client.new(redis: redis)
 
@@ -82,7 +77,7 @@ trap('INT') do
   exit 1
 end
 
-puts "[benchmark] WARNING: flushing Redis database at #{options[:redis_url] || 'in-memory instance'}"
+puts "[benchmark] WARNING: flushing Redis database at #{options[:redis_url]}"
 redis.flushdb
 
 client.seed_market(

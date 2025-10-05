@@ -87,6 +87,32 @@ puts response # JSON parsed into a Ruby hash
 p exchange.ticker('BTCUSDT')
 ```
 
+## Consuming Trade Stream
+
+Each market emits executed trades to a Redis Stream `trades:{symbol}` inside the Lua script. You can use the built-in consumer helper to process and persist trades reliably:
+
+```ruby
+consumer = exchange.trade_consumer(symbol: 'BTCUSDT', group: 'trades-consumers', consumer: 'worker-1')
+
+loop do
+  entries = consumer.read(count: 100, block_ms: 2000)
+  entries.each do |e|
+    # e.id is the Redis Stream entry id (e.g., "1707389234567-0")
+    fields = e.fields # Hash of strings: { 'taker_order_id' => '...', 'price' => '3000000', ... }
+
+    # Persist with idempotency: use e.id as unique key in your DB
+    # Convert numeric fields to integers before saving
+    # On success:
+    consumer.ack(e.id)
+  end
+end
+```
+
+Recommended persistence design:
+- Use `stream_entry_id` unique constraint for idempotency
+- Store scaled integer fields as `bigint` (price, quantity, quote, fees)
+- Save `executed_ts_ms` from `fields['ts']` as bigint
+
 `ticker` returns a hash of integers keyed by `:last_price`, `:last_quantity`, `:best_bid_price`, `:best_bid_volume`, `:best_ask_price`, `:best_ask_volume`, and more for quick UI snapshots.
 
 ## Development
@@ -100,12 +126,9 @@ bundle exec rspec
 
 ## Benchmarking
 
-Run the provided script to gauge Lua matching throughput. The script seeds a sell book and executes BUY market orders while reporting runtime and derived orders-per-second metrics. By default it uses the in-memory Redis shim; specify `--redis-url` (or set `BENCH_REDIS_URL`) to target a real instance. **Warning:** the chosen database is flushed before each run.
+Run the provided script to gauge Lua matching throughput. The script seeds a sell book and executes BUY market orders while reporting runtime and derived orders-per-second metrics. The benchmark requires a real Redis instance; set `--redis-url` (or `BENCH_REDIS_URL`) accordingly. **Warning:** the chosen database is flushed before each run.
 
 ```bash
-# In-memory benchmark with smaller order counts
-ruby script/benchmark_matching.rb --resting=1_000 --taker=1_000 --quantity=100_000
-
 # Against a specific Redis host
 BENCH_REDIS_URL=redis://127.0.0.1:6379/15 \
   ruby script/benchmark_matching.rb --resting=10_000 --taker=10_000 --price=3_000_000

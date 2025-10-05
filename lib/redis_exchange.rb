@@ -34,8 +34,7 @@ module RedisExchange
 end
 
 require_relative 'redis_exchange/version'
-require_relative 'redis_exchange/matching_engine'
-require_relative 'redis_exchange/in_memory_redis'
+## No Ruby fallback or in-memory shim; all logic uses real Redis + Lua
 
 module RedisExchange
   # Client encapsulates Lua script execution and convenience helpers.
@@ -45,7 +44,6 @@ module RedisExchange
     # @param script_path [String,nil] optional override for the Lua script path
     def initialize(redis:, script_path: nil)
       @redis = redis
-      @engine = MatchingEngine.new(@redis)
 
       match_script_path = script_path || default_script_path
       @match_script = register_script(read_script(match_script_path))
@@ -156,17 +154,22 @@ module RedisExchange
     def cancel_order(order_id)
       payload = { keys: ["order:#{order_id}"], argv: [order_id] }
       raw = call_script(@cancel_script, payload)
-      return JSON.parse(raw) if raw
-
-      cancel_order_fallback(order_id)
+      JSON.parse(raw)
     end
 
     def cancel_all_orders(user_id)
       payload = { keys: [], argv: [user_id] }
       raw = call_script(@cancel_all_script, payload)
-      return JSON.parse(raw) if raw
+      JSON.parse(raw)
+    end
 
-      cancel_all_orders_fallback(user_id)
+    # Build a TradeStreamConsumer for a market symbol.
+    # Usage: consumer = exchange.trade_consumer(symbol: 'BTCUSDT', group: 'trades-consumers', consumer: 'worker-1')
+    def trade_consumer(symbol:, group:, consumer:)
+      require_relative 'redis_exchange/trade_stream_consumer'
+      c = RedisExchange::TradeStreamConsumer.new(redis: @redis, symbol: symbol, group: group, consumer: consumer)
+      c.ensure_group(start_id: '0')
+      c
     end
 
     # Remove book, volume, sequence, trades, and ticker keys for tests.
@@ -204,6 +207,22 @@ module RedisExchange
       type_up = order_type.to_s.upcase
       raise ArgumentError, 'order_type must be LIMIT or MARKET' unless %w[LIMIT MARKET].include?(type_up)
 
+      # Precision pre-check (Ruby layer): both price_limit and quantity are scaled integers.
+      # Prevent sending arguments that would overflow Lua's double precision (~9e15).
+      precision_bound = 9_000_000_000_000_000
+      pl = price_limit.to_i
+      qty = quantity.to_i
+      if pl.negative? || qty <= 0
+        return { 'error' => 'INVALID_PRICE_OR_QUANTITY' }
+      end
+      if pl > 0
+        # If either operand or the product breaches the bound, abort.
+        # allow product equal to bound; overflow only when strictly greater
+        if pl >= precision_bound || qty >= precision_bound || (pl.to_i * qty.to_i) > precision_bound
+          return { 'error' => 'PRECISION_OVERFLOW' }
+        end
+      end
+
       ts = (timestamp_ms || current_millis).to_i
       keys = market_keys(symbol: symbol, user_id: user_id)
       script_payload = {
@@ -230,7 +249,6 @@ module RedisExchange
       }
 
       raw = execute_via_match_script(script_payload)
-      raw ||= JSON.generate(@engine.process_keys_and_args(**script_payload))
       JSON.parse(raw)
     end
 
@@ -258,14 +276,29 @@ module RedisExchange
       (Time.now.to_f * 1000).floor
     end
 
-    def register_script(lua_source)
-      return nil unless lua_source
-      return nil unless @redis.respond_to?(:register_script)
+    # Simple Lua script wrapper using SCRIPT LOAD + EVALSHA.
+    class LuaScript
+      def initialize(source)
+        @source = source
+        @sha = nil
+      end
 
-      @redis.register_script(lua_source)
-    rescue StandardError
-      puts "Error registering script: #{$ERROR_INFO}"
-      nil
+      def call(redis, keys:, argv:)
+        @sha ||= redis.script(:load, @source)
+        redis.evalsha(@sha, keys: keys, argv: argv)
+      rescue ::Redis::CommandError => e
+        if e.message =~ /NOSCRIPT/
+          @sha = redis.script(:load, @source)
+          retry
+        else
+          raise
+        end
+      end
+    end
+
+    def register_script(lua_source)
+      raise ArgumentError, 'missing Lua source' unless lua_source && !lua_source.empty?
+      LuaScript.new(lua_source)
     end
 
     def execute_via_match_script(script_payload)
@@ -279,55 +312,7 @@ module RedisExchange
     end
 
     def call_script(script, payload)
-      return nil unless script
-
       script.call(@redis, **payload)
-    rescue StandardError
-      nil
-    end
-
-    def cancel_order_fallback(order_id)
-      order_key = "order:#{order_id}"
-      order = @redis.hgetall(order_key)
-      return { 'status' => 'NOT_FOUND', 'order_id' => order_id } if order.empty?
-
-      remaining = order['remaining'].to_i
-      status = order['status'] || 'UNKNOWN'
-      return { 'status' => status, 'order_id' => order_id, 'symbol' => order['symbol'] } if remaining <= 0
-
-      symbol = order['symbol']
-      side = order['side']
-      price = order['price'].to_i
-      user_id = order['user_id']
-
-      market = @redis.hgetall("market:#{symbol}")
-      raise ArgumentError, 'unknown market' if market.empty?
-
-      release_reserved_funds(market: market, side: side, user_id: user_id, price: price, remaining: remaining)
-      remove_from_order_book(symbol: symbol, side: side, price: price, order_id: order_id, quantity: remaining)
-      update_order_status(order_key, remaining: 0, status: 'CANCELLED')
-      refresh_ticker_snapshot(symbol)
-
-      {
-        'status' => 'CANCELLED',
-        'order_id' => order_id,
-        'symbol' => symbol,
-        'remaining_quantity' => 0
-      }
-    end
-
-    def cancel_all_orders_fallback(user_id)
-      results = []
-      collect_order_keys.each do |order_key|
-        next unless @redis.hget(order_key, 'user_id') == user_id
-        status = @redis.hget(order_key, 'status')
-        next if status && !%w[OPEN PARTIALLY_FILLED].include?(status)
-
-        order_id = order_key.split(':', 2).last
-        result = cancel_order_fallback(order_id)
-        results << result if result['status'] == 'CANCELLED'
-      end
-      results
     end
 
     def collect_order_keys
@@ -383,9 +368,14 @@ module RedisExchange
       volume_key = "volume:#{symbol}:#{side}"
 
       range_method = descending ? :zrevrange : :zrange
-      args = [book_key, 0, limit ? limit - 1 : -1, { withscores: true }]
-      raw = @redis.public_send(range_method, *args)
-      list = Array(raw).each_slice(2).map do |member, score|
+      stop = limit ? limit - 1 : -1
+      raw = @redis.public_send(range_method, book_key, 0, stop, with_scores: true)
+      pairs = if raw.is_a?(Array) && raw.first.is_a?(Array)
+        raw
+      else
+        Array(raw).each_slice(2).to_a
+      end
+      list = pairs.map do |member, score|
         price_str = member.to_s
         {
           price: price_str.to_i,
@@ -396,67 +386,11 @@ module RedisExchange
       list.select! { |row| row[:volume].positive? }
       limit ? list.first(limit) : list
     end
-    def release_reserved_funds(market:, side:, user_id:, price:, remaining:)
-      base_asset = market['base_asset']
-      quote_asset = market['quote_asset']
-      quantity_scale = [(market['quantity_scale'] || '1').to_i, 1].max
-      maker_fee_bps = (market['maker_fee_bps'] || '0').to_i
-      balance_key = "balance:#{user_id}"
+    
 
-      if side == 'SELL'
-        @redis.hincrby(balance_key, "#{base_asset}:reserved", -remaining)
-        @redis.hincrby(balance_key, "#{base_asset}:available", remaining)
-      else
-        notional = (price * remaining) / quantity_scale
-        fee = (notional * maker_fee_bps) / 10_000
-        total = notional + fee
-        @redis.hincrby(balance_key, "#{quote_asset}:reserved", -total)
-        @redis.hincrby(balance_key, "#{quote_asset}:available", total)
-      end
-    end
-
-    def remove_from_order_book(symbol:, side:, price:, order_id:, quantity:)
-      queue_key = "queue:#{symbol}:#{side}:#{price}"
-      prune_queue(queue_key, order_id)
-
-      volume_key = "volume:#{symbol}:#{side}"
-      remaining_volume = @redis.hincrby(volume_key, price.to_s, -quantity)
-      if remaining_volume <= 0
-        @redis.hdel(volume_key, price.to_s) if @redis.respond_to?(:hdel)
-        @redis.del(queue_key)
-
-        book_key = side == 'BUY' ? "book:#{symbol}:BUY" : "book:#{symbol}:SELL"
-        @redis.zrem(book_key, price.to_s) if @redis.respond_to?(:zrem)
-      end
-    end
-
-    def prune_queue(queue_key, order_id)
-      if @redis.respond_to?(:lrem)
-        @redis.lrem(queue_key, 0, order_id)
-      else
-        entries = @redis.lrange(queue_key, 0, -1) || []
-        filtered = entries.reject { |entry| entry == order_id }
-        return if filtered == entries
-
-        @redis.del(queue_key)
-        filtered.each { |entry| @redis.rpush(queue_key, entry) }
-      end
-    end
-
-    def update_order_status(order_key, remaining:, status:)
-      fields = { 'remaining' => remaining.to_s, 'status' => status }
-      if @redis.respond_to?(:hset)
-        @redis.hset(order_key, fields)
-      else
-        current = @redis.hgetall(order_key)
-        @redis.hset(order_key, current.merge(fields))
-      end
-    end
-
-    def refresh_ticker_snapshot(symbol)
-      @engine.send(:refresh_ticker, symbol, last_trade: nil)
-    rescue StandardError
-      nil
-    end
+    # Fallback-related helpers removed; cancellations handled via Lua scripts.
   end
 end
+# frozen_string_literal: true
+
+require_relative 'redis_exchange/trade_stream_consumer'

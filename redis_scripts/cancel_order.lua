@@ -7,7 +7,8 @@
 --
 -- Returns JSON with `status`, `order_id`, and `symbol` when available.
 
-local cjson = require('cjson.safe')
+-- Redis Lua environment provides global `cjson`; no `require` is allowed.
+local cjson = cjson
 
 local function to_map(array)
   local map = {}

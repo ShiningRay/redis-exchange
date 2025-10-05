@@ -224,6 +224,34 @@ RSpec.describe RedisExchange::Client do
     expect(book[:asks].first[:price]).to eq(3_000_000)
     expect(book[:asks].first[:volume]).to eq(50_000_000)
     expect(book[:bids]).to be_empty
+
+    # Verify trades returned in response
+    trades = result['trades']
+    expect(trades).to be_an(Array)
+    expect(trades.size).to eq(1)
+    trade = trades.first
+    expect(trade['taker_order_id']).to eq('taker-1')
+    expect(trade['maker_order_id']).to eq('maker-1')
+    expect(trade['buy_order_id']).to eq('taker-1')
+    expect(trade['sell_order_id']).to eq('maker-1')
+    expect(trade['taker_side']).to eq('buy')
+    expect(trade['price']).to eq(3_000_000)
+    expect(trade['quantity']).to eq(50_000_000)
+    expect(trade['timestamp']).to be_a(Integer)
+
+    # Verify trade stream entry in Redis (values stored as strings)
+    stream_entries = redis.xrevrange('trades:BTCUSDT', '+', '-', count: 1)
+    expect(stream_entries).not_to be_empty
+    entry_id, fields = stream_entries.first
+    fields_hash = fields.is_a?(Hash) ? fields : Hash[*fields]
+    expect(fields_hash['taker_order_id']).to eq('taker-1')
+    expect(fields_hash['maker_order_id']).to eq('maker-1')
+    expect(fields_hash['buy_order_id']).to eq('taker-1')
+    expect(fields_hash['sell_order_id']).to eq('maker-1')
+    expect(fields_hash['taker_side']).to eq('buy')
+    expect(fields_hash['price']).to eq('3000000')
+    expect(fields_hash['quantity']).to eq('50000000')
+    expect(fields_hash['symbol']).to eq('BTCUSDT')
   end
 
   after do
