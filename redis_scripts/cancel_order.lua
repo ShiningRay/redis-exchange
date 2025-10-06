@@ -120,13 +120,12 @@ if side == 'SELL' then
   append_ledger(user_id, base_asset, 'available', remaining, 'CANCEL_REFUND', nil)
 else
   local notional = math.floor((as_number(price) * remaining) / quantity_scale)
-  local fee = math.floor((notional * maker_fee_bps) / 10000)
-  local total = notional + fee
-  if total > 0 then
-    redis.call('HINCRBY', balance_key, quote_asset .. ':reserved', -total)
-    append_ledger(user_id, quote_asset, 'reserved', -total, 'CANCEL_RELEASE', nil)
-    redis.call('HINCRBY', balance_key, quote_asset .. ':available', total)
-    append_ledger(user_id, quote_asset, 'available', total, 'CANCEL_REFUND', nil)
+  -- Fees are deducted only upon trade execution; do not include fees in cancellation refunds
+  if notional > 0 then
+    redis.call('HINCRBY', balance_key, quote_asset .. ':reserved', -notional)
+    append_ledger(user_id, quote_asset, 'reserved', -notional, 'CANCEL_RELEASE', nil)
+    redis.call('HINCRBY', balance_key, quote_asset .. ':available', notional)
+    append_ledger(user_id, quote_asset, 'available', notional, 'CANCEL_REFUND', nil)
   end
 end
 

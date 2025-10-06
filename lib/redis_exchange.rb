@@ -45,18 +45,18 @@ module RedisExchange
     def initialize(redis:, script_path: nil)
       @redis = redis
 
-    match_script_path = script_path || default_script_path
-    @match_script = register_script(read_script(match_script_path))
+      match_script_path = script_path || default_script_path
+      @match_script = register_script(read_script(match_script_path))
 
-    cancel_path = File.expand_path('../redis_scripts/cancel_order.lua', __dir__)
-    @cancel_script = register_script(read_script(cancel_path))
+      cancel_path = File.expand_path('../redis_scripts/cancel_order.lua', __dir__)
+      @cancel_script = register_script(read_script(cancel_path))
 
-    cancel_all_path = File.expand_path('../redis_scripts/cancel_all_orders.lua', __dir__)
-    @cancel_all_script = register_script(read_script(cancel_all_path))
+      cancel_all_path = File.expand_path('../redis_scripts/cancel_all_orders.lua', __dir__)
+      @cancel_all_script = register_script(read_script(cancel_all_path))
 
-    balance_change_path = File.expand_path('../redis_scripts/balance_change.lua', __dir__)
-    @balance_change_script = register_script(read_script(balance_change_path))
-  end
+      balance_change_path = File.expand_path('../redis_scripts/balance_change.lua', __dir__)
+      @balance_change_script = register_script(read_script(balance_change_path))
+    end
 
     # Submit a limit order and return the Redis/Lua response hash.
     # @param symbol [String] market symbol

@@ -14,7 +14,7 @@ RSpec.describe RedisExchange::Client do
       symbol: symbol,
       base_asset: 'BTC',
       quote_asset: 'USDT',
-      price_scale: 100,
+      price_scale: 100,  
       quantity_scale: 100_000_000,
       maker_fee_bps: 5,
       taker_fee_bps: 10,
@@ -31,8 +31,8 @@ RSpec.describe RedisExchange::Client do
       side: 'SELL',
       order_id: 'order-1',
       user_id: 'maker',
-      price: 3_000_000,
-      quantity: 100_000_000
+      price: 3_000_000, # 30000.00000000 USDT
+      quantity: 100_000_000 # 1.00000000 BTC
     )
 
     expect(result['status']).to eq('OPEN')
@@ -55,6 +55,44 @@ RSpec.describe RedisExchange::Client do
     expect(book[:asks].map { |row| row[:price] }).to eq([3_000_000])
     expect(book[:asks].first[:volume]).to eq(100_000_000)
     expect(book[:bids]).to be_empty
+  end
+
+  it 'rests a limit buy order when no opposite liquidity exists' do
+    # 买方先充入 USDT 余额，足以覆盖名义金额与预估手续费
+    exchange.set_balance(user_id: 'buyer', asset: 'USDT', available: 5_000_000) # 50000.00000000 USDT
+
+    result = exchange.place_limit_order(
+      symbol: symbol,
+      side: 'BUY',
+      order_id: 'order-buy-1',
+      user_id: 'buyer',
+      price: 3_000_000, # 30000.00000000 USDT
+      quantity: 100_000_000 # 1.00000000 BTC
+    )
+
+    expect(result['status']).to eq('OPEN')
+    expect(result['remaining_quantity']).to eq(100_000_000)
+    queue = redis.lrange('queue:BTCUSDT:BUY:3000000', 0, -1)
+    expect(queue).to eq(['order-buy-1'])
+
+    # 预留金额仅为名义金额：reserve_quote = floor(3_000_000 * 100_000_000 / 100_000_000) = 3_000_000
+    balances = redis.hgetall('balance:buyer')
+    expect(balances['USDT:available'].to_i).to eq(5_000_000 - 3_000_000)
+    expect(balances['USDT:reserved'].to_i).to eq(3_000_000)
+    expect(balances.fetch('BTC:available', '0').to_i).to eq(0)
+    expect(balances.fetch('BTC:reserved', '0').to_i).to eq(0)
+
+    ticker = exchange.ticker(symbol)
+    expect(ticker[:best_bid_price]).to eq(3_000_000)
+    expect(ticker[:best_bid_volume]).to eq(100_000_000)
+    expect(ticker[:best_ask_price]).to eq(0)
+    expect(ticker[:best_ask_volume]).to eq(0)
+    expect(ticker[:last_price]).to eq(0)
+
+    book = exchange.order_book(symbol)
+    expect(book[:bids].map { |row| row[:price] }).to eq([3_000_000])
+    expect(book[:bids].first[:volume]).to eq(100_000_000)
+    expect(book[:asks]).to be_empty
   end
 
   it 'cancels a resting order and releases reserved balances' do
@@ -219,41 +257,47 @@ RSpec.describe RedisExchange::Client do
   end
 
   it 'matches a market order against resting liquidity' do
-    exchange.set_balance(user_id: 'bob', asset: 'BTC', available: 200_000_000)
+    exchange.set_balance(user_id: 'bob', asset: 'BTC', available: 200_000_000) # 200.00000000 BTC
     exchange.place_limit_order(
       symbol: symbol,
-      side: 'SELL',
+      side: 'SELL', 
       order_id: 'maker-1',
       user_id: 'bob',
-      price: 3_000_000,
-      quantity: 100_000_000
-    )
+      price: 3_000_000, # 30000.00000000 USDT
+      quantity: 100_000_000 # 1.00000000 BTC
+    ) # SELL, lock BTC
 
-    exchange.set_balance(user_id: 'alice', asset: 'USDT', available: 5_000_000)
+    exchange.set_balance(user_id: 'alice', asset: 'USDT', available: 5_000_000) # 50000.00000000 USDT
 
     result = exchange.place_market_order(
       symbol: symbol,
       side: 'BUY',
       order_id: 'taker-1',
       user_id: 'alice',
-      quantity: 50_000_000,
-      price_cap: 3_100_000
-    )
+      quantity: 50_000_000, # 0.500000000 BTC
+      price_cap: 3_100_000 # 31000.00000000 USDT
+    ) # BUY, Spent 15000 USDT 
 
     expect(result['status']).to eq('FILLED')
-    expect(result['executed_quantity']).to eq(50_000_000)
+    expect(result['executed_quantity']).to eq(50_000_000) # 0.500000000 BTC
+
     alice_balances = redis.hgetall('balance:alice')
-    expect(alice_balances['BTC:available'].to_i).to eq(50_000_000)
-    expect(alice_balances['USDT:available'].to_i).to be < 5_000_000
+    expect(alice_balances['BTC:available'].to_i).to eq(50_000_000) # 0.500000000 BTC
+    # USDT 可用余额精确校验：trade_quote=1_500_000, taker_fee=1_500 → debit=1_501_500 → 5_000_000-1_501_500=3_498_500
+    expect(alice_balances['USDT:available'].to_i).to eq(3_498_500) # 34985.00 USDT
+    expect(alice_balances['USDT:reserved'].to_i).to eq(0)
 
     bob_balances = redis.hgetall('balance:bob')
-    expect(bob_balances['BTC:reserved'].to_i).to eq(50_000_000)
-    expect(bob_balances['USDT:available'].to_i).to be > 0
+    # BTC 预留余额减少 50_000_000，剩余 50_000_000；可用余额保持 100_000_000
+    expect(bob_balances['BTC:reserved'].to_i).to eq(50_000_000) # 50.00000000 BTC
+    expect(bob_balances['BTC:available'].to_i).to eq(100_000_000)
+    # USDT 可用余额精确校验：maker_fee=750 → credit=1_500_000-750=1_499_250
+    expect(bob_balances['USDT:available'].to_i).to eq(1_499_250) 
 
     ticker = exchange.ticker(symbol)
-    expect(ticker[:last_price]).to eq(3_000_000)
-    expect(ticker[:best_ask_price]).to eq(3_000_000)
-    expect(ticker[:best_ask_volume]).to eq(50_000_000)
+    expect(ticker[:last_price]).to eq(3_000_000) # 30000.00000000 USDT
+    expect(ticker[:best_ask_price]).to eq(3_000_000) # 30000.00000000 USDT
+    expect(ticker[:best_ask_volume]).to eq(50_000_000) # 50.00000000 BTC
     expect(ticker[:best_bid_price]).to eq(0)
     expect(ticker[:best_bid_volume]).to eq(0)
 

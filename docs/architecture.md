@@ -172,6 +172,14 @@ All prices, quantities, and balances are stored as scaled integers. Lua executes
 
 Cancellations would use a dedicated Lua script that validates ownership, releases reserved balances, removes order ids from the queue, and adjusts price-level aggregates.
 
+## Fees Deduction Policy
+
+- Fees (both taker and maker) are deducted only after a trade is executed.
+- Resting limit BUY orders reserve only the nominal quote amount: `floor(price_limit * remaining / quantity_scale)`; fees are not reserved.
+- Resting limit SELL orders reserve only the base quantity.
+- Market BUY orders may temporarily debit an estimated maximum quote (including fees) to ensure atomic matching, but any unused portion is refunded immediately within the same call.
+- Order cancellations release only the nominal reserved amounts (no fees), returning them from `reserved` back to `available`.
+
 ## Invariants
 
 - No double-spend: balances never go negative because all debits happen before credits and checks guard insufficiency.

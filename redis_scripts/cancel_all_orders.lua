@@ -80,7 +80,7 @@ local function release_reserved(market, side, user_id, price, remaining)
   if quantity_scale <= 0 then
     quantity_scale = 1
   end
-  local maker_fee_bps = as_number(market['maker_fee_bps'])
+  -- Fees are deducted only upon trade execution; do not include fees in cancellation refunds
 
   local balance_key = 'balance:' .. user_id
 
@@ -91,13 +91,11 @@ local function release_reserved(market, side, user_id, price, remaining)
     append_ledger(user_id, base_asset, 'available', remaining, 'CANCEL_ALL_REFUND', nil)
   else
     local notional = math.floor((as_number(price) * remaining) / quantity_scale)
-    local fee = math.floor((notional * maker_fee_bps) / 10000)
-    local total = notional + fee
-    if total > 0 then
-      redis.call('HINCRBY', balance_key, quote_asset .. ':reserved', -total)
-      append_ledger(user_id, quote_asset, 'reserved', -total, 'CANCEL_ALL_RELEASE', nil)
-      redis.call('HINCRBY', balance_key, quote_asset .. ':available', total)
-      append_ledger(user_id, quote_asset, 'available', total, 'CANCEL_ALL_REFUND', nil)
+    if notional > 0 then
+      redis.call('HINCRBY', balance_key, quote_asset .. ':reserved', -notional)
+      append_ledger(user_id, quote_asset, 'reserved', -notional, 'CANCEL_ALL_RELEASE', nil)
+      redis.call('HINCRBY', balance_key, quote_asset .. ':available', notional)
+      append_ledger(user_id, quote_asset, 'available', notional, 'CANCEL_ALL_REFUND', nil)
     end
   end
 end

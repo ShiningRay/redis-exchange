@@ -518,18 +518,16 @@ else
     if remaining > 0 then
       if is_buy then
         local reserve_quote = math.floor((price_limit * remaining) / quantity_scale)
-        local reserve_fee = math.floor((reserve_quote * maker_fee_bps) / 10000)
-        local total_reserve = reserve_quote + reserve_fee
-        if total_reserve > 0 then
-          if taker_available_quote_after < total_reserve then
+        if reserve_quote > 0 then
+          if taker_available_quote_after < reserve_quote then
             return cjson.encode({ error = 'INSUFFICIENT_FUNDS_TO_REST', asset = quote_asset })
           end
-          taker_available_quote_after = taker_available_quote_after - total_reserve
-          taker_reserved_quote = taker_reserved_quote + total_reserve
-          hincrby(taker_balance_key, quote_available_field, -total_reserve)
-          append_ledger(user_id, quote_asset, 'available', -total_reserve, 'TAKER_RESERVE', timestamp)
-          hincrby(taker_balance_key, quote_reserved_field, total_reserve)
-          append_ledger(user_id, quote_asset, 'reserved', total_reserve, 'TAKER_RESERVE', timestamp)
+          taker_available_quote_after = taker_available_quote_after - reserve_quote
+          taker_reserved_quote = taker_reserved_quote + reserve_quote
+          hincrby(taker_balance_key, quote_available_field, -reserve_quote)
+          append_ledger(user_id, quote_asset, 'available', -reserve_quote, 'TAKER_RESERVE', timestamp)
+          hincrby(taker_balance_key, quote_reserved_field, reserve_quote)
+          append_ledger(user_id, quote_asset, 'reserved', reserve_quote, 'TAKER_RESERVE', timestamp)
         end
       else
         local reserve_qty = remaining
