@@ -97,6 +97,7 @@ Each market emits executed trades to a Redis Stream `trades:{symbol}` inside the
 ```ruby
 consumer = exchange.trade_consumer(symbol: 'BTCUSDT', group: 'trades-consumers', consumer: 'worker-1')
 
+# Simple blocking loop with explicit read + ack
 loop do
   entries = consumer.read(count: 100, block_ms: 2000)
   entries.each do |e|
@@ -109,6 +110,14 @@ loop do
     consumer.ack(e.id)
   end
 end
+
+# Or use the convenience each to drive the loop
+consumer.each(count: 100, block_ms: 2000, auto_ack: true) do |e|
+  # fields = e.fields
+  # Persist with idempotency and type conversions as needed
+  # Return :halt to break the loop if desired
+  # return :halt if shutdown?
+end
 ```
 
 Recommended persistence design:
@@ -117,6 +126,35 @@ Recommended persistence design:
 - Save `executed_ts_ms` from `fields['ts']` as bigint
 
 `ticker` returns a hash of integers keyed by `:last_price`, `:last_quantity`, `:best_bid_price`, `:best_bid_volume`, `:best_ask_price`, `:best_ask_volume`, and more for quick UI snapshots.
+
+## Consuming Order Stream
+
+Each market emits order lifecycle events to `orders:{symbol}` (OPEN, PARTIALLY_FILLED, FILLED, CANCELLED, NO_LIQUIDITY). Use the built-in helper to consume reliably:
+
+```ruby
+consumer = exchange.order_consumer(symbol: 'BTCUSDT', group: 'orders-consumers', consumer: 'worker-1')
+
+# Explicit read + ack style
+loop do
+  entries = consumer.read(count: 100, block_ms: 2000)
+  entries.each do |e|
+    fields = e.fields # { 'order_id' => '...', 'status' => 'CANCELLED', 'price' => '3000000', ... }
+
+    # Persist with idempotency: use e.id as unique key in your DB
+    # Convert numeric fields to integers before saving
+    consumer.ack(e.id)
+  end
+end
+
+# Or use the convenience each to drive the loop
+consumer.each(count: 100, block_ms: 2000, auto_ack: true) do |e|
+  # fields = e.fields
+  # Persist then optional halt
+  # return :halt if shutdown?
+end
+```
+
+See `script/orders_demo.rb` for a runnable example.
 
 ## Development
 

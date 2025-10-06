@@ -1,7 +1,7 @@
 --[[
 match_order.lua implements the exchange's atomic limit/market order matching routine.
 
-Expected KEYS (1-8):
+Expected KEYS (1-9):
  1. market metadata hash (market:{symbol})
  2. sequence counter (seq:{symbol})
  3. buy book sorted set (book:{symbol}:BUY)
@@ -10,6 +10,7 @@ Expected KEYS (1-8):
  6. sell side volume hash (volume:{symbol}:SELL)
  7. taker balance hash (balance:{user_id})
  8. trade stream (trades:{symbol})
+  9. order event stream (orders:{symbol})
 
 Expected ARGV (1-8):
  1. symbol
@@ -78,6 +79,7 @@ local volume_buy_key = KEYS[5]
 local volume_sell_key = KEYS[6]
 local taker_balance_key = KEYS[7]
 local trades_key = KEYS[8]
+local orders_key = KEYS[9]
 
 -- ARGV parameters describing the taker order being processed.
 local symbol = ARGV[1]
@@ -134,6 +136,7 @@ end
 
 -- Optional stream length cap from market config; default to 1,000,000 entries
 local trades_maxlen = tonumber(market['trades_maxlen']) or 1000000
+local orders_maxlen = tonumber(market['orders_maxlen']) or 1000000
 
 local base_asset = market['base_asset']
 local quote_asset = market['quote_asset']
@@ -393,8 +396,40 @@ while remaining > 0 do
       redis.call('HSET', maker_order_key, 'status', 'FILLED')
       redis.call('LPOP', queue_key)
       pop_empty_price_level(opposite_book_key, opposite_volume_key, queue_key, price_member)
+      -- Remove filled maker order from user's active index
+      local maker_index_key = 'user_orders:' .. maker_user_id .. ':' .. symbol
+      redis.call('ZREM', maker_index_key, maker_order_id)
+      -- Publish maker FILLED event and delete terminal order hash
+      redis.call('XADD', orders_key, 'MAXLEN', '~', orders_maxlen, '*',
+        'order_id', maker_order_id,
+        'user_id', maker_user_id,
+        'symbol', symbol,
+        'side', (is_buy and 'SELL' or 'BUY'),
+        'type', 'LIMIT',
+        'status', 'FILLED',
+        'price', price_member,
+        'quantity', redis.call('HGET', maker_order_key, 'quantity') or '0',
+        'remaining', '0',
+        'ts', tostring(timestamp),
+        'sequence', tostring(redis.call('HGET', maker_order_key, 'sequence') or '')
+      )
+      redis.call('DEL', maker_order_key)
     else
       redis.call('HSET', maker_order_key, 'status', 'PARTIALLY_FILLED')
+      -- Publish maker PARTIALLY_FILLED event
+      redis.call('XADD', orders_key, 'MAXLEN', '~', orders_maxlen, '*',
+        'order_id', maker_order_id,
+        'user_id', maker_user_id,
+        'symbol', symbol,
+        'side', (is_buy and 'SELL' or 'BUY'),
+        'type', 'LIMIT',
+        'status', 'PARTIALLY_FILLED',
+        'price', price_member,
+        'quantity', redis.call('HGET', maker_order_key, 'quantity') or '0',
+        'remaining', tostring(maker_remaining),
+        'ts', tostring(timestamp),
+        'sequence', tostring(redis.call('HGET', maker_order_key, 'sequence') or '')
+      )
     end
 
     redis.call('HINCRBY', opposite_volume_key, price_member, -trade_qty)
@@ -507,7 +542,36 @@ redis.call('HMSET', order_key,
   'sequence', tostring(seq)
 )
 
+-- Maintain per-user active orders index for the taker.
+-- Index only resting LIMIT orders with remaining > 0.
+local taker_index_key = 'user_orders:' .. user_id .. ':' .. symbol
+if order_type == 'LIMIT' and remaining > 0 and (order_status == 'OPEN' or order_status == 'PARTIALLY_FILLED') then
+  redis.call('ZADD', taker_index_key, seq, order_id)
+else
+  redis.call('ZREM', taker_index_key, order_id)
+end
+
 update_ticker_state(trades)
+
+-- Publish taker order event
+redis.call('XADD', orders_key, 'MAXLEN', '~', orders_maxlen, '*',
+  'order_id', order_id,
+  'user_id', user_id,
+  'symbol', symbol,
+  'side', side,
+  'type', order_type,
+  'status', order_status,
+  'price', tostring(price_limit),
+  'quantity', tostring(quantity),
+  'remaining', tostring(remaining),
+  'ts', tostring(timestamp),
+  'sequence', tostring(seq)
+)
+
+-- Delete terminal taker orders to keep memory bounded
+if order_status == 'FILLED' or order_status == 'NO_LIQUIDITY' then
+  redis.call('DEL', order_key)
+end
 
 local result = {
   order_id = order_id,

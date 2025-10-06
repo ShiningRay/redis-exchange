@@ -123,6 +123,41 @@ redis.call('HMSET', order_key,
   'remaining', '0'
 )
 
+-- Remove from user's active orders index
+if user_id and symbol and order_id then
+  local index_key = 'user_orders:' .. user_id .. ':' .. symbol
+  redis.call('ZREM', index_key, order_id)
+end
+
+-- Publish order cancellation event to orders stream and delete final order hash
+do
+  local now = redis.call('TIME')
+  local ts_ms = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
+  local seq_key = 'seq:' .. symbol
+  local sequence = redis.call('INCR', seq_key)
+  local orders_key = 'orders:' .. symbol
+  local order_type = order['type'] or ''
+  local quantity = order['quantity'] or '0'
+
+  local orders_maxlen = tonumber(market['orders_maxlen']) or 1000000
+  redis.call('XADD', orders_key, 'MAXLEN', '~', orders_maxlen, '*',
+    'order_id', order_id,
+    'user_id', user_id,
+    'symbol', symbol,
+    'side', side,
+    'type', order_type,
+    'status', 'CANCELLED',
+    'price', tostring(price),
+    'quantity', tostring(quantity),
+    'remaining', '0',
+    'ts', tostring(ts_ms),
+    'sequence', tostring(sequence)
+  )
+
+  -- Delete terminal order hash to keep storage lean
+  redis.call('DEL', order_key)
+end
+
 refresh_ticker(symbol)
 
 return cjson.encode({

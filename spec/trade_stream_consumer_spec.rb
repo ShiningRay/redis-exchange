@@ -61,6 +61,37 @@ RSpec.describe RedisExchange::TradeStreamConsumer do
     expect(acked).to be >= 1
   end
 
+  it 'supports breaking the loop via each returning :halt' do
+    # Seed one trade
+    exchange.set_balance(user_id: 'maker', asset: 'BTC', available: 100_000_000)
+    exchange.place_limit_order(
+      symbol: symbol,
+      side: 'SELL',
+      order_id: 'maker-2',
+      user_id: 'maker',
+      price: 3_000_000,
+      quantity: 50_000_000
+    )
+
+    exchange.set_balance(user_id: 'taker', asset: 'USDT', available: 1_000_000_000)
+    exchange.place_market_order(
+      symbol: symbol,
+      side: 'BUY',
+      order_id: 'taker-2',
+      user_id: 'taker',
+      quantity: 10_000_000,
+      price_cap: 3_100_000
+    )
+
+    consumer = exchange.trade_consumer(symbol: symbol, group: 'trades-consumers', consumer: 'worker-2')
+    seen = []
+    consumer.each(count: 10, block_ms: 100, auto_ack: true) do |e|
+      seen << e.id
+      :halt
+    end
+    expect(seen).not_to be_empty
+  end
+
   after do
     redis.close if redis.respond_to?(:close)
   end

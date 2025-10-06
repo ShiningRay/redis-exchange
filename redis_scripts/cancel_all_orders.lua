@@ -1,4 +1,5 @@
--- cancel_all_orders.lua cancels every open or partially filled order for a user.
+-- cancel_all_orders.lua cancels every open or partially filled order for a user,
+-- using per-user, per-symbol active order indexes to avoid scanning all orders.
 --
 -- ARGV:
 --   1. user_id
@@ -123,6 +124,41 @@ local function cancel_order(order_key, requested_id, touched_symbols)
     'remaining', '0'
   )
 
+  -- Remove from user's active orders index
+  if user_id and symbol and order_id then
+    local index_key = 'user_orders:' .. user_id .. ':' .. symbol
+    redis.call('ZREM', index_key, order_id)
+  end
+
+  -- Publish order cancellation event to orders stream and delete terminal order hash
+  do
+    local now = redis.call('TIME')
+    local ts_ms = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
+    local seq_key = 'seq:' .. symbol
+    local sequence = redis.call('INCR', seq_key)
+    local orders_key = 'orders:' .. symbol
+    local order_type = order['type'] or ''
+    local quantity = order['quantity'] or '0'
+
+    local orders_maxlen = tonumber(market['orders_maxlen']) or 1000000
+    redis.call('XADD', orders_key, 'MAXLEN', '~', orders_maxlen, '*',
+      'order_id', order_id,
+      'user_id', user_id,
+      'symbol', symbol,
+      'side', side,
+      'type', order_type,
+      'status', 'CANCELLED',
+      'price', tostring(price),
+      'quantity', tostring(quantity),
+      'remaining', '0',
+      'ts', tostring(ts_ms),
+      'sequence', tostring(sequence)
+    )
+
+    -- Delete terminal order hash to keep storage lean
+    redis.call('DEL', order_key)
+  end
+
   touched_symbols[symbol] = true
 
   return {
@@ -140,23 +176,34 @@ end
 
 local results = {}
 local touched_symbols = {}
+
+-- Iterate user's active order indexes: user_orders:{user_id}:*
 local cursor = '0'
-
 repeat
-  local scan_result = redis.call('SCAN', cursor, 'MATCH', 'order:*', 'COUNT', 200)
-  cursor = scan_result[1]
-  local keys = scan_result[2]
+  local index_scan = redis.call('SCAN', cursor, 'MATCH', 'user_orders:' .. user_id .. ':*', 'COUNT', 100)
+  cursor = index_scan[1]
+  local index_keys = index_scan[2]
 
-  for i = 1, #keys do
-    local key = keys[i]
-    local owner = redis.call('HGET', key, 'user_id')
-    if owner == user_id then
-      local status = redis.call('HGET', key, 'status')
-      if (not status) or status == 'OPEN' or status == 'PARTIALLY_FILLED' then
-        local response = cancel_order(key, string.sub(key, 7), touched_symbols)
+  for i = 1, #index_keys do
+    local index_key = index_keys[i]
+    -- derive symbol from key: user_orders:{user_id}:{symbol}
+    local symbol = string.sub(index_key, string.len('user_orders:' .. user_id .. ':') + 1)
+    -- fetch all order ids in this index
+    local order_ids = redis.call('ZRANGE', index_key, 0, -1)
+    for j = 1, #order_ids do
+      local oid = order_ids[j]
+      local order_key = 'order:' .. oid
+      -- confirm status is cancelable
+      local status = redis.call('HGET', order_key, 'status')
+      local remaining = as_number(redis.call('HGET', order_key, 'remaining'))
+      if remaining > 0 and (not status or status == 'OPEN' or status == 'PARTIALLY_FILLED') then
+        local response = cancel_order(order_key, oid, touched_symbols)
         if response then
           results[#results + 1] = response
         end
+      else
+        -- not active; ensure it's not in index to avoid stale entries
+        redis.call('ZREM', index_key, oid)
       end
     end
   end

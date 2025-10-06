@@ -77,37 +77,32 @@ count    = ENV.fetch('COUNT', '100').to_i
 block_ms = ENV.fetch('BLOCK_MS', '2000').to_i
 
 File.open(output_path, 'a') do |f|
-  loop do
-    entries = consumer.read(count: count, block_ms: block_ms)
-    next if entries.empty?
+  consumer.each(count: count, block_ms: block_ms, auto_ack: true) do |e|
+    fields = e.fields
+    record = {
+      stream_entry_id: e.id,
+      symbol: fields['symbol'],
+      taker_side: fields['taker_side'],
+      price: fields['price'].to_i,
+      quantity: fields['quantity'].to_i,
+      quote: fields['quote'].to_i,
+      maker_fee: fields['maker_fee'].to_i,
+      taker_fee: fields['taker_fee'].to_i,
+      maker_order_id: fields['maker_order_id'],
+      taker_order_id: fields['taker_order_id'],
+      buy_order_id: fields['buy_order_id'],
+      sell_order_id: fields['sell_order_id'],
+      executed_ts_ms: fields['ts'].to_i
+    }
 
-    entries.each do |e|
-      fields = e.fields
-      record = {
-        stream_entry_id: e.id,
-        symbol: fields['symbol'],
-        taker_side: fields['taker_side'],
-        price: fields['price'].to_i,
-        quantity: fields['quantity'].to_i,
-        quote: fields['quote'].to_i,
-        maker_fee: fields['maker_fee'].to_i,
-        taker_fee: fields['taker_fee'].to_i,
-        maker_order_id: fields['maker_order_id'],
-        taker_order_id: fields['taker_order_id'],
-        buy_order_id: fields['buy_order_id'],
-        sell_order_id: fields['sell_order_id'],
-        executed_ts_ms: fields['ts'].to_i
-      }
+    line = JSON.generate(record)
+    f.puts(line)
+    f.flush
+    puts "[TRADE] #{line}"
 
-      line = JSON.generate(record)
-      f.puts(line)
-      f.flush
-      puts "[TRADE] #{line}"
-
-      consumer.ack(e.id)
-    rescue StandardError => err
-      warn "[ERROR] failed to persist/ack trade #{e.id}: #{err.message}"
-      # On error, do not ack; pending entries will be retried/claimed later
-    end
+    # auto_ack: true will ack if no exception raised
+  rescue StandardError => err
+    warn "[ERROR] failed to persist trade #{e.id}: #{err.message}"
+    # On error, do not ack; pending entries will be retried/claimed later
   end
 end

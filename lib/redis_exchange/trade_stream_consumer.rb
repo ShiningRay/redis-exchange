@@ -47,6 +47,34 @@ module RedisExchange
       normalize_read_result(raw)
     end
 
+    # Convenience loop: continuously read and yield entries to the given block.
+    # Stops when the block returns :halt. If auto_ack is true, ack after block
+    # executes successfully (no exception raised).
+    #
+    # Example:
+    #   consumer.each(count: 100, block_ms: 2000, auto_ack: true) do |entry|
+    #     persist(entry)
+    #     # return :halt to stop the loop
+    #   end
+    def each(count: 100, block_ms: 2000, auto_ack: false)
+      raise ArgumentError, 'block required' unless block_given?
+      loop do
+        entries = read(count: count, block_ms: block_ms)
+        next if entries.empty?
+
+        entries.each do |e|
+          begin
+            result = yield e
+            ack(e.id) if auto_ack
+            return if result == :halt
+          rescue StandardError => err
+            warn "[#{self.class.name}] error processing #{stream_key} #{e.id}: #{err.message}"
+            # Do not ack on error; pending entries can be retried/claimed later
+          end
+        end
+      end
+    end
+
     # Acknowledge an entry id back to the consumer group.
     def ack(entry_id)
       @redis.xack(stream_key, group, entry_id)

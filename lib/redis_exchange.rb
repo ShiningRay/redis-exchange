@@ -110,11 +110,20 @@ module RedisExchange
     end
 
     # Seed or update market metadata.
-    # @param price_scale [Integer] price precision scale
-    # @param quantity_scale [Integer] quantity precision scale
-  def seed_market(symbol:, base_asset:, quote_asset:, price_scale: 1, quantity_scale: 1,
+    # @param symbol [String] market symbol (e.g., 'BTCUSDT')
+    # @param base_asset [String] base asset code (e.g., 'BTC')
+    # @param quote_asset [String] quote asset code (e.g., 'USDT')
+    # @param price_scale [Integer] price precision scale (price in quote minor units)
+    # @param quantity_scale [Integer] quantity precision scale (quantity in base minor units)
+    # @param maker_fee_bps [Integer] maker fee in basis points (0..10000)
+    # @param taker_fee_bps [Integer] taker fee in basis points (0..10000)
+    # @param min_qty [Integer] minimum order quantity in base minor units
+    # @param min_notional [Integer] minimum notional in quote minor units
+    # @param trades_maxlen [Integer,nil] max trades stream length; nil uses default (1_000_000)
+    # @param orders_maxlen [Integer,nil] max orders stream length; nil uses default (1_000_000)
+    def seed_market(symbol:, base_asset:, quote_asset:, price_scale: 1, quantity_scale: 1,
                   maker_fee_bps: 0, taker_fee_bps: 0, min_qty: 1, min_notional: 1,
-                  trades_maxlen: nil)
+                  trades_maxlen: nil, orders_maxlen: nil)
       key = "market:#{symbol}"
       mapping = {
         'base_asset' => base_asset,
@@ -128,6 +137,7 @@ module RedisExchange
         'status' => 'OPEN'
       }
       mapping['trades_maxlen'] = trades_maxlen.to_i if trades_maxlen
+      mapping['orders_maxlen'] = orders_maxlen.to_i if orders_maxlen
       @redis.hset(key, mapping)
     end
 
@@ -190,11 +200,45 @@ module RedisExchange
       JSON.parse(raw)
     end
 
+    # 分页查询用户在某交易对的活跃订单（OPEN/PARTIALLY_FILLED 且 remaining>0）。
+    # 依赖 Lua 维护的 ZSET 索引：`user_orders:{user_id}:{symbol}`，score 使用撮合序列。
+    # @param user_id [String]
+    # @param symbol [String]
+    # @param page [Integer] 从 1 开始的页码
+    # @param per_page [Integer] 每页条数，默认 50
+    # @param direction [Symbol] :asc 或 :desc（根据序列顺序）
+    # @return [Array<Hash>] 订单快照数组
+    def active_orders(user_id:, symbol:, page: 1, per_page: 50, direction: :desc)
+      page = page.to_i
+      per_page = per_page.to_i
+      page = 1 if page <= 0
+      per_page = 50 if per_page <= 0
+
+      index_key = "user_orders:#{user_id}:#{symbol}"
+      start = (page - 1) * per_page
+      stop = start + per_page - 1
+
+      range_method = direction.to_sym == :asc ? :zrange : :zrevrange
+      ids = Array(@redis.public_send(range_method, index_key, start, stop))
+      return [] if ids.empty?
+
+      ids.map { |id| order(id) }.select { |o| !o.empty? && o[:remaining].positive? && (o[:status] == 'OPEN' || o[:status] == 'PARTIALLY_FILLED') }
+    end
+
     # Build a TradeStreamConsumer for a market symbol.
     # Usage: consumer = exchange.trade_consumer(symbol: 'BTCUSDT', group: 'trades-consumers', consumer: 'worker-1')
     def trade_consumer(symbol:, group:, consumer:)
       require_relative 'redis_exchange/trade_stream_consumer'
       c = RedisExchange::TradeStreamConsumer.new(redis: @redis, symbol: symbol, group: group, consumer: consumer)
+      c.ensure_group(start_id: '0')
+      c
+    end
+
+    # Build an OrderStreamConsumer for a market symbol.
+    # Usage: consumer = exchange.order_consumer(symbol: 'BTCUSDT', group: 'orders-consumers', consumer: 'worker-1')
+    def order_consumer(symbol:, group:, consumer:)
+      require_relative 'redis_exchange/order_stream_consumer'
+      c = RedisExchange::OrderStreamConsumer.new(redis: @redis, symbol: symbol, group: group, consumer: consumer)
       c.ensure_group(start_id: '0')
       c
     end
@@ -261,7 +305,8 @@ module RedisExchange
           keys[:volume_buy],
           keys[:volume_sell],
           keys[:balance],
-          keys[:trades]
+          keys[:trades],
+          keys[:orders]
         ],
         argv: [
           symbol,
@@ -289,7 +334,8 @@ module RedisExchange
         volume_buy: "volume:#{symbol}:BUY",
         volume_sell: "volume:#{symbol}:SELL",
         balance: "balance:#{user_id}",
-        trades: "trades:#{symbol}"
+        trades: "trades:#{symbol}",
+        orders: "orders:#{symbol}"
       }
     end
 
