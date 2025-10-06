@@ -156,6 +156,42 @@ end
 
 See `script/orders_demo.rb` for a runnable example.
 
+## Consuming Account Ledger
+
+Append-only account changes are published to the `account_ledger` Redis Stream. Use the built-in consumer to reliably process changes with consumer groups and idempotent persistence:
+
+```ruby
+consumer = exchange.ledger_consumer(group: 'ledger-consumers', consumer: 'worker-1')
+
+# Explicit read + ack style
+loop do
+  entries = consumer.read(count: 100, block_ms: 2000)
+  entries.each do |e|
+    fields = e.fields # { 'user_id' => 'u1', 'asset' => 'USDT', 'bucket' => 'available', 'delta' => '1000', 'reason' => 'DEPOSIT', 'ts' => '...', 'sequence' => '1' }
+
+    # Persist with idempotency: use e.id as unique key in your DB
+    # Convert numeric fields to integers before saving
+    consumer.ack(e.id)
+  end
+end
+
+# Or use the convenience each to drive the loop
+consumer.each(count: 100, block_ms: 2000, auto_ack: true) do |e|
+  # fields = e.fields
+  # Persist then optional halt
+  # return :halt if shutdown?
+end
+```
+
+Fields of each ledger entry:
+- `user_id` (String)
+- `asset` (String)
+- `bucket` (String: `available`|`reserved`)
+- `delta` (String integer; scaled)
+- `reason` (String)
+- `ts` (String integer; milliseconds)
+- `sequence` (String integer; per user+asset incremental)
+
 ## Development
 
 Ensure Redis 6+ is running locally. Install gem dependencies and run specs:
@@ -164,6 +200,25 @@ Ensure Redis 6+ is running locally. Install gem dependencies and run specs:
 bundle install
 bundle exec rspec
 ```
+
+## Account Ledger & Balance Helpers
+
+Convenience helpers are provided for deposits and withdrawals. All changes append entries to the `account_ledger` stream with a per-user-asset sequence counter:
+
+```ruby
+exchange = RedisExchange::Client.new(redis: Redis.new)
+
+# Deposit 100 USDT (scaled integer)
+exchange.deposit(user_id: 'u1', asset: 'USDT', amount: 100_000)
+
+# Withdraw 50 USDT
+exchange.withdraw(user_id: 'u1', asset: 'USDT', amount: 50_000)
+
+# Generic balance change (available or reserved)
+exchange.change_balance(user_id: 'u1', asset: 'BTC', bucket: 'reserved', delta: 10_000_000, reason: 'ORDER_RESERVE')
+```
+
+Each ledger entry includes: `user_id`, `asset`, `bucket`, `delta`, `reason`, `ts`, `sequence`.
 
 ## Benchmarking
 

@@ -53,6 +53,27 @@ local function hincrby(key, field, delta)
   end
 end
 
+-- Append an account ledger entry for a balance change.
+-- Uses per-user-asset sequence `ledger_seq:{user_id}:{asset}` and global stream `account_ledger`.
+local function append_ledger(user_id, asset, bucket, delta, reason, ts)
+  if delta == 0 then return end
+  local now_ts = ts
+  if not now_ts or now_ts <= 0 then
+    local now = redis.call('TIME')
+    now_ts = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
+  end
+  local seq = redis.call('INCR', 'ledger_seq:' .. user_id .. ':' .. asset)
+  redis.call('XADD', 'account_ledger', 'MAXLEN', '~', 1000000, '*',
+    'user_id', user_id,
+    'asset', asset,
+    'bucket', bucket,
+    'delta', tostring(delta),
+    'reason', reason or 'MATCH',
+    'ts', tostring(now_ts),
+    'sequence', tostring(seq)
+  )
+end
+
 -- Store a trade entry so that the response can echo executions.
 local function append_trade(trades, payload)
   trades[#trades + 1] = payload
@@ -355,7 +376,9 @@ while remaining > 0 do
       end
       taker_available_quote_after = taker_available_quote_after - debit
       hincrby(taker_balance_key, quote_available_field, -debit)
+      append_ledger(user_id, quote_asset, 'available', -debit, 'TAKER_SPEND', timestamp)
       hincrby(taker_balance_key, base_available_field, trade_qty)
+      append_ledger(user_id, base_asset, 'available', trade_qty, 'TAKER_RECEIVE', timestamp)
       taker_quote_spent = taker_quote_spent + debit
       taker_base_received = taker_base_received + trade_qty
     else
@@ -364,8 +387,10 @@ while remaining > 0 do
       end
       taker_available_base_after = taker_available_base_after - trade_qty
       hincrby(taker_balance_key, base_available_field, -trade_qty)
+      append_ledger(user_id, base_asset, 'available', -trade_qty, 'TAKER_SELL', timestamp)
       local credit = trade_quote - taker_fee
       hincrby(taker_balance_key, quote_available_field, credit)
+      append_ledger(user_id, quote_asset, 'available', credit, 'TAKER_RECEIVE', timestamp)
       taker_quote_received = taker_quote_received + credit
       taker_base_sold = taker_base_sold + trade_qty
     end
@@ -378,12 +403,16 @@ while remaining > 0 do
     local maker_balance_key = 'balance:' .. maker_user_id
     if maker_side == 'SELL' then
       hincrby(maker_balance_key, base_reserved_field, -trade_qty)
+      append_ledger(maker_user_id, base_asset, 'reserved', -trade_qty, 'MAKER_RELEASE', timestamp)
       local credit = trade_quote - maker_fee
       hincrby(maker_balance_key, quote_available_field, credit)
+      append_ledger(maker_user_id, quote_asset, 'available', credit, 'MAKER_RECEIVE', timestamp)
     else
       local debit = trade_quote + maker_fee
       hincrby(maker_balance_key, quote_reserved_field, -debit)
+      append_ledger(maker_user_id, quote_asset, 'reserved', -debit, 'MAKER_RELEASE', timestamp)
       hincrby(maker_balance_key, base_available_field, trade_qty)
+      append_ledger(maker_user_id, base_asset, 'available', trade_qty, 'MAKER_RECEIVE', timestamp)
     end
 
     maker_remaining = maker_remaining - trade_qty
@@ -498,7 +527,9 @@ else
           taker_available_quote_after = taker_available_quote_after - total_reserve
           taker_reserved_quote = taker_reserved_quote + total_reserve
           hincrby(taker_balance_key, quote_available_field, -total_reserve)
+          append_ledger(user_id, quote_asset, 'available', -total_reserve, 'TAKER_RESERVE', timestamp)
           hincrby(taker_balance_key, quote_reserved_field, total_reserve)
+          append_ledger(user_id, quote_asset, 'reserved', total_reserve, 'TAKER_RESERVE', timestamp)
         end
       else
         local reserve_qty = remaining
@@ -509,7 +540,9 @@ else
           taker_available_base_after = taker_available_base_after - reserve_qty
           taker_reserved_base = taker_reserved_base + reserve_qty
           hincrby(taker_balance_key, base_available_field, -reserve_qty)
+          append_ledger(user_id, base_asset, 'available', -reserve_qty, 'TAKER_RESERVE', timestamp)
           hincrby(taker_balance_key, base_reserved_field, reserve_qty)
+          append_ledger(user_id, base_asset, 'reserved', reserve_qty, 'TAKER_RESERVE', timestamp)
         end
       end
 

@@ -28,6 +28,27 @@ local function as_number(value)
   return num
 end
 
+-- Append an account ledger entry for a balance change.
+-- Uses per-user-asset sequence `ledger_seq:{user_id}:{asset}` and global stream `account_ledger`.
+local function append_ledger(user_id, asset, bucket, delta, reason, ts)
+  if delta == 0 then return end
+  local now_ts = ts
+  if not now_ts or now_ts <= 0 then
+    local now = redis.call('TIME')
+    now_ts = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
+  end
+  local seq = redis.call('INCR', 'ledger_seq:' .. user_id .. ':' .. asset)
+  redis.call('XADD', 'account_ledger', 'MAXLEN', '~', 1000000, '*',
+    'user_id', user_id,
+    'asset', asset,
+    'bucket', bucket,
+    'delta', tostring(delta),
+    'reason', reason or 'CANCEL_ALL',
+    'ts', tostring(now_ts),
+    'sequence', tostring(seq)
+  )
+end
+
 local function refresh_ticker(symbol)
   local ticker_key = 'ticker:' .. symbol
   local best_bid_member = redis.call('ZRANGE', 'book:' .. symbol .. ':BUY', -1, -1)
@@ -65,14 +86,18 @@ local function release_reserved(market, side, user_id, price, remaining)
 
   if side == 'SELL' then
     redis.call('HINCRBY', balance_key, base_asset .. ':reserved', -remaining)
+    append_ledger(user_id, base_asset, 'reserved', -remaining, 'CANCEL_ALL_RELEASE', nil)
     redis.call('HINCRBY', balance_key, base_asset .. ':available', remaining)
+    append_ledger(user_id, base_asset, 'available', remaining, 'CANCEL_ALL_REFUND', nil)
   else
     local notional = math.floor((as_number(price) * remaining) / quantity_scale)
     local fee = math.floor((notional * maker_fee_bps) / 10000)
     local total = notional + fee
     if total > 0 then
       redis.call('HINCRBY', balance_key, quote_asset .. ':reserved', -total)
+      append_ledger(user_id, quote_asset, 'reserved', -total, 'CANCEL_ALL_RELEASE', nil)
       redis.call('HINCRBY', balance_key, quote_asset .. ':available', total)
+      append_ledger(user_id, quote_asset, 'available', total, 'CANCEL_ALL_REFUND', nil)
     end
   end
 end

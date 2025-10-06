@@ -45,15 +45,18 @@ module RedisExchange
     def initialize(redis:, script_path: nil)
       @redis = redis
 
-      match_script_path = script_path || default_script_path
-      @match_script = register_script(read_script(match_script_path))
+    match_script_path = script_path || default_script_path
+    @match_script = register_script(read_script(match_script_path))
 
-      cancel_path = File.expand_path('../redis_scripts/cancel_order.lua', __dir__)
-      @cancel_script = register_script(read_script(cancel_path))
+    cancel_path = File.expand_path('../redis_scripts/cancel_order.lua', __dir__)
+    @cancel_script = register_script(read_script(cancel_path))
 
-      cancel_all_path = File.expand_path('../redis_scripts/cancel_all_orders.lua', __dir__)
-      @cancel_all_script = register_script(read_script(cancel_all_path))
-    end
+    cancel_all_path = File.expand_path('../redis_scripts/cancel_all_orders.lua', __dir__)
+    @cancel_all_script = register_script(read_script(cancel_all_path))
+
+    balance_change_path = File.expand_path('../redis_scripts/balance_change.lua', __dir__)
+    @balance_change_script = register_script(read_script(balance_change_path))
+  end
 
     # Submit a limit order and return the Redis/Lua response hash.
     # @param symbol [String] market symbol
@@ -66,6 +69,7 @@ module RedisExchange
     # @return [Hash] parsed Lua response
     def place_limit_order(symbol:, side:, order_id:, user_id:, price:, quantity:, timestamp_ms: nil)
       raise ArgumentError, 'price must be positive for limit orders' unless price.positive?
+      raise ArgumentError, 'quantity must be positive for limit orders' unless quantity.positive?
 
       execute_order(
         symbol: symbol,
@@ -196,9 +200,52 @@ module RedisExchange
 
     def cancel_all_orders(user_id)
       payload = { keys: [], argv: [user_id] }
-      raw = call_script(@cancel_all_script, payload)
-      JSON.parse(raw)
-    end
+    raw = call_script(@cancel_all_script, payload)
+    JSON.parse(raw)
+  end
+
+  # Adjust a user's available or reserved balance for an asset and record the transaction in the ledger.
+  # @param user_id [String] user identifier
+  # @param asset [String] asset symbol
+  # @param bucket [String] either 'available' or 'reserved'
+  # @param delta [Integer] amount to add (positive) or subtract (negative)
+  # @param reason [String] optional reason for the balance change (defaults to 'MANUAL_ADJUST')
+  # @param timestamp_ms [Integer,nil] optional timestamp in milliseconds
+  # @return [Hash] parsed Lua response with new value or error
+  def change_balance(user_id:, asset:, bucket:, delta:, reason: 'MANUAL_ADJUST', timestamp_ms: nil)
+    timestamp = timestamp_ms || current_millis
+    payload = { 
+      keys: ["balance:#{user_id}"], 
+      argv: [user_id, asset, bucket, delta.to_s, reason, timestamp.to_s] 
+    }
+    raw = call_script(@balance_change_script, payload)
+    JSON.parse(raw)
+  end
+
+  # Convenience: deposit funds into user's available balance for an asset.
+  # Emits ledger entry with reason 'DEPOSIT'.
+  # @param user_id [String]
+  # @param asset [String]
+  # @param amount [Integer] positive scaled integer amount
+  # @param timestamp_ms [Integer,nil]
+  # @return [Hash]
+  def deposit(user_id:, asset:, amount:, timestamp_ms: nil)
+    amt = amount.to_i.abs
+    change_balance(user_id: user_id, asset: asset, bucket: 'available', delta: amt, reason: 'DEPOSIT', timestamp_ms: timestamp_ms)
+  end
+
+  # Convenience: withdraw funds from user's available balance for an asset.
+  # Emits ledger entry with reason 'WITHDRAWAL'.
+  # Fails with error 'INSUFFICIENT_FUNDS' from Lua when balance insufficient.
+  # @param user_id [String]
+  # @param asset [String]
+  # @param amount [Integer] positive scaled integer amount
+  # @param timestamp_ms [Integer,nil]
+  # @return [Hash]
+  def withdraw(user_id:, asset:, amount:, timestamp_ms: nil)
+    amt = amount.to_i.abs
+    change_balance(user_id: user_id, asset: asset, bucket: 'available', delta: -amt, reason: 'WITHDRAWAL', timestamp_ms: timestamp_ms)
+  end
 
     # 分页查询用户在某交易对的活跃订单（OPEN/PARTIALLY_FILLED 且 remaining>0）。
     # 依赖 Lua 维护的 ZSET 索引：`user_orders:{user_id}:{symbol}`，score 使用撮合序列。
@@ -239,6 +286,15 @@ module RedisExchange
     def order_consumer(symbol:, group:, consumer:)
       require_relative 'redis_exchange/order_stream_consumer'
       c = RedisExchange::OrderStreamConsumer.new(redis: @redis, symbol: symbol, group: group, consumer: consumer)
+      c.ensure_group(start_id: '0')
+      c
+    end
+
+    # Build a LedgerStreamConsumer for account ledger stream.
+    # Usage: consumer = exchange.ledger_consumer(group: 'ledger-consumers', consumer: 'worker-1')
+    def ledger_consumer(group:, consumer:, stream_key: 'account_ledger')
+      require_relative 'redis_exchange/ledger_stream_consumer'
+      c = RedisExchange::LedgerStreamConsumer.new(redis: @redis, group: group, consumer: consumer, stream_key: stream_key)
       c.ensure_group(start_id: '0')
       c
     end
