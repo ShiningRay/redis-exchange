@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 require 'spec_helper'
-
+require 'redis_exchange/trade_stream_consumer'
 RSpec.describe RedisExchange::TradeStreamConsumer do
   let(:redis) { RSpec.configuration.redis_factory.call }
   let(:exchange) { RedisExchange::Client.new(redis: redis) }

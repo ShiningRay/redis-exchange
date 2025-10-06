@@ -86,7 +86,7 @@ File.open(output_path, 'a') do |f|
       record = {
         stream_entry_id: e.id,
         symbol: fields['symbol'],
-        side: fields['side'],
+        taker_side: fields['taker_side'],
         price: fields['price'].to_i,
         quantity: fields['quantity'].to_i,
         quote: fields['quote'].to_i,
@@ -94,6 +94,8 @@ File.open(output_path, 'a') do |f|
         taker_fee: fields['taker_fee'].to_i,
         maker_order_id: fields['maker_order_id'],
         taker_order_id: fields['taker_order_id'],
+        buy_order_id: fields['buy_order_id'],
+        sell_order_id: fields['sell_order_id'],
         executed_ts_ms: fields['ts'].to_i
       }
 

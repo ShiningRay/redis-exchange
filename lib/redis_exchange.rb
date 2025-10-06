@@ -112,8 +112,9 @@ module RedisExchange
     # Seed or update market metadata.
     # @param price_scale [Integer] price precision scale
     # @param quantity_scale [Integer] quantity precision scale
-    def seed_market(symbol:, base_asset:, quote_asset:, price_scale: 1, quantity_scale: 1,
-                    maker_fee_bps: 0, taker_fee_bps: 0, min_qty: 1, min_notional: 1)
+  def seed_market(symbol:, base_asset:, quote_asset:, price_scale: 1, quantity_scale: 1,
+                  maker_fee_bps: 0, taker_fee_bps: 0, min_qty: 1, min_notional: 1,
+                  trades_maxlen: nil)
       key = "market:#{symbol}"
       mapping = {
         'base_asset' => base_asset,
@@ -126,6 +127,7 @@ module RedisExchange
         'min_notional' => min_notional,
         'status' => 'OPEN'
       }
+      mapping['trades_maxlen'] = trades_maxlen.to_i if trades_maxlen
       @redis.hset(key, mapping)
     end
 
@@ -147,6 +149,31 @@ module RedisExchange
       raw.each_with_object({}) do |(field, value), result|
         result[field.to_sym] = value.to_i
       end
+    end
+
+    # Retrieve an order snapshot by id with typed fields.
+    # @param order_id [String]
+    # @return [Hash] empty hash when not found; otherwise typed fields
+    #   Keys:
+    #   - :order_id, :user_id, :symbol, :side, :type, :status (String)
+    #   - :price, :quantity, :remaining, :created_at, :sequence (Integer)
+    def order(order_id)
+      raw = @redis.hgetall("order:#{order_id}")
+      return {} if raw.empty?
+
+      {
+        order_id: raw.fetch('order_id', order_id),
+        user_id: raw['user_id'],
+        symbol: raw['symbol'],
+        side: raw['side'],
+        type: raw['type'],
+        status: raw['status'],
+        price: raw.fetch('price', '0').to_i,
+        quantity: raw.fetch('quantity', '0').to_i,
+        remaining: raw.fetch('remaining', '0').to_i,
+        created_at: raw.fetch('created_at', '0').to_i,
+        sequence: raw.fetch('sequence', '0').to_i
+      }
     end
 
     # Cancel a resting order and release any reserved balances.
@@ -391,6 +418,3 @@ module RedisExchange
     # Fallback-related helpers removed; cancellations handled via Lua scripts.
   end
 end
-# frozen_string_literal: true
-
-require_relative 'redis_exchange/trade_stream_consumer'

@@ -98,7 +98,22 @@ Matches are appended to a capped stream/list for downstream consumers:
 trades:{symbol}
 ```
 
-Each trade entry is a JSON blob with fields `(taker_order_id, maker_order_id, price, quantity, quote_amount, taker_fee, maker_fee, timestamp)`.
+Each trade entry is broadcast to `trades:{symbol}` via `XADD` with fields:
+
+```
+symbol        -> market symbol (e.g., BTCUSDT)
+taker_order_id
+maker_order_id
+buy_order_id  -> normalized convenience id (buyer side)
+sell_order_id -> normalized convenience id (seller side)
+taker_side    -> 'BUY' | 'SELL'
+price         -> executed price (scaled integer)
+quantity      -> executed base quantity (scaled integer)
+quote         -> executed quote amount (scaled integer)
+taker_fee     -> fee charged to taker (scaled integer)
+maker_fee     -> fee charged to maker (scaled integer)
+ts            -> unix timestamp in milliseconds
+```
 
 ### Ticker
 

@@ -132,6 +132,9 @@ if market['status'] ~= 'OPEN' then
   return cjson.encode({ error = 'MARKET_HALTED' })
 end
 
+-- Optional stream length cap from market config; default to 1,000,000 entries
+local trades_maxlen = tonumber(market['trades_maxlen']) or 1000000
+
 local base_asset = market['base_asset']
 local quote_asset = market['quote_asset']
 local quantity_scale = tonumber(market['quantity_scale'] or '1')
@@ -402,7 +405,7 @@ while remaining > 0 do
       -- normalized identifiers for convenience
       buy_order_id = is_buy and order_id or maker_order_id,
       sell_order_id = is_buy and maker_order_id or order_id,
-      taker_side = is_buy and 'buy' or 'sell',
+      taker_side = is_buy and 'BUY' or 'SELL',
       price = trade_price,
       quantity = trade_qty,
       quote = trade_quote,
@@ -411,12 +414,14 @@ while remaining > 0 do
       timestamp = timestamp
     }
     append_trade(trades, trade_payload)
-    redis.call('XADD', trades_key, '*',
+    -- Stream entry with near-length trimming to avoid unbounded growth
+    -- Use MAXLEN ~ for amortized trimming; length threshold sourced from market config.
+    redis.call('XADD', trades_key, 'MAXLEN', '~', trades_maxlen, '*',
       'taker_order_id', order_id,
       'maker_order_id', maker_order_id,
       'buy_order_id', is_buy and order_id or maker_order_id,
       'sell_order_id', is_buy and maker_order_id or order_id,
-      'taker_side', is_buy and 'buy' or 'sell',
+      'taker_side', is_buy and 'BUY' or 'SELL',
       'price', tostring(trade_price),
       'quantity', tostring(trade_qty),
       'quote', tostring(trade_quote),

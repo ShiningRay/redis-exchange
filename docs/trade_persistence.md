@@ -7,7 +7,19 @@
 
 ## 数据来源
 - Lua 匹配脚本在每次成交时执行 `XADD trades:{symbol}`，写入一条成交流水。
-- 记录字段包含但不限于：`symbol`, `side`, `price`, `quantity`, `quote`, `maker_fee`, `taker_fee`, `maker_order_id`, `taker_order_id`, `ts`（毫秒时间戳）。
+- 记录字段为：
+  - `symbol`
+  - `taker_order_id`
+  - `maker_order_id`
+  - `buy_order_id`（买方订单 id，便于查询）
+  - `sell_order_id`（卖方订单 id，便于查询）
+- `taker_side`（`BUY` | `SELL`）
+  - `price`（成交价，整数，已缩放）
+  - `quantity`（成交基础数量，整数，已缩放）
+  - `quote`（成交报价金额，整数，已缩放）
+  - `taker_fee`（成交扣除的吃单方手续费，整数）
+  - `maker_fee`（成交扣除的挂单方手续费，整数）
+  - `ts`（毫秒时间戳）
 - 数值字段均为整型（已按 `price_scale` 与 `quantity_scale` 缩放）。
 
 ## 消费者封装（GEM 内）
@@ -27,7 +39,7 @@
   - 必备字段：
     - `stream_entry_id`（唯一索引，来自 Redis Stream 的 `e.id`）
     - `symbol`（string）
-    - `side`（string，BUY/SELL）
+- `taker_side`（string，`BUY`/`SELL`）
     - `price`（bigint）
     - `quantity`（bigint）
     - `quote`（bigint）
@@ -35,6 +47,8 @@
     - `taker_fee`（bigint）
     - `maker_order_id`（string）
     - `taker_order_id`（string）
+    - `buy_order_id`（string，可选）
+    - `sell_order_id`（string，可选）
     - `executed_ts_ms`（bigint）
   - 索引：
     - 唯一索引：`stream_entry_id`
@@ -89,7 +103,7 @@ loop do
     attrs = {
       stream_entry_id: e.id,
       symbol: fields['symbol'],
-      side: fields['side'],
+      taker_side: fields['taker_side'],
       price: fields['price'].to_i,
       quantity: fields['quantity'].to_i,
       quote: fields['quote'].to_i,
@@ -97,6 +111,8 @@ loop do
       taker_fee: fields['taker_fee'].to_i,
       maker_order_id: fields['maker_order_id'],
       taker_order_id: fields['taker_order_id'],
+      buy_order_id: fields['buy_order_id'],
+      sell_order_id: fields['sell_order_id'],
       executed_ts_ms: fields['ts'].to_i
     }
 

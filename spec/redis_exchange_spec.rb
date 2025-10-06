@@ -87,6 +87,32 @@ RSpec.describe RedisExchange::Client do
     expect(order_snapshot['remaining']).to eq('0')
   end
 
+  it 'retrieves typed order snapshot by id' do
+    exchange.set_balance(user_id: 'maker', asset: 'BTC', available: 100_000_000)
+    exchange.place_limit_order(
+      symbol: symbol,
+      side: 'SELL',
+      order_id: 'query-1',
+      user_id: 'maker',
+      price: 3_000_000,
+      quantity: 100_000_000
+    )
+
+    snapshot = exchange.order('query-1')
+    expect(snapshot[:order_id]).to eq('query-1')
+    expect(snapshot[:symbol]).to eq(symbol)
+    expect(snapshot[:side]).to eq('SELL')
+    expect(snapshot[:type]).to eq('LIMIT')
+    expect(snapshot[:status]).to eq('OPEN')
+    expect(snapshot[:price]).to eq(3_000_000)
+    expect(snapshot[:quantity]).to eq(100_000_000)
+    expect(snapshot[:remaining]).to eq(100_000_000)
+    expect(snapshot[:sequence]).to be_a(Integer)
+    expect(snapshot[:created_at]).to be_a(Integer)
+
+    expect(exchange.order('nonexistent')).to eq({})
+  end
+
   it 'cancels all orders for a user without touching other users' do
     exchange.set_balance(user_id: 'maker', asset: 'BTC', available: 200_000_000)
     exchange.place_limit_order(
@@ -234,7 +260,7 @@ RSpec.describe RedisExchange::Client do
     expect(trade['maker_order_id']).to eq('maker-1')
     expect(trade['buy_order_id']).to eq('taker-1')
     expect(trade['sell_order_id']).to eq('maker-1')
-    expect(trade['taker_side']).to eq('buy')
+    expect(trade['taker_side']).to eq('BUY')
     expect(trade['price']).to eq(3_000_000)
     expect(trade['quantity']).to eq(50_000_000)
     expect(trade['timestamp']).to be_a(Integer)
@@ -248,7 +274,7 @@ RSpec.describe RedisExchange::Client do
     expect(fields_hash['maker_order_id']).to eq('maker-1')
     expect(fields_hash['buy_order_id']).to eq('taker-1')
     expect(fields_hash['sell_order_id']).to eq('maker-1')
-    expect(fields_hash['taker_side']).to eq('buy')
+    expect(fields_hash['taker_side']).to eq('BUY')
     expect(fields_hash['price']).to eq('3000000')
     expect(fields_hash['quantity']).to eq('50000000')
     expect(fields_hash['symbol']).to eq('BTCUSDT')

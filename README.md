@@ -85,6 +85,9 @@ puts response # JSON parsed into a Ruby hash
 
 # Retrieve ticker information (last trade, best bid/ask).
 p exchange.ticker('BTCUSDT')
+
+# Retrieve an order snapshot by id with typed fields
+pp exchange.order('sell-1')
 ```
 
 ## Consuming Trade Stream
