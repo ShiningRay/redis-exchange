@@ -28,16 +28,16 @@ RSpec.describe 'Numeric precision bounds', :precision_bounds do
 
       exchange.set_balance(user_id: 'maker_overflow', asset: 'BTC', available: 10_000_000_000_000_000)
 
-      result = exchange.place_limit_order(
-        symbol: symbol,
-        side: 'SELL',
-        order_id: 'overflow-limit-1',
-        user_id: 'maker_overflow',
-        price: 10_000_000_000,
-        quantity: 1_000_000_000
-      )
+    result = exchange.place_limit_order(
+      symbol: symbol,
+      side: 'SELL',
+      order_id: 'overflow-limit-1',
+      user_id: 'maker_overflow',
+      price: 10_000_000_000,
+      quantity: 1_000_000_000
+    )
 
-      expect(result['error']).to eq('PRECISION_OVERFLOW')
+    expect(result[:error]).to eq('PRECISION_OVERFLOW')
     end
 
     it 'accepts near-threshold price*quantity without overflow' do
@@ -52,8 +52,8 @@ RSpec.describe 'Numeric precision bounds', :precision_bounds do
         quantity: 2_000_000
       )
 
-      expect(result['status']).to eq('OPEN')
-      expect(result['error']).to be_nil
+      expect(result[:status]).to eq('OPEN')
+      expect(result[:error]).to be_nil
     end
   end
 
@@ -82,7 +82,7 @@ RSpec.describe 'Numeric precision bounds', :precision_bounds do
         price_cap: 10_000_000_000
       )
 
-      expect(outcome['error']).to eq('PRECISION_OVERFLOW')
+      expect(outcome[:error]).to eq('PRECISION_OVERFLOW')
     end
 
     it 'accepts near-threshold matching without overflow' do
@@ -107,8 +107,8 @@ RSpec.describe 'Numeric precision bounds', :precision_bounds do
         price_cap: 5_000_000_000
       )
 
-      expect(outcome['status']).to eq('FILLED').or eq('PARTIALLY_FILLED')
-      expect(outcome['error']).to be_nil
+      expect(outcome[:status]).to eq('FILLED').or eq('PARTIALLY_FILLED')
+      expect(outcome[:error]).to be_nil
     end
   end
 

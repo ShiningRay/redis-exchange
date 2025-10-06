@@ -262,6 +262,33 @@ local opposite_book_key = is_buy and book_sell_key or book_buy_key
 local own_book_key = is_buy and book_buy_key or book_sell_key
 local opposite_volume_key = is_buy and volume_sell_key or volume_buy_key
 local own_volume_key = is_buy and volume_buy_key or volume_sell_key
+-- Pre-check: for market orders, ensure sufficient opposing liquidity exists to fully satisfy requested quantity.
+-- This avoids partial executions when the user expects all-or-nothing for market orders.
+local insufficient_liquidity_precheck = false
+if is_market then
+  local total_liquidity = 0
+  local levels = redis.call('ZRANGE', opposite_book_key, 0, -1, 'WITHSCORES')
+  for i = 1, #levels, 2 do
+    local price_member = levels[i]
+    local level_price = tonumber(levels[i + 1])
+    if has_price_limit then
+      if is_buy and level_price > price_limit then
+        break
+      end
+      if (not is_buy) and level_price < price_limit then
+        break
+      end
+    end
+    local level_volume = as_number(redis.call('HGET', opposite_volume_key, price_member))
+    total_liquidity = total_liquidity + level_volume
+    if total_liquidity >= quantity then
+      break
+    end
+  end
+  if total_liquidity < quantity then
+    insufficient_liquidity_precheck = true
+  end
+end
 local function update_ticker_state(trade_list)
   local ticker_key = 'ticker:' .. symbol
 
@@ -308,7 +335,7 @@ end
 
 local opposite_side = is_buy and 'SELL' or 'BUY'
 
-while remaining > 0 do
+while (not insufficient_liquidity_precheck) and remaining > 0 do
   local level = best_price_key_for_side(opposite_book_key, is_buy)
   if #level == 0 then
     break
@@ -421,6 +448,9 @@ while remaining > 0 do
 
     redis.call('HSET', maker_order_key, 'remaining', maker_remaining)
 
+    -- Update volume first before any cleanup
+    redis.call('HINCRBY', opposite_volume_key, price_member, -trade_qty)
+    
     if maker_remaining == 0 then
       redis.call('HSET', maker_order_key, 'status', 'FILLED')
       redis.call('LPOP', queue_key)
@@ -460,8 +490,6 @@ while remaining > 0 do
         'sequence', tostring(redis.call('HGET', maker_order_key, 'sequence') or '')
       )
     end
-
-    redis.call('HINCRBY', opposite_volume_key, price_member, -trade_qty)
 
     local trade_payload = {
       taker_order_id = order_id,

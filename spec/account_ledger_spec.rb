@@ -19,7 +19,7 @@ RSpec.describe 'Account Ledger and Balance Changes' do
 
   it '存款：更新available并写入账户流水' do
     result = exchange.deposit(user_id: 'u1', asset: 'USDT', amount: 100_000)
-    expect(result['ok']).to eq(true)
+    expect(result[:ok]).to eq(true)
     balances = redis.hgetall('balance:u1')
     expect(balances['USDT:available'].to_i).to eq(100_000)
     expect(balances['USDT:reserved'].to_i).to eq(0)
@@ -38,7 +38,7 @@ RSpec.describe 'Account Ledger and Balance Changes' do
   it '取款：余额充足时更新available并写入账户流水' do
     exchange.deposit(user_id: 'u1', asset: 'USDT', amount: 100_000)
     result = exchange.withdraw(user_id: 'u1', asset: 'USDT', amount: 40_000)
-    expect(result['ok']).to eq(true)
+    expect(result[:ok]).to eq(true)
 
     balances = redis.hgetall('balance:u1')
     expect(balances['USDT:available'].to_i).to eq(60_000)
@@ -57,7 +57,7 @@ RSpec.describe 'Account Ledger and Balance Changes' do
 
   it '取款：余额不足时返回错误且不写入账户流水' do
     result = exchange.withdraw(user_id: 'u1', asset: 'USDT', amount: 50_000)
-    expect(result['error']).to eq('INSUFFICIENT_FUNDS')
+    expect(result[:error]).to eq('INSUFFICIENT_FUNDS')
 
     balances = redis.hgetall('balance:u1')
     expect(balances['USDT:available'].to_i).to eq(0)
@@ -70,7 +70,7 @@ RSpec.describe 'Account Ledger and Balance Changes' do
 
   it 'reserved变更：写入reserved并投递账户流水' do
     result = exchange.change_balance(user_id: 'u1', asset: 'BTC', bucket: 'reserved', delta: 10_000_000, reason: 'ORDER_RESERVE')
-    expect(result['ok']).to eq(true)
+    expect(result[:ok]).to eq(true)
     balances = redis.hgetall('balance:u1')
     expect(balances['BTC:available'].to_i).to eq(0)
     expect(balances['BTC:reserved'].to_i).to eq(10_000_000)

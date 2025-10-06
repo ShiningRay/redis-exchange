@@ -195,13 +195,13 @@ module RedisExchange
     def cancel_order(order_id)
       payload = { keys: ["order:#{order_id}"], argv: [order_id] }
       raw = call_script(@cancel_script, payload)
-      JSON.parse(raw)
+      JSON.parse(raw, symbolize_names: true)
     end
 
     def cancel_all_orders(user_id)
       payload = { keys: [], argv: [user_id] }
     raw = call_script(@cancel_all_script, payload)
-    JSON.parse(raw)
+    JSON.parse(raw, symbolize_names: true)
   end
 
   # Adjust a user's available or reserved balance for an asset and record the transaction in the ledger.
@@ -219,7 +219,7 @@ module RedisExchange
       argv: [user_id, asset, bucket, delta.to_s, reason, timestamp.to_s] 
     }
     raw = call_script(@balance_change_script, payload)
-    JSON.parse(raw)
+    JSON.parse(raw, symbolize_names: true)
   end
 
   # Convenience: deposit funds into user's available balance for an asset.
@@ -340,13 +340,13 @@ module RedisExchange
       pl = price_limit.to_i
       qty = quantity.to_i
       if pl.negative? || qty <= 0
-        return { 'error' => 'INVALID_PRICE_OR_QUANTITY' }
+        return { error: 'INVALID_PRICE_OR_QUANTITY' }
       end
       if pl > 0
         # If either operand or the product breaches the bound, abort.
         # allow product equal to bound; overflow only when strictly greater
         if pl >= precision_bound || qty >= precision_bound || (pl.to_i * qty.to_i) > precision_bound
-          return { 'error' => 'PRECISION_OVERFLOW' }
+          return { error: 'PRECISION_OVERFLOW' }
         end
       end
 
@@ -377,7 +377,7 @@ module RedisExchange
       }
 
       raw = execute_via_match_script(script_payload)
-      JSON.parse(raw)
+      JSON.parse(raw, symbolize_names: true)
     end
 
     # Build all Redis keys touched by the Lua script for a market/user pair.
