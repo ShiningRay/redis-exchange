@@ -86,6 +86,34 @@ RSpec.describe 'Account Ledger and Balance Changes' do
     expect(redis.get('ledger_seq:u1:BTC')).to eq('1')
   end
 
+  it 'change_balance 支持 biz_id 幂等，重复提交不产生重复流水或余额变化' do
+    # 首次调用，使用相同的 biz_id
+    biz_id = 'req-123'
+    r1 = exchange.change_balance(user_id: 'u1', asset: 'USDT', bucket: 'available', delta: 50_000, reason: 'MANUAL_ADJUST', biz_id: biz_id)
+    expect(r1[:ok]).to eq(true)
+    expect(r1[:delta]).to eq(50_000)
+
+    # 重复调用同一请求，应返回缓存结果且不重复写入流水
+    r2 = exchange.change_balance(user_id: 'u1', asset: 'USDT', bucket: 'available', delta: 50_000, reason: 'MANUAL_ADJUST', biz_id: biz_id)
+    expect(r2[:ok]).to eq(true)
+    expect(r2[:delta]).to eq(50_000)
+    expect(r2[:sequence]).to eq(r1[:sequence])
+    expect(r2[:ts]).to eq(r1[:ts])
+
+    balances = redis.hgetall('balance:u1')
+    expect(balances['USDT:available'].to_i).to eq(50_000)
+
+    # 账户流水只应有一条记录
+    entries = redis.xrevrange('account_ledger', '+', '-', count: 10)
+    expect(entries.size).to eq(1)
+    entry_fields = (entries.first&.last.is_a?(Hash) ? entries.first.last : Hash[*entries.first.last])
+    expect(entry_fields['user_id']).to eq('u1')
+    expect(entry_fields['asset']).to eq('USDT')
+    expect(entry_fields['bucket']).to eq('available')
+    expect(entry_fields['delta']).to eq('50000')
+    expect(entry_fields['reason']).to eq('MANUAL_ADJUST')
+  end
+
   it 'ledger_seq：按用户资产独立递增' do
     exchange.deposit(user_id: 'u1', asset: 'USDT', amount: 100_000)
     exchange.deposit(user_id: 'u1', asset: 'USDT', amount: 50_000)

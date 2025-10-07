@@ -9,6 +9,7 @@
 --   4. delta (integer; positive for credit, negative for debit)
 --   5. reason (string; e.g., MANUAL_ADJUST)
 --   6. timestamp in ms (optional; when missing, computed via TIME)
+--   7. biz_id (optional; idempotency key to avoid duplicate requests)
 --
 -- Returns JSON with new value or error.
 
@@ -28,6 +29,7 @@ local bucket = ARGV[3]
 local delta = tonumber(ARGV[4] or '0') or 0
 local reason = ARGV[5] or 'MANUAL_ADJUST'
 local ts_arg = ARGV[6]
+local biz_id = ARGV[7]
 
 if not (balance_key and user_id and asset and bucket) then
   return cjson.encode({ error = 'INVALID_ARGUMENTS' })
@@ -35,6 +37,16 @@ end
 
 if bucket ~= 'available' and bucket ~= 'reserved' then
   return cjson.encode({ error = 'INVALID_BUCKET' })
+end
+
+-- Idempotency: if a cached response exists for this biz_id, return it.
+local resp_key = nil
+if biz_id and biz_id ~= '' then
+  resp_key = 'balance_biz:' .. user_id .. ':' .. asset .. ':' .. bucket .. ':' .. biz_id
+  local cached = redis.call('GET', resp_key)
+  if cached then
+    return cached
+  end
 end
 
 local field = asset .. ':' .. bucket
@@ -69,5 +81,11 @@ redis.call('XADD', ledger_stream_key, 'MAXLEN', '~', ledger_maxlen, '*',
   'ts', tostring(ts),
   'sequence', tostring(seq)
 )
+local result_json = cjson.encode({ ok = true, user_id = user_id, asset = asset, bucket = bucket, delta = delta, value = after, ts = ts, sequence = seq })
 
-return cjson.encode({ ok = true, user_id = user_id, asset = asset, bucket = bucket, delta = delta, value = after, ts = ts, sequence = seq })
+-- Cache the result for idempotency if biz_id provided (24h TTL)
+if resp_key then
+  redis.call('SET', resp_key, result_json, 'EX', 86400)
+end
+
+return result_json

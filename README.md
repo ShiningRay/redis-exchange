@@ -90,6 +90,15 @@ p exchange.ticker('BTCUSDT')
 pp exchange.order('sell-1')
 ```
 
+### Auto-connect without providing `redis`
+
+You can omit the `redis` parameter and the client will auto-connect using `ENV['REDIS_URL']` or fall back to `redis://127.0.0.1:6379/0`.
+
+```ruby
+# Uses ENV['REDIS_URL'] if set; otherwise connects to local Redis db 0
+exchange = RedisExchange::Client.new
+```
+
 ## Consuming Trade Stream
 
 Each market emits executed trades to a Redis Stream `trades:{symbol}` inside the Lua script. You can use the built-in consumer helper to process and persist trades reliably:
@@ -219,6 +228,18 @@ exchange.change_balance(user_id: 'u1', asset: 'BTC', bucket: 'reserved', delta: 
 ```
 
 Each ledger entry includes: `user_id`, `asset`, `bucket`, `delta`, `reason`, `ts`, `sequence`.
+
+Idempotency: `change_balance` accepts an optional `biz_id` to deduplicate duplicate requests. When provided, the Redis Lua script returns a cached response for the same `{user_id, asset, bucket, biz_id}` within 24 hours and does not append a duplicate ledger entry or re-apply the balance mutation.
+
+```ruby
+# Using biz_id to prevent duplicate submissions
+biz_id = 'req-123'
+exchange.change_balance(user_id: 'u1', asset: 'USDT', bucket: 'available', delta: 50_000, reason: 'MANUAL_ADJUST', biz_id: biz_id)
+# A repeated call with the same biz_id returns the same response and does not duplicate effects
+exchange.change_balance(user_id: 'u1', asset: 'USDT', bucket: 'available', delta: 50_000, reason: 'MANUAL_ADJUST', biz_id: biz_id)
+```
+
+If `biz_id` is omitted, the client auto-generates a UUID and includes it in the response as `:biz_id`.
 
 ## Benchmarking
 

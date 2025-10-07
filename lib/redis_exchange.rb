@@ -19,6 +19,7 @@
 require 'json'
 require 'redis' unless defined?(Redis)
 require 'time'
+require 'securerandom'
 
 module RedisExchange
   TICKER_FIELDS = %w[
@@ -40,12 +41,12 @@ module RedisExchange
   # Client encapsulates Lua script execution and convenience helpers.
   class Client
 
-    # @param redis [Redis] configured Redis connection
-    # @param script_path [String,nil] optional override for the Lua script path
-    def initialize(redis:, script_path: nil)
-      @redis = redis
+    # @param redis [Redis,nil] configured Redis connection; if nil, auto-connect
+    # Auto-connect priority: ENV['REDIS_URL'] -> 'redis://127.0.0.1:6379/0'
+    def initialize(redis: nil)
+      @redis = redis || Redis.new(url: (ENV['REDIS_URL'] || 'redis://127.0.0.1:6379/0'))
 
-      match_script_path = script_path || default_script_path
+      match_script_path = File.expand_path('../redis_scripts/match_order.lua', __dir__)
       @match_script = register_script(read_script(match_script_path))
 
       cancel_path = File.expand_path('../redis_scripts/cancel_order.lua', __dir__)
@@ -211,15 +212,19 @@ module RedisExchange
   # @param delta [Integer] amount to add (positive) or subtract (negative)
   # @param reason [String] optional reason for the balance change (defaults to 'MANUAL_ADJUST')
   # @param timestamp_ms [Integer,nil] optional timestamp in milliseconds
+  # @param biz_id [String,nil] optional idempotency key to deduplicate requests
   # @return [Hash] parsed Lua response with new value or error
-  def change_balance(user_id:, asset:, bucket:, delta:, reason: 'MANUAL_ADJUST', timestamp_ms: nil)
+  def change_balance(user_id:, asset:, bucket:, delta:, reason: 'MANUAL_ADJUST', timestamp_ms: nil, biz_id: nil)
     timestamp = timestamp_ms || current_millis
+    biz = (biz_id && !biz_id.to_s.empty?) ? biz_id.to_s : SecureRandom.uuid
     payload = { 
       keys: ["balance:#{user_id}"], 
-      argv: [user_id, asset, bucket, delta.to_s, reason, timestamp.to_s] 
+      argv: [user_id, asset, bucket, delta.to_s, reason, timestamp.to_s, biz] 
     }
     raw = call_script(@balance_change_script, payload)
-    JSON.parse(raw, symbolize_names: true)
+    resp = JSON.parse(raw, symbolize_names: true)
+    resp[:biz_id] = biz
+    resp
   end
 
   # Convenience: deposit funds into user's available balance for an asset.
@@ -229,9 +234,9 @@ module RedisExchange
   # @param amount [Integer] positive scaled integer amount
   # @param timestamp_ms [Integer,nil]
   # @return [Hash]
-  def deposit(user_id:, asset:, amount:, timestamp_ms: nil)
+  def deposit(user_id:, asset:, amount:, timestamp_ms: nil, biz_id: nil)
     amt = amount.to_i.abs
-    change_balance(user_id: user_id, asset: asset, bucket: 'available', delta: amt, reason: 'DEPOSIT', timestamp_ms: timestamp_ms)
+    change_balance(user_id: user_id, asset: asset, bucket: 'available', delta: amt, reason: 'DEPOSIT', timestamp_ms: timestamp_ms, biz_id: biz_id)
   end
 
   # Convenience: withdraw funds from user's available balance for an asset.
@@ -242,9 +247,9 @@ module RedisExchange
   # @param amount [Integer] positive scaled integer amount
   # @param timestamp_ms [Integer,nil]
   # @return [Hash]
-  def withdraw(user_id:, asset:, amount:, timestamp_ms: nil)
+  def withdraw(user_id:, asset:, amount:, timestamp_ms: nil, biz_id: nil)
     amt = amount.to_i.abs
-    change_balance(user_id: user_id, asset: asset, bucket: 'available', delta: -amt, reason: 'WITHDRAWAL', timestamp_ms: timestamp_ms)
+    change_balance(user_id: user_id, asset: asset, bucket: 'available', delta: -amt, reason: 'WITHDRAWAL', timestamp_ms: timestamp_ms, biz_id: biz_id)
   end
 
     # 分页查询用户在某交易对的活跃订单（OPEN/PARTIALLY_FILLED 且 remaining>0）。
@@ -393,11 +398,6 @@ module RedisExchange
         trades: "trades:#{symbol}",
         orders: "orders:#{symbol}"
       }
-    end
-
-    # Path to the bundled Lua matching script.
-    def default_script_path
-      File.expand_path('../redis_scripts/match_order.lua', __dir__)
     end
 
     # Current epoch time in milliseconds.
