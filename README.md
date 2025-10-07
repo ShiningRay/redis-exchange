@@ -176,7 +176,7 @@ consumer = exchange.ledger_consumer(group: 'ledger-consumers', consumer: 'worker
 loop do
   entries = consumer.read(count: 100, block_ms: 2000)
   entries.each do |e|
-    fields = e.fields # { 'user_id' => 'u1', 'asset' => 'USDT', 'bucket' => 'available', 'delta' => '1000', 'reason' => 'DEPOSIT', 'ts' => '...', 'sequence' => '1' }
+    fields = e.fields # { 'user_id' => 'u1', 'asset' => 'USDT', 'bucket' => 'available', 'delta' => '1000', 'reason' => 'DEPOSIT', 'ts' => '...', 'sequence' => '1', 'biz_id' => '...' }
 
     # Persist with idempotency: use e.id as unique key in your DB
     # Convert numeric fields to integers before saving
@@ -200,6 +200,7 @@ Fields of each ledger entry:
 - `reason` (String)
 - `ts` (String integer; milliseconds)
 - `sequence` (String integer; per user+asset incremental)
+- `biz_id` (String; idempotency key; auto-generated if not provided)
 
 ## Development
 
@@ -227,9 +228,9 @@ exchange.withdraw(user_id: 'u1', asset: 'USDT', amount: 50_000)
 exchange.change_balance(user_id: 'u1', asset: 'BTC', bucket: 'reserved', delta: 10_000_000, reason: 'ORDER_RESERVE')
 ```
 
-Each ledger entry includes: `user_id`, `asset`, `bucket`, `delta`, `reason`, `ts`, `sequence`.
+Each ledger entry includes: `user_id`, `asset`, `bucket`, `delta`, `reason`, `ts`, `sequence`, `biz_id`.
 
-Idempotency: `change_balance` accepts an optional `biz_id` to deduplicate duplicate requests. When provided, the Redis Lua script returns a cached response for the same `{user_id, asset, bucket, biz_id}` within 24 hours and does not append a duplicate ledger entry or re-apply the balance mutation.
+Idempotency: `change_balance` accepts an optional `biz_id` to deduplicate duplicate requests. When provided, the Redis Lua script returns a cached response for the same `{user_id, asset, bucket, biz_id}` within 24 hours and does not append a duplicate ledger entry or re-apply the balance mutation. The ledger entry will include the same `biz_id`.
 
 ```ruby
 # Using biz_id to prevent duplicate submissions
@@ -239,7 +240,7 @@ exchange.change_balance(user_id: 'u1', asset: 'USDT', bucket: 'available', delta
 exchange.change_balance(user_id: 'u1', asset: 'USDT', bucket: 'available', delta: 50_000, reason: 'MANUAL_ADJUST', biz_id: biz_id)
 ```
 
-If `biz_id` is omitted, the client auto-generates a UUID and includes it in the response as `:biz_id`.
+If `biz_id` is omitted, the client auto-generates a UUID and includes it in the response as `:biz_id`; the ledger entry will also carry this generated `biz_id`. Internally generated events (e.g., matching/cancellation) attach an auto `biz_id` as well.
 
 ## Benchmarking
 

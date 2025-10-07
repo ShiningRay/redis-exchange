@@ -32,6 +32,7 @@ RSpec.describe 'Account Ledger and Balance Changes' do
     expect(entry['delta']).to eq('100000')
     expect(entry['reason']).to eq('DEPOSIT')
     expect(entry['sequence']).to eq('1')
+    expect(entry['biz_id']).to eq(result[:biz_id])
     expect(redis.get('ledger_seq:u1:USDT')).to eq('1')
   end
 
@@ -52,6 +53,7 @@ RSpec.describe 'Account Ledger and Balance Changes' do
     expect(entry['delta']).to eq('-40000')
     expect(entry['reason']).to eq('WITHDRAWAL')
     expect(entry['sequence']).to eq('2')
+    expect(entry['biz_id']).to eq(result[:biz_id])
     expect(redis.get('ledger_seq:u1:USDT')).to eq('2')
   end
 
@@ -83,6 +85,7 @@ RSpec.describe 'Account Ledger and Balance Changes' do
     expect(entry['delta']).to eq('10000000')
     expect(entry['reason']).to eq('ORDER_RESERVE')
     expect(entry['sequence']).to eq('1')
+    expect(entry['biz_id']).to eq(result[:biz_id])
     expect(redis.get('ledger_seq:u1:BTC')).to eq('1')
   end
 
@@ -112,6 +115,7 @@ RSpec.describe 'Account Ledger and Balance Changes' do
     expect(entry_fields['bucket']).to eq('available')
     expect(entry_fields['delta']).to eq('50000')
     expect(entry_fields['reason']).to eq('MANUAL_ADJUST')
+    expect(entry_fields['biz_id']).to eq(biz_id)
   end
 
   it 'ledger_seq：按用户资产独立递增' do

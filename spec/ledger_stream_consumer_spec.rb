@@ -40,6 +40,7 @@ RSpec.describe RedisExchange::LedgerStreamConsumer do
     expect(entry.fields['user_id']).to eq('u1')
     expect(entry.fields['asset']).to eq('USDT')
     expect(%w[available reserved]).to include(entry.fields['bucket'])
+    expect(entry.fields['biz_id']).to be_a(String)
 
     acked = consumer.ack(entry.id)
     expect(acked).to be >= 1

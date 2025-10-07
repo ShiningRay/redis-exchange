@@ -72,6 +72,12 @@ local seq = redis.call('INCR', 'ledger_seq:' .. user_id .. ':' .. asset)
 local ledger_stream_key = 'account_ledger'
 local ledger_maxlen = 1000000
 
+-- Determine the biz_id to attach to the ledger entry
+local ledger_biz_id = biz_id
+if not ledger_biz_id or ledger_biz_id == '' then
+  ledger_biz_id = 'AUTO:' .. user_id .. ':' .. asset .. ':' .. bucket .. ':' .. tostring(seq)
+end
+
 redis.call('XADD', ledger_stream_key, 'MAXLEN', '~', ledger_maxlen, '*',
   'user_id', user_id,
   'asset', asset,
@@ -79,9 +85,10 @@ redis.call('XADD', ledger_stream_key, 'MAXLEN', '~', ledger_maxlen, '*',
   'delta', tostring(delta),
   'reason', reason,
   'ts', tostring(ts),
-  'sequence', tostring(seq)
+  'sequence', tostring(seq),
+  'biz_id', ledger_biz_id
 )
-local result_json = cjson.encode({ ok = true, user_id = user_id, asset = asset, bucket = bucket, delta = delta, value = after, ts = ts, sequence = seq })
+local result_json = cjson.encode({ ok = true, user_id = user_id, asset = asset, bucket = bucket, delta = delta, value = after, ts = ts, sequence = seq, biz_id = ledger_biz_id })
 
 -- Cache the result for idempotency if biz_id provided (24h TTL)
 if resp_key then

@@ -39,6 +39,7 @@ local function append_ledger(user_id, asset, bucket, delta, reason, ts)
     now_ts = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
   end
   local seq = redis.call('INCR', 'ledger_seq:' .. user_id .. ':' .. asset)
+  local ledger_biz_id = 'AUTO:' .. user_id .. ':' .. asset .. ':' .. bucket .. ':' .. tostring(seq)
   redis.call('XADD', 'account_ledger', 'MAXLEN', '~', 1000000, '*',
     'user_id', user_id,
     'asset', asset,
@@ -46,7 +47,8 @@ local function append_ledger(user_id, asset, bucket, delta, reason, ts)
     'delta', tostring(delta),
     'reason', reason or 'CANCEL',
     'ts', tostring(now_ts),
-    'sequence', tostring(seq)
+    'sequence', tostring(seq),
+    'biz_id', ledger_biz_id
   )
 end
 
