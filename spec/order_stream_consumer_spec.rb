@@ -10,6 +10,8 @@ RSpec.describe RedisExchange::OrderStreamConsumer do
 
   before do
     redis.flushdb
+    exchange.seed_asset(asset: 'BTC', balance_scale: 100_000_000, status: 'ACTIVE')
+    exchange.seed_asset(asset: 'USDT', balance_scale: 100, status: 'ACTIVE')
     exchange.seed_market(
       symbol: symbol,
       base_asset: 'BTC',

@@ -24,8 +24,21 @@ market:{symbol}
     taker_fee_bps     -> taker fee in basis points
     min_qty           -> minimum order quantity (scaled integer)
     min_notional      -> minimum notional (quote units)
-    status            -> OPEN | HALTED
+    status            -> OPEN | HALTED | CLOSED
 ```
+
+### Assets (New)
+
+```
+asset:{asset}
+    balance_scale    -> integer scale used for balances and ledger (e.g., 1, 100, 1_000_000)
+    status           -> ACTIVE | HALTED
+    # optional display hints (not used by Lua): name, display_decimals
+```
+
+- Purpose: decouple account/ledger precision from per-market matching precision.
+- All deposits/withdrawals/ledger entries must use `balance_scale` minor units for the asset.
+- Markets reference assets via `base_asset` and `quote_asset`; the matching script converts market-scale deltas into asset `balance_scale` when mutating balances and writing ledger.
 
 ### Balances
 
@@ -37,7 +50,7 @@ balance:{user_id}
     {asset}:reserved  -> funds locked on active orders
 ```
 
-All amounts are stored as integers in minor units (`price_scale`, `quantity_scale`).
+All balances are stored as integers in the asset's minor units (`asset.balance_scale`). Matching uses market scales (`price_scale`, `quantity_scale`) and converts to asset units before applying.
 
 ### Order Books
 
@@ -136,6 +149,7 @@ ticker:{symbol}
 
 1. **Validation**
    - Market must be `OPEN`.
+   - The Ruby client performs a pre-check and rejects new order placement when market status is `HALTED` or `CLOSED` (returns `MARKET_HALTED` or `MARKET_CLOSED`).
    - Order quantity must satisfy the market minimum; limit orders must also meet the minimum notional.
    - The taker must have sufficient `available` balance to cover the order (quote asset for buys, base asset for sells).
 
@@ -164,13 +178,34 @@ ticker:{symbol}
      - Balance deltas applied to the taker
    - The ticker hash is refreshed with the most recent trade (if any) and current best bid/ask levels
 
-## Numeric Precision
+## Numeric Precision & Scale Compatibility
 
-All prices, quantities, and balances are stored as scaled integers. Lua executes inside Redis as an IEEE-754 double, so values must stay within roughly 53 bits (~9e15) to remain exact. Choose `price_scale` and `quantity_scale` to honour this bound and keep the product `price * quantity` inside the safe range; otherwise `math.floor` and fee calculations may lose precision.
+- Lua runs on IEEE-754 double; keep every integer value strictly within ~9e15 to avoid precision loss.
+- Market scales:
+  - `price_scale` (quote minor units)
+  - `quantity_scale` (base minor units)
+- Asset scales:
+  - `asset.balance_scale` per asset, used for balances and ledger.
 
-## Cancellation (Future Work)
+### Conversion Rules
 
-Cancellations would use a dedicated Lua script that validates ownership, releases reserved balances, removes order ids from the queue, and adjusts price-level aggregates.
+- Base conversions (quantities):
+  - From market to balance units: `base_balance = base_market * (base_balance_scale / quantity_scale)`
+- Quote conversions (notional and fees):
+  - From market to balance units: `quote_balance = quote_market * (quote_balance_scale / price_scale)`
+
+To guarantee integer conversions and avoid rounding, enforce:
+- `base_balance_scale` must be a multiple of `quantity_scale` for any market that trades the base asset.
+- `quote_balance_scale` must be a multiple of `price_scale` for any market that trades the quote asset.
+
+If this compatibility is violated, the engine should reject seeding or order placement with `ASSET_SCALE_MISMATCH`.
+
+### Overflow Protection (unchanged but extended)
+
+- The script aborts with `PRECISION_OVERFLOW` when any of the following would exceed ~9e15:
+  - `price * quantity` (market notional in market scales)
+  - Any conversion multiplier application (e.g., `quote_market * (quote_balance_scale / price_scale)`)
+- Prefer "divide first, then multiply" or precomputed integer factors to minimize intermediate products.
 
 ## Fees Deduction Policy
 

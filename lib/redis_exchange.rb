@@ -128,8 +128,10 @@ module RedisExchange
     # @param orders_maxlen [Integer,nil] max orders stream length; nil uses default (1_000_000)
     def seed_market(symbol:, base_asset:, quote_asset:, price_scale: 1, quantity_scale: 1,
                   maker_fee_bps: 0, taker_fee_bps: 0, min_qty: 1, min_notional: 1,
-                  trades_maxlen: nil, orders_maxlen: nil)
+                  status: 'OPEN', trades_maxlen: nil, orders_maxlen: nil)
       key = "market:#{symbol}"
+      stat = status.to_s.upcase
+      raise ArgumentError, 'invalid market status' unless %w[OPEN HALTED CLOSED].include?(stat)
       mapping = {
         'base_asset' => base_asset,
         'quote_asset' => quote_asset,
@@ -139,11 +141,79 @@ module RedisExchange
         'taker_fee_bps' => taker_fee_bps,
         'min_qty' => min_qty,
         'min_notional' => min_notional,
-        'status' => 'OPEN'
+        'status' => stat
       }
       mapping['trades_maxlen'] = trades_maxlen.to_i if trades_maxlen
       mapping['orders_maxlen'] = orders_maxlen.to_i if orders_maxlen
       @redis.hset(key, mapping)
+    end
+
+    # Seed or update an asset's balance scale and status.
+    # Balances and ledger entries MUST use this scale; matching converts market deltas into asset units.
+    # @param asset [String] asset code (e.g., 'BTC')
+    # @param balance_scale [Integer] integer minor unit scale for balances/ledger
+    # @param status [String] 'ACTIVE' | 'HALTED'
+    def seed_asset(asset:, balance_scale:, status: 'ACTIVE')
+      raise ArgumentError, 'balance_scale must be positive' unless balance_scale.to_i > 0
+      stat = status.to_s.upcase
+      raise ArgumentError, 'invalid status' unless %w[ACTIVE HALTED].include?(stat)
+      key = "asset:#{asset}"
+      mapping = {
+        'balance_scale' => balance_scale.to_i,
+        'status' => stat
+      }
+      @redis.hset(key, mapping)
+    end
+
+    # Read asset configuration.
+    # @param asset [String]
+    # @return [Hash] { balance_scale: Integer, status: String } or {}
+    def asset_config(asset)
+      raw = @redis.hgetall("asset:#{asset}")
+      return {} if raw.empty?
+      {
+        balance_scale: raw.fetch('balance_scale', '0').to_i,
+        status: raw.fetch('status', 'ACTIVE')
+      }
+    end
+
+    # Read market configuration.
+    # @param symbol [String]
+    # @return [Hash] { base_asset:, quote_asset:, price_scale:, quantity_scale:, status: } or {}
+    def market_config(symbol)
+      raw = @redis.hgetall("market:#{symbol}")
+      return {} if raw.empty?
+      {
+        base_asset: raw.fetch('base_asset', nil),
+        quote_asset: raw.fetch('quote_asset', nil),
+        price_scale: raw.fetch('price_scale', '1').to_i,
+        quantity_scale: raw.fetch('quantity_scale', '1').to_i,
+        status: raw.fetch('status', 'OPEN')
+      }
+    end
+
+    # Validate that asset balance scales are compatible with a market's scales (integer multiples).
+    # @return [Hash] { ok: true, base_factor: Integer, quote_factor: Integer } or { ok: false, error: 'ASSET_NOT_CONFIGURED'|'ASSET_SCALE_MISMATCH', asset: String, balance_scale: Integer, market_scale: Integer }
+    def validate_asset_scales_for_market(base_asset:, quote_asset:, price_scale:, quantity_scale:)
+      base_cfg = asset_config(base_asset)
+      quote_cfg = asset_config(quote_asset)
+      base_bs = base_cfg[:balance_scale].to_i
+      quote_bs = quote_cfg[:balance_scale].to_i
+      unless base_bs.positive? && quote_bs.positive?
+        missing = !base_bs.positive? ? base_asset : quote_asset
+        return { ok: false, error: 'ASSET_NOT_CONFIGURED', asset: missing }
+      end
+      ps = price_scale.to_i
+      qs = quantity_scale.to_i
+      base_factor = base_bs / qs
+      quote_factor = quote_bs / ps
+      unless (base_factor * qs) == base_bs
+        return { ok: false, error: 'ASSET_SCALE_MISMATCH', asset: base_asset, balance_scale: base_bs, market_scale: qs }
+      end
+      unless (quote_factor * ps) == quote_bs
+        return { ok: false, error: 'ASSET_SCALE_MISMATCH', asset: quote_asset, balance_scale: quote_bs, market_scale: ps }
+      end
+      { ok: true, base_factor: base_factor, quote_factor: quote_factor }
     end
 
     # Overwrite a user's available/reserved buckets for an asset.
@@ -199,58 +269,61 @@ module RedisExchange
       JSON.parse(raw, symbolize_names: true)
     end
 
+    # Cancel all resting orders for a user across all markets.
     def cancel_all_orders(user_id)
       payload = { keys: [], argv: [user_id] }
-    raw = call_script(@cancel_all_script, payload)
-    JSON.parse(raw, symbolize_names: true)
-  end
+      raw = call_script(@cancel_all_script, payload)
+      JSON.parse(raw, symbolize_names: true)
+    end
 
-  # Adjust a user's available or reserved balance for an asset and record the transaction in the ledger.
-  # @param user_id [String] user identifier
-  # @param asset [String] asset symbol
-  # @param bucket [String] either 'available' or 'reserved'
-  # @param delta [Integer] amount to add (positive) or subtract (negative)
-  # @param reason [String] optional reason for the balance change (defaults to 'MANUAL_ADJUST')
-  # @param timestamp_ms [Integer,nil] optional timestamp in milliseconds
-  # @param biz_id [String,nil] optional idempotency key to deduplicate requests
-  # @return [Hash] parsed Lua response with new value or error
-  def change_balance(user_id:, asset:, bucket:, delta:, reason: 'MANUAL_ADJUST', timestamp_ms: nil, biz_id: nil)
-    timestamp = timestamp_ms || current_millis
-    biz = (biz_id && !biz_id.to_s.empty?) ? biz_id.to_s : SecureRandom.uuid
-    payload = { 
-      keys: ["balance:#{user_id}"], 
-      argv: [user_id, asset, bucket, delta.to_s, reason, timestamp.to_s, biz] 
-    }
-    raw = call_script(@balance_change_script, payload)
-    resp = JSON.parse(raw, symbolize_names: true)
-    resp[:biz_id] = biz
-    resp
-  end
+    # Adjust a user's available or reserved balance for an asset and record the transaction in the ledger.
+    # @param user_id [String] user identifier
+    # @param asset [String] asset symbol
+    # @param bucket [String] either 'available' or 'reserved'
+    # @param delta [Integer] amount to add (positive) or subtract (negative)
+    # @param reason [String] optional reason for the balance change (defaults to 'MANUAL_ADJUST')
+    # @param timestamp_ms [Integer,nil] optional timestamp in milliseconds
+    # @param biz_id [String,nil] optional idempotency key to deduplicate requests
+    # @return [Hash] parsed Lua response with new value or error
+    def change_balance(user_id:, asset:, bucket: 'available', delta:, reason: 'MANUAL_ADJUST', timestamp_ms: nil, biz_id: nil)
+      timestamp = timestamp_ms || current_millis
+      biz = (biz_id && !biz_id.to_s.empty?) ? biz_id.to_s : SecureRandom.uuid
+      payload = {
+        keys: ["balance:#{user_id}"],
+        argv: [user_id, asset, bucket, delta.to_s, reason, timestamp.to_s, biz]
+      }
+      raw = call_script(@balance_change_script, payload)
+      resp = JSON.parse(raw, symbolize_names: true)
+      resp[:biz_id] = biz
+      resp
+    end
 
-  # Convenience: deposit funds into user's available balance for an asset.
-  # Emits ledger entry with reason 'DEPOSIT'.
-  # @param user_id [String]
-  # @param asset [String]
-  # @param amount [Integer] positive scaled integer amount
-  # @param timestamp_ms [Integer,nil]
-  # @return [Hash]
-  def deposit(user_id:, asset:, amount:, timestamp_ms: nil, biz_id: nil)
-    amt = amount.to_i.abs
-    change_balance(user_id: user_id, asset: asset, bucket: 'available', delta: amt, reason: 'DEPOSIT', timestamp_ms: timestamp_ms, biz_id: biz_id)
-  end
+    # Convenience: deposit funds into user's available balance for an asset.
+    # Emits ledger entry with reason 'DEPOSIT'.
+    # @param user_id [String]
+    # @param asset [String]
+    # @param amount [Integer] positive scaled integer amount
+    # @param timestamp_ms [Integer,nil]
+    # @param biz_id [String,nil]
+    # @return [Hash]
+    def deposit(user_id:, asset:, amount:, timestamp_ms: nil, biz_id: nil)
+      amt = amount.to_i.abs
+      change_balance(user_id: user_id, asset: asset, bucket: 'available', delta: amt, reason: 'DEPOSIT', timestamp_ms: timestamp_ms, biz_id: biz_id)
+    end
 
-  # Convenience: withdraw funds from user's available balance for an asset.
-  # Emits ledger entry with reason 'WITHDRAWAL'.
-  # Fails with error 'INSUFFICIENT_FUNDS' from Lua when balance insufficient.
-  # @param user_id [String]
-  # @param asset [String]
-  # @param amount [Integer] positive scaled integer amount
-  # @param timestamp_ms [Integer,nil]
-  # @return [Hash]
-  def withdraw(user_id:, asset:, amount:, timestamp_ms: nil, biz_id: nil)
-    amt = amount.to_i.abs
-    change_balance(user_id: user_id, asset: asset, bucket: 'available', delta: -amt, reason: 'WITHDRAWAL', timestamp_ms: timestamp_ms, biz_id: biz_id)
-  end
+    # Convenience: withdraw funds from user's available balance for an asset.
+    # Emits ledger entry with reason 'WITHDRAWAL'.
+    # Fails with error 'INSUFFICIENT_FUNDS' from Lua when balance insufficient.
+    # @param user_id [String]
+    # @param asset [String]
+    # @param amount [Integer] positive scaled integer amount
+    # @param timestamp_ms [Integer,nil]
+    # @param biz_id [String,nil]
+    # @return [Hash]
+    def withdraw(user_id:, asset:, amount:, timestamp_ms: nil, biz_id: nil)
+      amt = amount.to_i.abs
+      change_balance(user_id: user_id, asset: asset, bucket: 'available', delta: -amt, reason: 'WITHDRAWAL', timestamp_ms: timestamp_ms, biz_id: biz_id)
+    end
 
     # 分页查询用户在某交易对的活跃订单（OPEN/PARTIALLY_FILLED 且 remaining>0）。
     # 依赖 Lua 维护的 ZSET 索引：`user_orders:{user_id}:{symbol}`，score 使用撮合序列。
@@ -352,6 +425,34 @@ module RedisExchange
         # allow product equal to bound; overflow only when strictly greater
         if pl >= precision_bound || qty >= precision_bound || (pl.to_i * qty.to_i) > precision_bound
           return { error: 'PRECISION_OVERFLOW' }
+        end
+      end
+
+      # Market status pre-check: reject orders if market is HALTED or CLOSED
+      mc = market_config(symbol)
+      unless mc.empty?
+        st = mc[:status].to_s.upcase
+        if st != 'OPEN'
+          return { error: st == 'HALTED' ? 'MARKET_HALTED' : 'MARKET_CLOSED' }
+        end
+      end
+
+      # Asset scale compatibility pre-check: ensure asset balance scales are integer multiples
+      # of market scales before invoking the Lua matcher. This surfaces friendly errors early.
+      unless mc.empty?
+        scale_check = validate_asset_scales_for_market(
+          base_asset: mc[:base_asset],
+          quote_asset: mc[:quote_asset],
+          price_scale: mc[:price_scale],
+          quantity_scale: mc[:quantity_scale]
+        )
+        unless scale_check[:ok]
+          err = { error: scale_check[:error] }
+          [:asset, :balance_scale, :market_scale].each do |k|
+            v = scale_check[k]
+            err[k] = v if v
+          end
+          return err
         end
       end
 

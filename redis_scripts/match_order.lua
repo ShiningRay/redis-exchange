@@ -168,6 +168,33 @@ local min_qty = tonumber(market['min_qty'] or '0')
 local min_notional = tonumber(market['min_notional'] or '0')
 local maker_fee_bps = tonumber(market['maker_fee_bps'] or '0')
 local taker_fee_bps = tonumber(market['taker_fee_bps'] or '0')
+local price_scale = tonumber(market['price_scale'] or '1')
+
+-- Read asset balance scales and validate compatibility with market scales.
+local base_asset_map = to_map(redis.call('HGETALL', 'asset:' .. base_asset))
+local quote_asset_map = to_map(redis.call('HGETALL', 'asset:' .. quote_asset))
+if next(base_asset_map) == nil or next(quote_asset_map) == nil then
+  return cjson.encode({ error = 'ASSET_NOT_CONFIGURED' })
+end
+local base_balance_scale = tonumber(base_asset_map['balance_scale'] or '0')
+local quote_balance_scale = tonumber(quote_asset_map['balance_scale'] or '0')
+if base_balance_scale <= 0 or quote_balance_scale <= 0 then
+  return cjson.encode({ error = 'ASSET_NOT_CONFIGURED' })
+end
+local function compute_factor(balance_scale, market_scale)
+  if market_scale <= 0 then return 0 end
+  local div = math.floor(balance_scale / market_scale)
+  if div <= 0 then return 0 end
+  if (div * market_scale) ~= balance_scale then
+    return 0
+  end
+  return div
+end
+local base_factor = compute_factor(base_balance_scale, quantity_scale)
+local quote_factor = compute_factor(quote_balance_scale, price_scale)
+if base_factor == 0 or quote_factor == 0 then
+  return cjson.encode({ error = 'ASSET_SCALE_MISMATCH' })
+end
 
 -- Precision guard: Lua uses 64-bit double; keep intermediates below ~9e15
 local PRECISION_BOUND = 9000000000000000 -- ~9e15
@@ -213,17 +240,26 @@ local maker_fee_estimate = math.floor((max_quote_needed * maker_fee_bps) / 10000
 
 if is_buy then
   if is_market and not has_price_limit then
+    -- For market BUY without explicit price, we only check non-zero quote balance presence.
     if taker_available_quote <= 0 then
       return cjson.encode({ error = 'INSUFFICIENT_FUNDS', asset = quote_asset })
     end
   else
-    local required_quote = max_quote_needed + taker_fee_estimate + maker_fee_estimate
-    if taker_available_quote < required_quote then
+    local required_quote_market = max_quote_needed + taker_fee_estimate + maker_fee_estimate
+    if would_overflow_mul(required_quote_market, quote_factor) then
+      return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+    end
+    local required_quote_balance = required_quote_market * quote_factor
+    if taker_available_quote < required_quote_balance then
       return cjson.encode({ error = 'INSUFFICIENT_FUNDS', asset = quote_asset })
     end
   end
 else
-  if taker_available_base < quantity then
+  if would_overflow_mul(quantity, base_factor) then
+    return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+  end
+  local required_base_balance = quantity * base_factor
+  if taker_available_base < required_base_balance then
     return cjson.encode({ error = 'INSUFFICIENT_FUNDS', asset = base_asset })
   end
 end
@@ -253,11 +289,11 @@ end
 
 -- Retrieve the top-of-book price entry for the given side.
 local function best_price_key_for_side(book_key, is_buy_side)
-  if is_buy_side then
-    return redis.call('ZRANGE', book_key, -1, -1, 'WITHSCORES')
-  else
-    return redis.call('ZRANGE', book_key, 0, 0, 'WITHSCORES')
-  end
+  -- We store SELL book with positive scores (price), BUY book with negative scores (-price).
+  -- Therefore, the best price level for both sides resides at ZRANGE index 0:
+  --  - SELL book: lowest ask (smallest positive score)
+  --  - BUY book: highest bid (most negative score)
+  return redis.call('ZRANGE', book_key, 0, 0, 'WITHSCORES')
 end
 
 local opposite_book_key = is_buy and book_sell_key or book_buy_key
@@ -399,49 +435,85 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
     local maker_fee = math.floor((trade_quote * maker_fee_bps) / 10000)
 
     if is_buy then
-      local debit = trade_quote + taker_fee
-      if taker_available_quote_after < debit then
+      local debit_market = trade_quote + taker_fee
+      if would_overflow_mul(debit_market, quote_factor) then
+        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+      end
+      local debit_balance = debit_market * quote_factor
+      if taker_available_quote_after < debit_balance then
         return cjson.encode({ error = 'INSUFFICIENT_FUNDS_DURING_MATCH', asset = quote_asset })
       end
-      taker_available_quote_after = taker_available_quote_after - debit
-      hincrby(taker_balance_key, quote_available_field, -debit)
-      append_ledger(user_id, quote_asset, 'available', -debit, 'TAKER_SPEND', timestamp)
-      hincrby(taker_balance_key, base_available_field, trade_qty)
-      append_ledger(user_id, base_asset, 'available', trade_qty, 'TAKER_RECEIVE', timestamp)
-      taker_quote_spent = taker_quote_spent + debit
+      taker_available_quote_after = taker_available_quote_after - debit_balance
+      hincrby(taker_balance_key, quote_available_field, -debit_balance)
+      append_ledger(user_id, quote_asset, 'available', -debit_balance, 'TAKER_SPEND', timestamp)
+      if would_overflow_mul(trade_qty, base_factor) then
+        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+      end
+      local trade_qty_balance = trade_qty * base_factor
+      hincrby(taker_balance_key, base_available_field, trade_qty_balance)
+      append_ledger(user_id, base_asset, 'available', trade_qty_balance, 'TAKER_RECEIVE', timestamp)
+      taker_quote_spent = taker_quote_spent + debit_market
       taker_base_received = taker_base_received + trade_qty
     else
-      if taker_available_base_after < trade_qty then
+      if would_overflow_mul(trade_qty, base_factor) then
+        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+      end
+      local trade_qty_balance = trade_qty * base_factor
+      if taker_available_base_after < trade_qty_balance then
         return cjson.encode({ error = 'INSUFFICIENT_FUNDS_DURING_MATCH', asset = base_asset })
       end
-      taker_available_base_after = taker_available_base_after - trade_qty
-      hincrby(taker_balance_key, base_available_field, -trade_qty)
-      append_ledger(user_id, base_asset, 'available', -trade_qty, 'TAKER_SELL', timestamp)
-      local credit = trade_quote - taker_fee
-      hincrby(taker_balance_key, quote_available_field, credit)
-      append_ledger(user_id, quote_asset, 'available', credit, 'TAKER_RECEIVE', timestamp)
-      taker_quote_received = taker_quote_received + credit
+      taker_available_base_after = taker_available_base_after - trade_qty_balance
+      hincrby(taker_balance_key, base_available_field, -trade_qty_balance)
+      append_ledger(user_id, base_asset, 'available', -trade_qty_balance, 'TAKER_SELL', timestamp)
+      local credit_market = trade_quote - taker_fee
+      if would_overflow_mul(credit_market, quote_factor) then
+        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+      end
+      local credit_balance = credit_market * quote_factor
+      hincrby(taker_balance_key, quote_available_field, credit_balance)
+      append_ledger(user_id, quote_asset, 'available', credit_balance, 'TAKER_RECEIVE', timestamp)
+      taker_quote_received = taker_quote_received + credit_market
       taker_base_sold = taker_base_sold + trade_qty
     end
 
     taker_fees_collected = taker_fees_collected + taker_fee
     maker_fees_collected = maker_fees_collected + maker_fee
-    add_fee(quote_asset, taker_fee + maker_fee)
+    local fee_total_market = taker_fee + maker_fee
+    if would_overflow_mul(fee_total_market, quote_factor) then
+      return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+    end
+    add_fee(quote_asset, fee_total_market * quote_factor)
 
     -- Update maker balances.
     local maker_balance_key = 'balance:' .. maker_user_id
     if maker_side == 'SELL' then
-      hincrby(maker_balance_key, base_reserved_field, -trade_qty)
-      append_ledger(maker_user_id, base_asset, 'reserved', -trade_qty, 'MAKER_RELEASE', timestamp)
-      local credit = trade_quote - maker_fee
-      hincrby(maker_balance_key, quote_available_field, credit)
-      append_ledger(maker_user_id, quote_asset, 'available', credit, 'MAKER_RECEIVE', timestamp)
+      if would_overflow_mul(trade_qty, base_factor) then
+        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+      end
+      local trade_qty_balance = trade_qty * base_factor
+      hincrby(maker_balance_key, base_reserved_field, -trade_qty_balance)
+      append_ledger(maker_user_id, base_asset, 'reserved', -trade_qty_balance, 'MAKER_RELEASE', timestamp)
+      local credit_market_maker = trade_quote - maker_fee
+      if would_overflow_mul(credit_market_maker, quote_factor) then
+        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+      end
+      local credit_balance_maker = credit_market_maker * quote_factor
+      hincrby(maker_balance_key, quote_available_field, credit_balance_maker)
+      append_ledger(maker_user_id, quote_asset, 'available', credit_balance_maker, 'MAKER_RECEIVE', timestamp)
     else
-      local debit = trade_quote + maker_fee
-      hincrby(maker_balance_key, quote_reserved_field, -debit)
-      append_ledger(maker_user_id, quote_asset, 'reserved', -debit, 'MAKER_RELEASE', timestamp)
-      hincrby(maker_balance_key, base_available_field, trade_qty)
-      append_ledger(maker_user_id, base_asset, 'available', trade_qty, 'MAKER_RECEIVE', timestamp)
+      local debit_market = trade_quote + maker_fee
+      if would_overflow_mul(debit_market, quote_factor) then
+        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+      end
+      local debit_balance = debit_market * quote_factor
+      hincrby(maker_balance_key, quote_reserved_field, -debit_balance)
+      append_ledger(maker_user_id, quote_asset, 'reserved', -debit_balance, 'MAKER_RELEASE', timestamp)
+      if would_overflow_mul(trade_qty, base_factor) then
+        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+      end
+      local trade_qty_balance = trade_qty * base_factor
+      hincrby(maker_balance_key, base_available_field, trade_qty_balance)
+      append_ledger(maker_user_id, base_asset, 'available', trade_qty_balance, 'MAKER_RECEIVE', timestamp)
     end
 
     maker_remaining = maker_remaining - trade_qty
@@ -549,28 +621,36 @@ else
       if is_buy then
         local reserve_quote = math.floor((price_limit * remaining) / quantity_scale)
         if reserve_quote > 0 then
-          if taker_available_quote_after < reserve_quote then
+          if would_overflow_mul(reserve_quote, quote_factor) then
+            return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+          end
+          local reserve_quote_balance = reserve_quote * quote_factor
+          if taker_available_quote_after < reserve_quote_balance then
             return cjson.encode({ error = 'INSUFFICIENT_FUNDS_TO_REST', asset = quote_asset })
           end
-          taker_available_quote_after = taker_available_quote_after - reserve_quote
-          taker_reserved_quote = taker_reserved_quote + reserve_quote
-          hincrby(taker_balance_key, quote_available_field, -reserve_quote)
-          append_ledger(user_id, quote_asset, 'available', -reserve_quote, 'TAKER_RESERVE', timestamp)
-          hincrby(taker_balance_key, quote_reserved_field, reserve_quote)
-          append_ledger(user_id, quote_asset, 'reserved', reserve_quote, 'TAKER_RESERVE', timestamp)
+          taker_available_quote_after = taker_available_quote_after - reserve_quote_balance
+          taker_reserved_quote = taker_reserved_quote + reserve_quote_balance
+          hincrby(taker_balance_key, quote_available_field, -reserve_quote_balance)
+          append_ledger(user_id, quote_asset, 'available', -reserve_quote_balance, 'TAKER_RESERVE', timestamp)
+          hincrby(taker_balance_key, quote_reserved_field, reserve_quote_balance)
+          append_ledger(user_id, quote_asset, 'reserved', reserve_quote_balance, 'TAKER_RESERVE', timestamp)
         end
       else
         local reserve_qty = remaining
         if reserve_qty > 0 then
-          if taker_available_base_after < reserve_qty then
+          if would_overflow_mul(reserve_qty, base_factor) then
+            return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+          end
+          local reserve_qty_balance = reserve_qty * base_factor
+          if taker_available_base_after < reserve_qty_balance then
             return cjson.encode({ error = 'INSUFFICIENT_FUNDS_TO_REST', asset = base_asset })
           end
-          taker_available_base_after = taker_available_base_after - reserve_qty
-          taker_reserved_base = taker_reserved_base + reserve_qty
-          hincrby(taker_balance_key, base_available_field, -reserve_qty)
-          append_ledger(user_id, base_asset, 'available', -reserve_qty, 'TAKER_RESERVE', timestamp)
-          hincrby(taker_balance_key, base_reserved_field, reserve_qty)
-          append_ledger(user_id, base_asset, 'reserved', reserve_qty, 'TAKER_RESERVE', timestamp)
+          taker_available_base_after = taker_available_base_after - reserve_qty_balance
+          taker_reserved_base = taker_reserved_base + reserve_qty_balance
+          hincrby(taker_balance_key, base_available_field, -reserve_qty_balance)
+          append_ledger(user_id, base_asset, 'available', -reserve_qty_balance, 'TAKER_RESERVE', timestamp)
+          hincrby(taker_balance_key, base_reserved_field, reserve_qty_balance)
+          append_ledger(user_id, base_asset, 'reserved', reserve_qty_balance, 'TAKER_RESERVE', timestamp)
         end
       end
 

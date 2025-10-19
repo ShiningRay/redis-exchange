@@ -268,6 +268,66 @@ Redis executes Lua with 64-bit floating point numbers. Keep scaled prices, quant
 - Consider using `fakeredis` for unit tests that do not require a live server.
 - For integration coverage, run concurrent clients to validate atomic behaviour under contention.
 
+## Asset & Market Configuration
+
+Before placing orders, configure asset precision and market parameters. Balances and ledger entries use per-asset minor units (`balance_scale`), while matching uses per-market scales (`price_scale`, `quantity_scale`).
+
+```ruby
+exchange = RedisExchange::Client.new(redis: Redis.new)
+
+# Configure assets (balance scales and status)
+exchange.seed_asset(asset: 'BTC',  balance_scale: 100_000_000, status: 'ACTIVE')
+exchange.seed_asset(asset: 'USDT', balance_scale: 100,         status: 'ACTIVE')
+
+# Configure market (price/quantity scales, fees, thresholds, and status)
+exchange.seed_market(
+  symbol: 'BTCUSDT',
+  base_asset: 'BTC',
+  quote_asset: 'USDT',
+  price_scale: 100,
+  quantity_scale: 100_000_000,
+  maker_fee_bps: 5,
+  taker_fee_bps: 10,
+  min_qty: 100_000,
+  min_notional: 1_000,
+  status: 'OPEN' # OPEN | HALTED | CLOSED
+)
+```
+
+### Scale Compatibility Rules
+
+To guarantee integer conversions without rounding:
+- Base asset balance scale must be a multiple of `quantity_scale`.
+- Quote asset balance scale must be a multiple of `price_scale`.
+
+If violated, order placement returns:
+- `ASSET_NOT_CONFIGURED` when the asset configuration is missing.
+- `ASSET_SCALE_MISMATCH` when the asset balance scale does not evenly divide the market scale. Returned fields include `asset`, `balance_scale`, and `market_scale`.
+
+### Market Status Semantics
+
+- `OPEN`: normal operation; order placement proceeds.
+- `HALTED`: new limit/market orders are rejected with `MARKET_HALTED`.
+- `CLOSED`: new limit/market orders are rejected with `MARKET_CLOSED`.
+
+Currently, cancellations are not blocked by market status.
+
+Example rejection when market is halted:
+
+```ruby
+exchange.seed_market(
+  symbol: 'BTCUSDT', base_asset: 'BTC', quote_asset: 'USDT',
+  price_scale: 100, quantity_scale: 100_000_000,
+  status: 'HALTED'
+)
+
+res = exchange.place_limit_order(
+  symbol: 'BTCUSDT', side: 'SELL', order_id: 'o-1', user_id: 'bob',
+  price: 3_000_000, quantity: 100_000_000
+)
+# => { error: 'MARKET_HALTED' }
+```
+
 ## License
 
 MIT

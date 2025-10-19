@@ -22,6 +22,16 @@
   - `ts`（毫秒时间戳）
 - 数值字段均为整型（已按 `price_scale` 与 `quantity_scale` 缩放）。
 
+## 单位与刻度（重要）
+- Stream 字段的数值（`price`/`quantity`/`quote`/`taker_fee`/`maker_fee`）采用市场撮合刻度（market units）：
+  - `price` 使用市场的 `price_scale`。
+  - `quantity` 使用市场的 `quantity_scale`。
+  - `quote`、`taker_fee`、`maker_fee` 也基于市场刻度计算并广播，便于统一行情/成交分析。
+- 账本与余额采用资产余额刻度（asset balance units）：
+  - 撮合脚本内部在更新 `balance:{user}` 的 `available`/`reserved` 以及写入 `append_ledger(...)` 时，所有金额以资产的 `asset:{asset}.balance_scale` 为单位（参见 `docs/architecture.md`）。
+  - 费用聚合键 `fees:{asset}` 也以资产余额刻度累计。
+- 这意味着：事件（Stream/响应）与账本（HSET/HINCRBY/fees）使用不同刻度。需要在消费或展示层明确单位来源，避免混淆。
+
 ## 消费者封装（GEM 内）
 - 类：`RedisExchange::TradeStreamConsumer`
   - `ensure_group(start_id: '0')`：确保消费者组存在，`mkstream: true`，默认从历史开始消费。
@@ -140,6 +150,14 @@ end
 ## 与精度边界的关系
 - 所有数值字段均为缩放后的整数，避免浮点误差。
 - 溢出保护已在 Ruby 与 Lua 两层实现，详见 `Numeric Precision` 与相关规范测试。
+
+## 错误码与兼容性
+- 撮合脚本新增错误码：
+  - `ASSET_NOT_CONFIGURED`：资产未配置或 `asset:{asset}.balance_scale` 非正数。
+  - `ASSET_SCALE_MISMATCH`：资产余额刻度与市场刻度不满足整数倍兼容（详见 `docs/architecture.md`）。
+  - `PRECISION_OVERFLOW`：中间乘积超过安全边界（约 `9e15`）。
+- 兼容建议：
+  - 消费与持久化不依赖资产刻度（仅依赖市场刻度事件），账本与余额由 Lua 保持资产刻度一致性。
 
 ## 常见问题（FAQ）
 - 从历史还是从尾部开始？

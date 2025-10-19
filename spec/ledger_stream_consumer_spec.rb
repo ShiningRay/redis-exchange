@@ -9,6 +9,8 @@ RSpec.describe RedisExchange::LedgerStreamConsumer do
 
   before do
     redis.flushdb
+    exchange.seed_asset(asset: 'BTC', balance_scale: 100_000_000, status: 'ACTIVE')
+    exchange.seed_asset(asset: 'USDT', balance_scale: 100, status: 'ACTIVE')
     # Seed a market for consistency; not strictly needed for ledger operations
     exchange.seed_market(
       symbol: 'BTCUSDT',

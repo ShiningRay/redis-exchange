@@ -39,6 +39,9 @@ end
 
 require 'redis_exchange'
 
+# Load support files (shared contexts, helpers)
+Dir[File.expand_path('support/**/*.rb', __dir__)].sort.each { |f| require f }
+
 RSpec.configure do |config|
   config.expect_with(:rspec) do |c|
     c.syntax = :expect
