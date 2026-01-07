@@ -45,6 +45,8 @@ OptionParser.new do |opts|
   opts.on('--no-seed', 'Do not seed assets/market') { options[:seed] = false }
   # 新增选项：禁用彩色输出
   opts.on('--no-color', 'Disable colored output') { options[:color] = false }
+  # 新增选项：显示合并深度
+  opts.on('--merge-depth [BUCKET_SIZE]', Integer, 'Show merged depth with specified bucket size') { |v| options[:merge_depth] = v || 1000 }
 end.parse!
 
 raise ArgumentError, 'sleep-max must be >= sleep-min' if options[:sleep_max] < options[:sleep_min]
@@ -219,6 +221,60 @@ def print_order_book(ts, exchange, symbol, depth_limit: 10)
   end
 end
 
+# Helper: print merged order book depth table
+def print_merged_order_book(ts, exchange, symbol, bucket_size:, depth_limit: 10)
+  merged_ob = exchange.merge_depth_both_sides(symbol, bucket_size, bucket_size, limit: depth_limit)
+  bids = Array(merged_ob[:bids])
+  asks = Array(merged_ob[:asks])
+
+  # Precompute formatted strings
+  bid_prices = bids.map { |r| format_price(r[:price]) }
+  bid_vols   = bids.map { |r| format_quantity(r[:volume]) }
+  bid_levels = bids.map { |r| r[:original_levels].to_s }
+  ask_prices = asks.map { |r| format_price(r[:price]) }
+  ask_vols   = asks.map { |r| format_quantity(r[:volume]) }
+  ask_levels = asks.map { |r| r[:original_levels].to_s }
+
+  # Compute column widths based on formatted values
+  bid_price_w = (["price"] + bid_prices).map(&:size).max || 5
+  bid_vol_w   = (["volume"] + bid_vols).map(&:size).max || 6
+  bid_levels_w = (["levels"] + bid_levels).map(&:size).max || 6
+  ask_price_w = (["price"] + ask_prices).map(&:size).max || 5
+  ask_vol_w   = (["volume"] + ask_vols).map(&:size).max || 6
+  ask_levels_w = (["levels"] + ask_levels).map(&:size).max || 6
+
+  puts "[#{ts}] #{c('MERGED ORDER BOOK', :magenta)} (bucket_size=#{format_price(bucket_size)}, top #{depth_limit})"
+  header_left  = "BIDS".ljust(bid_price_w + bid_vol_w + bid_levels_w + 10)
+  header_right = "ASKS".ljust(ask_price_w + ask_vol_w + ask_levels_w + 10)
+  puts "#{header_left}| #{header_right}"
+  sub_left  = "price".rjust(bid_price_w) + "  " + "volume".rjust(bid_vol_w) + "  " + "levels".rjust(bid_levels_w)
+  sub_right = "price".rjust(ask_price_w) + "  " + "volume".rjust(ask_vol_w) + "  " + "levels".rjust(ask_levels_w)
+  puts "#{sub_left.ljust(bid_price_w + bid_vol_w + bid_levels_w + 6)}   | #{sub_right}"
+
+  rows = [bids.size, asks.size].max
+  rows.times do |i|
+    lb = bids[i]
+    rb = asks[i]
+    left = if lb
+      lb_price = format_price(lb[:price]).rjust(bid_price_w)
+      lb_vol = format_quantity(lb[:volume]).rjust(bid_vol_w)
+      lb_levels = lb[:original_levels].to_s.rjust(bid_levels_w)
+      "#{lb_price}  #{lb_vol}  #{lb_levels}"
+    else
+      "".ljust(bid_price_w + bid_vol_w + bid_levels_w + 4)
+    end
+    right = if rb
+      rb_price = format_price(rb[:price]).rjust(ask_price_w)
+      rb_vol = format_quantity(rb[:volume]).rjust(ask_vol_w)
+      rb_levels = rb[:original_levels].to_s.rjust(ask_levels_w)
+      "#{rb_price}  #{rb_vol}  #{rb_levels}"
+    else
+      "".ljust(ask_price_w + ask_vol_w + ask_levels_w + 4)
+    end
+    puts "#{left.ljust(bid_price_w + bid_vol_w + bid_levels_w + 6)}   | #{right}"
+  end
+end
+
 # Helpers for random values respecting scales
 rand_price = lambda do
   p = rand(2_900_000..3_100_000) # around 29k..31k USDT
@@ -259,6 +315,13 @@ pick_op = lambda do
   bag.sample
 end
 
+# 如果启用了合并深度显示，先显示一次初始状态
+if options[:merge_depth]
+  puts "#{c('[INIT]', :cyan)} 显示初始合并深度状态..."
+  print_merged_order_book(Time.now.strftime('%H:%M:%S'), exchange, options[:symbol], bucket_size: options[:merge_depth], depth_limit: 10)
+  puts
+end
+
 options[:iterations].times do |i|
   op = pick_op.call
   user = options[:users].sample
@@ -283,17 +346,21 @@ options[:iterations].times do |i|
       puts "[#{ts}] #{c('LIMIT', :blue)} #{c(side, (side == 'BUY' ? :green : :red))} user=#{user} price=#{format_price(price)} qty=#{format_quantity(quantity)} id=#{order_id} => #{JSON.pretty_generate(res)}"
       if res.nil?
         puts "Empty result"
-      elsif res[:error].nil? 
+      elsif res[:error].nil?
         # Print trade results (if any)
         print_trade_results(ts, res)
         # Print current order book depth on successful placement
         if %w[OPEN PARTIALLY_FILLED FILLED].include?(res[:status].to_s)
-          print_order_book(ts, exchange, options[:symbol], depth_limit: 10)
+          if options[:merge_depth]
+            print_merged_order_book(ts, exchange, options[:symbol], bucket_size: options[:merge_depth], depth_limit: 10)
+          else
+            print_order_book(ts, exchange, options[:symbol], depth_limit: 10)
+          end
         else
           puts res[:status]
         end
       else
-        puts res        
+        puts res
       end
     when :market_order
       side = %w[BUY SELL].sample
@@ -312,17 +379,21 @@ options[:iterations].times do |i|
       puts "[#{ts}] #{c('MARKET', :blue)} #{c(side, (side == 'BUY' ? :green : :red))} user=#{user} qty=#{format_quantity(quantity)} cap=#{cap_str} id=#{order_id} => #{JSON.pretty_generate(res)}"
       if res.nil?
         puts "Empty result"
-      elsif res[:error].nil? 
+      elsif res[:error].nil?
         # Print trade results (if any)
         print_trade_results(ts, res)
         # Print current order book depth on successful placement
         if %w[OPEN PARTIALLY_FILLED FILLED].include?(res[:status].to_s)
-          print_order_book(ts, exchange, options[:symbol], depth_limit: 10)
+          if options[:merge_depth]
+            print_merged_order_book(ts, exchange, options[:symbol], bucket_size: options[:merge_depth], depth_limit: 10)
+          else
+            print_order_book(ts, exchange, options[:symbol], depth_limit: 10)
+          end
         else
           puts res[:status]
         end
       else
-        puts res        
+        puts res
       end
 
     when :deposit

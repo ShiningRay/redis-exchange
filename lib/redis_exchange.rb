@@ -402,6 +402,76 @@ module RedisExchange
       }
     end
 
+    # Merge depth levels by aggregating volumes within price ranges.
+    # This method consolidates multiple price levels into aggregated buckets for better visualization.
+    # @param symbol [String] market symbol
+    # @param side [String] 'BUY' or 'SELL'
+    # @param bucket_size [Integer] price bucket size in scaled units for aggregation
+    # @param limit [Integer,nil] maximum number of aggregated buckets to return
+    # @return [Array<Hash{Symbol=>Integer}>] array of aggregated depth levels
+    #   Each hash contains: :price, :volume, :original_levels (count of original levels merged)
+    def merge_depth(symbol, side, bucket_size, limit: nil)
+      raise ArgumentError, 'side must be BUY or SELL' unless %w[BUY SELL].include?(side.to_s.upcase)
+      raise ArgumentError, 'bucket_size must be positive' unless bucket_size&.positive?
+
+      side_up = side.to_s.upcase
+      bucket_size = bucket_size.to_i
+      limit = limit&.to_i
+
+      # Fetch the full book side
+      full_depth = fetch_book_side(symbol, side_up, descending: side_up == 'BUY', limit: nil)
+      return [] if full_depth.empty?
+
+      # Aggregate price levels into buckets
+      merged_buckets = {}
+      full_depth.each do |level|
+        price = level[:price]
+        volume = level[:volume]
+
+        # Calculate bucket index based on price and bucket size
+        bucket_index = (price / bucket_size).floor * bucket_size
+
+        # Initialize bucket if not exists
+        unless merged_buckets[bucket_index]
+          merged_buckets[bucket_index] = {
+            price: bucket_index,
+            volume: 0,
+            original_levels: 0
+          }
+        end
+
+        # Aggregate volume and count levels
+        merged_buckets[bucket_index][:volume] += volume
+        merged_buckets[bucket_index][:original_levels] += 1
+      end
+
+      # Convert to sorted array
+      result = merged_buckets.values
+      if side_up == 'BUY'
+        # For BUY side, sort by price descending (highest prices first)
+        result.sort_by! { |bucket| -bucket[:price] }
+      else
+        # For SELL side, sort by price ascending (lowest prices first)
+        result.sort_by! { |bucket| bucket[:price] }
+      end
+
+      # Apply limit if specified
+      limit ? result.first(limit) : result
+    end
+
+    # Merge depth for both sides with configurable bucket sizes.
+    # @param symbol [String] market symbol
+    # @param buy_bucket_size [Integer] bucket size for BUY side
+    # @param sell_bucket_size [Integer] bucket size for SELL side
+    # @param limit [Integer,nil] maximum number of buckets per side
+    # @return [Hash{Symbol=>Array<Hash{Symbol=>Integer}>}] merged depth for both sides
+    def merge_depth_both_sides(symbol, buy_bucket_size, sell_bucket_size, limit: nil)
+      {
+        bids: merge_depth(symbol, 'BUY', buy_bucket_size, limit: limit),
+        asks: merge_depth(symbol, 'SELL', sell_bucket_size, limit: limit)
+      }
+    end
+
     private
 
     # Internal helper to execute the Lua script with typed arguments.

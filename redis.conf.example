@@ -1,0 +1,85 @@
+# redis.conf.example
+# ------------------
+# Guidance configuration for Redis Exchange production-grade deployments.
+# Tune hostnames, passwords, and replica topology for your environment.
+
+## Network & Security -------------------------------------------------------
+bind 127.0.0.1 10.0.0.5           # Restrict to loopback + private interface
+protected-mode yes
+port 6379
+
+# Enable TLS if clients travel across untrusted networks (requires Redis 6+).
+# tls-port 6379
+# tls-cert-file /etc/redis/tls/redis.crt
+# tls-key-file /etc/redis/tls/redis.key
+# tls-ca-cert-file /etc/redis/tls/ca.crt
+
+# Replace this with a strong password or configure ACL users.
+requirepass changeme-strong-password
+aclfile /etc/redis/users.acl
+
+# Optionally disable or rename high-risk commands.
+rename-command FLUSHALL ""
+rename-command FLUSHDB ""
+rename-command CONFIG ""
+
+notify-keyspace-events Khs         # Keyspace notifications for ticker watchers
+
+## Persistence --------------------------------------------------------------
+# Maintain both RDB snapshots and AOF append-only logs.
+save 900 1
+save 300 10
+save 60 10000
+stop-writes-on-bgsave-error yes
+dir /var/lib/redis
+dbfilename dump.rdb
+
+appendonly yes
+appendfsync everysec               # Change to "always" for strongest durability
+no-appendfsync-on-rewrite no
+aof-use-rdb-preamble yes
+
+# Keep multiple AOF backups for point-in-time recovery.
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+## Replication & Failover ---------------------------------------------------
+# Configure read replicas for high availability (Sentinel/Cluster recommended).
+# replicaof primary-host 6379
+repl-backlog-size 256mb
+repl-diskless-sync yes
+repl-diskless-sync-delay 5
+replica-read-only yes
+min-replicas-to-write 1
+min-replicas-max-lag 5
+
+## Memory Management --------------------------------------------------------
+maxmemory 4gb                      # Size according to order-book depth targets
+maxmemory-policy noeviction        # Prevent accidental eviction of core data
+maxmemory-samples 5
+
+# Reserve space for snapshots and background rewrites.
+lazyfree-lazy-eviction yes
+lazyfree-lazy-expire yes
+lazyfree-lazy-server-del no
+
+## Monitoring & Latency -----------------------------------------------------
+slowlog-log-slower-than 10000      # Log commands slower than 10ms
+slowlog-max-len 1024
+latency-monitor-threshold 100
+
+## Lua & Scripts ------------------------------------------------------------
+lua-time-limit 5000
+
+## Logging -----------------------------------------------------------------
+loglevel notice
+logfile /var/log/redis/redis.log
+
+## Misc --------------------------------------------------------------------
+cluster-enabled no                 # Enable only when running Redis Cluster
+daemonize yes
+pidfile /var/run/redis.pid
+
+# Keep append-only files lean by rewriting during maintenance windows.
+# Pair with external backups (rsync/s3) and the repo's script/export_snapshot.rb
+# for additional auditing of market state.
