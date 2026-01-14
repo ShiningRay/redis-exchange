@@ -535,8 +535,24 @@ module RedisExchange
 
     private
 
+    def check_market_status(market_config)
+      st = market_config[:status].to_s.upcase
+      return nil if st == 'OPEN'
+
+      case st
+      when 'HALTED' then { error: 'MARKET_HALTED' }
+      when 'MAINTENANCE' then { error: 'MARKET_MAINTENANCE' }
+      when 'CLOSED' then { error: 'MARKET_CLOSED' }
+      else { error: 'MARKET_CLOSED' }
+      end
+    end
+
     # Internal helper to execute the Lua script with typed arguments.
     def execute_order(symbol:, side:, order_type:, order_id:, user_id:, price_limit:, quantity:, timestamp_ms: nil)
+      if maintenance.enabled?
+        return { error: 'SYSTEM_MAINTENANCE' }
+      end
+
       side_up = side.to_s.upcase
       raise ArgumentError, 'side must be BUY or SELL' unless %w[BUY SELL].include?(side_up)
 
@@ -560,32 +576,26 @@ module RedisExchange
 
       # Market status pre-check: reject orders if market is HALTED or CLOSED
       mc = market_config(symbol)
-      unless mc.empty?
-        st = mc[:status].to_s.upcase
-        if st != 'OPEN'
-          return { error: 'MARKET_HALTED' } if st == 'HALTED'
-          return { error: 'MARKET_MAINTENANCE' } if st == 'MAINTENANCE'
-          return { error: 'MARKET_CLOSED' }
-        end
-      end
+      return { error: 'UNKNOWN_MARKET' } if mc.empty?
+
+      status_check = check_market_status(mc)
+      return status_check if status_check
 
       # Asset scale compatibility pre-check: ensure asset balance scales are integer multiples
       # of market scales before invoking the Lua matcher. This surfaces friendly errors early.
-      unless mc.empty?
-        scale_check = validate_asset_scales_for_market(
-          base_asset: mc[:base_asset],
-          quote_asset: mc[:quote_asset],
-          price_scale: mc[:price_scale],
-          quantity_scale: mc[:quantity_scale]
-        )
-        unless scale_check[:ok]
-          err = { error: scale_check[:error] }
-          [:asset, :balance_scale, :market_scale].each do |k|
-            v = scale_check[k]
-            err[k] = v if v
-          end
-          return err
+      scale_check = validate_asset_scales_for_market(
+        base_asset: mc[:base_asset],
+        quote_asset: mc[:quote_asset],
+        price_scale: mc[:price_scale],
+        quantity_scale: mc[:quantity_scale]
+      )
+      unless scale_check[:ok]
+        err = { error: scale_check[:error] }
+        [:asset, :balance_scale, :market_scale].each do |k|
+          v = scale_check[k]
+          err[k] = v if v
         end
+        return err
       end
 
       ts = (timestamp_ms || current_millis).to_i
