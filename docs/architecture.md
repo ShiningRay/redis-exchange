@@ -91,7 +91,18 @@ order:{order_id}
     remaining       -> open quantity (scaled)
     status          -> OPEN | PARTIALLY_FILLED | FILLED | NO_LIQUIDITY
     created_at      -> unix timestamp in ms
+
+### Order Tombstones
+
+Finished orders (FILLED, NO_LIQUIDITY, CANCELLED) are deleted from the `order:{id}` hash to conserve memory. To prevent ID reuse and facilitate idempotency checks, a lightweight "tombstone" key is created:
+
 ```
+order_tombstone:{order_id} -> status string (e.g. "FILLED")
+```
+
+- **TTL**: 24 hours (default), configurable via `market:{symbol}` field `order_tombstone_ttl_sec`.
+- **Purpose**: Prevents submitting a new order with the same ID as a recently finished one.
+- **Check**: Order placement checks both `order:{id}` (active) and `order_tombstone:{id}` (finished) for duplicates.
 
 ### Sequencing
 

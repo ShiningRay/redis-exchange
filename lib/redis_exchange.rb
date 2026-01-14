@@ -553,6 +553,11 @@ module RedisExchange
         return { error: 'SYSTEM_MAINTENANCE' }
       end
 
+      # Duplicate order check (Ruby layer optimization)
+      if @redis.exists("order:#{order_id}", "order_tombstone:#{order_id}") > 0
+        return { error: 'DUPLICATE_ORDER_ID' }
+      end
+
       side_up = side.to_s.upcase
       raise ArgumentError, 'side must be BUY or SELL' unless %w[BUY SELL].include?(side_up)
 
