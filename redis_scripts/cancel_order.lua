@@ -10,6 +10,26 @@
 -- Redis Lua environment provides global `cjson`; no `require` is allowed.
 local cjson = cjson
 
+-- Check for system maintenance mode
+if redis.call('GET', 'system:maintenance_mode') == '1' then
+  return cjson.encode({ error = 'SYSTEM_MAINTENANCE' })
+end
+
+-- order_key is KEYS[1]
+local order_key = KEYS[1]
+local requested_id = ARGV[1]
+
+-- To check market maintenance, we need the symbol.
+-- Since we don't pass market key directly, we must look it up from the order.
+-- This works fine on single-instance Redis.
+
+local symbol = redis.call('HGET', order_key, 'symbol')
+if symbol then
+  if redis.call('HGET', 'market:' .. symbol, 'maintenance') == '1' then
+    return cjson.encode({ error = 'MARKET_MAINTENANCE' })
+  end
+end
+
 local function to_map(array)
   local map = {}
   for i = 1, #array, 2 do
@@ -76,9 +96,6 @@ local function refresh_ticker(symbol)
   )
 end
 
-local order_key = KEYS[1]
-local requested_id = ARGV[1]
-
 local order = to_map(redis.call('HGETALL', order_key))
 if next(order) == nil then
   return cjson.encode({ status = 'NOT_FOUND', order_id = requested_id })
@@ -105,29 +122,42 @@ if next(market) == nil then
   return cjson.encode({ status = 'UNKNOWN_MARKET', order_id = order_id })
 end
 
+local tombstone_ttl_sec = tonumber(market['order_tombstone_ttl_sec']) or 86400
+local function mark_tombstone(oid, status)
+  if not oid or oid == '' then return end
+  redis.call('SET', 'order_tombstone:' .. oid, status or 'DONE', 'EX', tombstone_ttl_sec)
+end
+
 local base_asset = market['base_asset']
 local quote_asset = market['quote_asset']
 local quantity_scale = as_number(market['quantity_scale'])
 if quantity_scale <= 0 then
   quantity_scale = 1
 end
-local maker_fee_bps = as_number(market['maker_fee_bps'])
 
 local balance_key = 'balance:' .. user_id
 
 if side == 'SELL' then
-  redis.call('HINCRBY', balance_key, base_asset .. ':reserved', -remaining)
-  append_ledger(user_id, base_asset, 'reserved', -remaining, 'CANCEL_RELEASE', nil)
-  redis.call('HINCRBY', balance_key, base_asset .. ':available', remaining)
-  append_ledger(user_id, base_asset, 'available', remaining, 'CANCEL_REFUND', nil)
+  local reserved_base = as_number(order['reserved_base'])
+  local release_amount = reserved_base
+  if release_amount <= 0 then
+    release_amount = remaining
+  end
+  redis.call('HINCRBY', balance_key, base_asset .. ':reserved', -release_amount)
+  append_ledger(user_id, base_asset, 'reserved', -release_amount, 'CANCEL_RELEASE', nil)
+  redis.call('HINCRBY', balance_key, base_asset .. ':available', release_amount)
+  append_ledger(user_id, base_asset, 'available', release_amount, 'CANCEL_REFUND', nil)
 else
-  local notional = math.floor((as_number(price) * remaining) / quantity_scale)
-  -- Fees are deducted only upon trade execution; do not include fees in cancellation refunds
-  if notional > 0 then
-    redis.call('HINCRBY', balance_key, quote_asset .. ':reserved', -notional)
-    append_ledger(user_id, quote_asset, 'reserved', -notional, 'CANCEL_RELEASE', nil)
-    redis.call('HINCRBY', balance_key, quote_asset .. ':available', notional)
-    append_ledger(user_id, quote_asset, 'available', notional, 'CANCEL_REFUND', nil)
+  local reserved_quote = as_number(order['reserved_quote'])
+  local release_amount = reserved_quote
+  if release_amount <= 0 then
+    release_amount = math.floor((as_number(price) * remaining) / quantity_scale)
+  end
+  if release_amount > 0 then
+    redis.call('HINCRBY', balance_key, quote_asset .. ':reserved', -release_amount)
+    append_ledger(user_id, quote_asset, 'reserved', -release_amount, 'CANCEL_RELEASE', nil)
+    redis.call('HINCRBY', balance_key, quote_asset .. ':available', release_amount)
+    append_ledger(user_id, quote_asset, 'available', release_amount, 'CANCEL_REFUND', nil)
   end
 end
 
@@ -181,6 +211,7 @@ do
   )
 
   -- Delete terminal order hash to keep storage lean
+  mark_tombstone(order_id, 'CANCELLED')
   redis.call('DEL', order_key)
 end
 

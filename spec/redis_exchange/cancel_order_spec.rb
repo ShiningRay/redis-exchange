@@ -41,6 +41,31 @@ RSpec.describe RedisExchange::Client do
         expect(fields_hash['order_id']).to eq('cancel-1')
         expect(fields_hash['status']).to eq('CANCELLED')
       end
+
+      it 'cancels a resting BUY order and releases notional and maker fee reserve' do
+        exchange.set_balance(user_id: 'buyer', asset: 'USDT', available: 5_000_000)
+
+        exchange.place_limit_order(
+          symbol: symbol,
+          side: 'BUY',
+          order_id: 'cancel-buy-1',
+          user_id: 'buyer',
+          price: 3_000_000,
+          quantity: 100_000_000
+        )
+
+        balances_before = exchange.balances('buyer')
+        expect(balances_before[:'USDT:reserved']).to eq(3_001_500)
+        expect(balances_before[:'USDT:available']).to eq(5_000_000 - 3_001_500)
+
+        outcome = exchange.cancel_order('cancel-buy-1')
+        expect(outcome[:status]).to eq('CANCELLED')
+
+        balances_after = exchange.balances('buyer')
+        expect(balances_after[:'USDT:reserved']).to eq(0)
+        expect(balances_after[:'USDT:available']).to eq(5_000_000)
+        expect(exchange.order('cancel-buy-1')).to eq({})
+      end
     end
     context "given a non-existent order id" do
       it 'returns NOT_FOUND when cancelling a non-existent order' do

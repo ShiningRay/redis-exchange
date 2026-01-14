@@ -89,6 +89,43 @@ RSpec.describe RedisExchange::Client do
       end
 
     end
+
+    context "when matching against a resting BUY limit order" do
+      it 'does not make maker quote reserved negative' do
+        exchange.set_balance(user_id: 'maker-buyer', asset: 'USDT', available: 5_000_000)
+        exchange.place_limit_order(
+          symbol: symbol,
+          side: 'BUY',
+          order_id: 'maker-bid-1',
+          user_id: 'maker-buyer',
+          price: 3_000_000,
+          quantity: 100_000_000
+        )
+
+        maker_before = redis.hgetall('balance:maker-buyer')
+        expect(maker_before['USDT:reserved'].to_i).to eq(3_001_500)
+        expect(maker_before['USDT:available'].to_i).to eq(5_000_000 - 3_001_500)
+
+        exchange.set_balance(user_id: 'taker-seller', asset: 'BTC', available: 100_000_000)
+        result = exchange.place_market_order(
+          symbol: symbol,
+          side: 'SELL',
+          order_id: 'taker-sell-1',
+          user_id: 'taker-seller',
+          quantity: 100_000_000,
+          price_cap: 2_900_000
+        )
+
+        expect(result[:status]).to eq('FILLED')
+
+        maker_after = redis.hgetall('balance:maker-buyer')
+        expect(maker_after['USDT:reserved'].to_i).to eq(0)
+        expect(maker_after['BTC:available'].to_i).to eq(100_000_000)
+        expect(maker_after['USDT:available'].to_i).to eq(5_000_000 - 3_001_500)
+
+        expect(exchange.order('maker-bid-1')).to eq({})
+      end
+    end
     
     context "market order completely fills a resting limit order" do
       it 'matches a market order full with a limit order' do
@@ -118,6 +155,16 @@ RSpec.describe RedisExchange::Client do
         expect(result[:status]).to eq('FILLED')
         expect(result[:executed_quantity]).to eq(100_000_000)
         expect(result[:remaining_quantity]).to eq(0)
+
+        duplicate = exchange.place_market_order(
+          symbol: symbol,
+          side: 'BUY',
+          order_id: 'market-full-taker-1',
+          user_id: 'alice',
+          quantity: 100_000_000,
+          price_cap: 3_100_000
+        )
+        expect(duplicate[:error]).to eq('DUPLICATE_ORDER_ID')
 
         # 对手方卖单队列应被清空；订单哈希删除（终态）
         expect(redis.lrange('queue:BTCUSDT:SELL:3000000', 0, -1)).to eq([])

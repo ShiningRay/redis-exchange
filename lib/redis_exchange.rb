@@ -52,9 +52,6 @@ module RedisExchange
       cancel_path = File.expand_path('../redis_scripts/cancel_order.lua', __dir__)
       @cancel_script = register_script(read_script(cancel_path))
 
-      cancel_all_path = File.expand_path('../redis_scripts/cancel_all_orders.lua', __dir__)
-      @cancel_all_script = register_script(read_script(cancel_all_path))
-
       balance_change_path = File.expand_path('../redis_scripts/balance_change.lua', __dir__)
       @balance_change_script = register_script(read_script(balance_change_path))
     end
@@ -146,6 +143,17 @@ module RedisExchange
       mapping['trades_maxlen'] = trades_maxlen.to_i if trades_maxlen
       mapping['orders_maxlen'] = orders_maxlen.to_i if orders_maxlen
       @redis.hset(key, mapping)
+    end
+
+    def set_market_status(symbol:, status:)
+      key = "market:#{symbol}"
+      return { error: 'UNKNOWN_MARKET' } unless @redis.exists?(key)
+
+      stat = status.to_s.upcase
+      raise ArgumentError, 'invalid market status' unless %w[OPEN HALTED CLOSED].include?(stat)
+
+      @redis.hset(key, 'status', stat)
+      market_config(symbol)
     end
 
     # Seed or update an asset's balance scale and status.
@@ -270,10 +278,55 @@ module RedisExchange
     end
 
     # Cancel all resting orders for a user across all markets.
+    # Implemented in Ruby to avoid Lua script timeouts on large data sets.
     def cancel_all_orders(user_id)
-      payload = { keys: [], argv: [user_id] }
-      raw = call_script(@cancel_all_script, payload)
-      JSON.parse(raw, symbolize_names: true)
+      if maintenance.enabled?
+        return { error: 'SYSTEM_MAINTENANCE' }
+      end
+
+      results = []
+      touched_symbols = Set.new
+      cursor = '0'
+      loop do
+        # 1. Scan user's order indexes
+        cursor, keys = @redis.scan(cursor, match: "user_orders:#{user_id}:*", count: 100)
+        
+        keys.each do |index_key|
+          # index_key format: user_orders:{user_id}:{symbol}
+          symbol = index_key.split(':').last
+          
+          # 2. Get all order IDs for this symbol
+          order_ids = @redis.zrange(index_key, 0, -1)
+          
+          order_ids.each do |oid|
+            # 3. Cancel each order individually
+            # This calls cancel_order.lua which handles status checks, balance release, etc.
+            # It returns a Hash with :status, :order_id, :symbol etc. or :error
+            res = cancel_order(oid)
+            
+            # 4. Collect successful cancellations
+            if res[:status] == 'CANCELLED'
+              results << res
+              touched_symbols.add(symbol)
+            elsif res[:error] == 'MARKET_MAINTENANCE'
+              # Capture error but continue processing other orders (which might be in different markets)
+              results << { order_id: oid, error: 'MARKET_MAINTENANCE' }
+            elsif res[:status] == 'NOT_FOUND' || res[:status] == 'UNKNOWN'
+               # Order might be already gone or finished, clean up index just in case?
+               # cancel_order.lua doesn't clean up index if order not found in hash.
+               # But if it's not found, we should probably remove it from ZSET to avoid stuck keys.
+               # However, standard cancel_order doesn't know about user_id if order hash is gone.
+               # Here we know the index_key, so we can clean it.
+               @redis.zrem(index_key, oid)
+            end
+          end
+        end
+        
+        break if cursor == '0'
+      end
+      
+      # 5. Return results
+      results
     end
 
     # Adjust a user's available or reserved balance for an asset and record the transaction in the ledger.
@@ -357,6 +410,11 @@ module RedisExchange
       c = RedisExchange::TradeStreamConsumer.new(redis: @redis, symbol: symbol, group: group, consumer: consumer)
       c.ensure_group(start_id: '0')
       c
+    end
+
+    def maintenance
+      require_relative 'redis_exchange/maintenance'
+      @maintenance ||= RedisExchange::Maintenance.new(@redis)
     end
 
     # Build an OrderStreamConsumer for a market symbol.

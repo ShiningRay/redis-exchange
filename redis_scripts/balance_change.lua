@@ -15,6 +15,11 @@
 
 local cjson = cjson
 
+-- Check for system maintenance mode
+if redis.call('GET', 'system:maintenance_mode') == '1' then
+  return cjson.encode({ error = 'SYSTEM_MAINTENANCE' })
+end
+
 local function as_number(value)
   if not value then return 0 end
   local num = tonumber(value)
