@@ -2,25 +2,25 @@
 match_order.lua implements the exchange's atomic limit/market order matching routine.
 
 Expected KEYS (1-9):
- 1. market metadata hash (market:{symbol})
- 2. sequence counter (seq:{symbol})
- 3. buy book sorted set (book:{symbol}:BUY)
- 4. sell book sorted set (book:{symbol}:SELL)
- 5. buy side volume hash (volume:{symbol}:BUY)
- 6. sell side volume hash (volume:{symbol}:SELL)
- 7. taker balance hash (balance:{user_id})
- 8. trade stream (trades:{symbol})
+  1. market metadata hash (market:{symbol})
+  2. sequence counter (seq:{symbol})
+  3. buy book sorted set (book:{symbol}:BUY)
+  4. sell book sorted set (book:{symbol}:SELL)
+  5. buy side volume hash (volume:{symbol}:BUY)
+  6. sell side volume hash (volume:{symbol}:SELL)
+  7. taker balance hash (balance:{user_id})
+  8. trade stream (trades:{symbol})
   9. order event stream (orders:{symbol})
 
 Expected ARGV (1-8):
- 1. symbol
- 2. side (BUY|SELL)
- 3. order type (LIMIT|MARKET)
- 4. order id
- 5. user id
- 6. price limit (scaled integer, 0 when unrestricted)
- 7. quantity (scaled integer)
- 8. timestamp in milliseconds
+  1. symbol
+  2. side (BUY|SELL)
+  3. order type (LIMIT|MARKET)
+  4. order id
+  5. user id
+  6. price limit (scaled integer, 0 when unrestricted)
+  7. quantity (scaled integer)
+  8. timestamp in milliseconds
 
 Returns a JSON blob describing execution outcome or an error code.
 The ticker hash (`ticker:{symbol}`) is also refreshed with last trade and top-of-book data.
@@ -475,6 +475,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
     local trade_quote = math.floor((trade_price * trade_qty) / quantity_scale)
     local maker_side = maker_order['side']
     local maker_user_id = maker_order['user_id']
+    local maker_balance_key = 'balance:' .. maker_user_id
 
     local taker_fee = math.floor((trade_quote * taker_fee_bps) / 10000)
     local maker_fee = math.floor((trade_quote * maker_fee_bps) / 10000)
@@ -569,7 +570,6 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       local credit_balance = credit_market * quote_factor
 
       -- Maker checks (Maker is BUY)
-      local maker_balance_key = 'balance:' .. maker_user_id
       -- Maker BUY checks
       local debit_market_maker = trade_quote + maker_fee
       if would_overflow_mul(debit_market_maker, quote_factor) then
@@ -622,6 +622,22 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
     redis.call('HINCRBY', opposite_volume_key, price_member, -trade_qty)
 
     if maker_remaining == 0 then
+      -- Cleanup any residual reserved amounts (dust from rounding)
+      local residual_base = as_number(redis.call('HGET', maker_order_key, 'reserved_base'))
+      if residual_base > 0 then
+        hincrby(maker_balance_key, base_reserved_field, -residual_base)
+        hincrby(maker_balance_key, base_available_field, residual_base)
+        append_ledger(maker_user_id, base_asset, 'reserved', -residual_base, 'DUST_RELEASE', timestamp)
+        append_ledger(maker_user_id, base_asset, 'available', residual_base, 'DUST_RELEASE', timestamp)
+      end
+      local residual_quote = as_number(redis.call('HGET', maker_order_key, 'reserved_quote'))
+      if residual_quote > 0 then
+        hincrby(maker_balance_key, quote_reserved_field, -residual_quote)
+        hincrby(maker_balance_key, quote_available_field, residual_quote)
+        append_ledger(maker_user_id, quote_asset, 'reserved', -residual_quote, 'DUST_RELEASE', timestamp)
+        append_ledger(maker_user_id, quote_asset, 'available', residual_quote, 'DUST_RELEASE', timestamp)
+      end
+
       redis.call('HSET', maker_order_key, 'status', 'FILLED')
       redis.call('LPOP', queue_key)
       pop_empty_price_level(opposite_book_key, opposite_volume_key, queue_key, price_member)

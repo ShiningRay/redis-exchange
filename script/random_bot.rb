@@ -493,7 +493,35 @@ threads.each(&:join)
 
 if options[:audit]
   puts
-  puts c('[AUDIT]', :cyan, :bold) + " Starting post-run balance audit..."
+  puts c('[AUDIT]', :cyan, :bold) + " Starting post-run ledger replay check..."
+  
+  # 1. Capture current end state
+  current_last_entry = redis_main.xrevrange('account_ledger', '+', '-', count: 1).first
+  current_end_id = current_last_entry ? current_last_entry[0] : '0-0'
+  
+  # 2. Capture current actual balances
+  current_actual_balances = exchange_main.maintenance.snapshot_balances
+  
+  # 3. Run replay
+  audit_res = exchange_main.maintenance.replay_ledger_audit(
+    initial_balances: audit_baseline_balances,
+    start_id: audit_baseline_id,
+    end_id: current_end_id,
+    actual_balances: current_actual_balances
+  )
+  
+  if audit_res[:success]
+    puts "#{c('✅', :green)} Ledger replay check passed! (Range: #{audit_baseline_id} -> #{current_end_id})"
+  else
+    puts "#{c('❌', :red)} Ledger replay check FAILED!"
+    audit_res[:discrepancies].each do |d|
+      puts "  User #{d[:user_id]} #{d[:asset]} #{d[:bucket]}: Expected #{d[:expected]}, Actual #{d[:actual]}"
+    end
+    # We don't exit here, we continue to the static balance audit below
+  end
+
+  puts
+  puts c('[AUDIT]', :cyan, :bold) + " Starting post-run balance audit (Static Check)..."
   begin
     reports = exchange_main.maintenance.audit_user_balances(fix: true)
     

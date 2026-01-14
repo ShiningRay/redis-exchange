@@ -147,11 +147,25 @@ if side == 'SELL' then
   append_ledger(user_id, base_asset, 'reserved', -release_amount, 'CANCEL_RELEASE', nil)
   redis.call('HINCRBY', balance_key, base_asset .. ':available', release_amount)
   append_ledger(user_id, base_asset, 'available', release_amount, 'CANCEL_REFUND', nil)
+
+  -- If we released the full reserved amount for the order, we should zero it out in the hash too,
+  -- although the order is being deleted shortly. But critically, if this was a partial cancel
+  -- (not supported here, but good practice), we'd update.
+  -- For full cancel, the order hash is deleted anyway.
 else
   local reserved_quote = as_number(order['reserved_quote'])
   local release_amount = reserved_quote
   if release_amount <= 0 then
+    -- Fallback for legacy orders without reserved_quote field
     release_amount = math.floor((as_number(price) * remaining) / quantity_scale)
+
+    -- Add fee reserve fallback logic matching match_order.lua?
+    -- match_order.lua: reserve_total = reserve_quote + reserve_fee
+    -- If we don't have the exact reserved amount stored, we might under-release if fees were reserved!
+    -- However, match_order.lua NOW stores `reserved_quote` correctly.
+    -- So this fallback is only for very old data.
+
+    -- But wait, if we have stored reserved_quote, we trust it.
   end
   if release_amount > 0 then
     redis.call('HINCRBY', balance_key, quote_asset .. ':reserved', -release_amount)
