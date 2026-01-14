@@ -311,6 +311,41 @@ If violated, order placement returns:
 - `CLOSED`: new limit/market orders are rejected with `MARKET_CLOSED`; cancellations are **allowed**.
 - `MAINTENANCE`: all operations (including cancellation) are rejected with `MARKET_MAINTENANCE`. Used for atomic operations like snapshotting or precision updates.
 
+### Force Cancellation (Maintenance Mode)
+
+During maintenance (or for emergency cleanup), `force_cancel_order` can be used to remove orders regardless of market status.
+
+```ruby
+# Mode 1: Delete only (no balance changes)
+exchange.maintenance.force_cancel_order(order_id: 'o-1', mode: :delete_only)
+
+# Mode 2: Best-effort unlock (refunds reserved balance if available)
+exchange.maintenance.force_cancel_order(order_id: 'o-1', mode: :best_effort_unlock)
+```
+
+### Balance Audit
+
+To prevent accounting errors, you can audit and reconcile user reserved balances against active orders.
+
+```bash
+# Audit all users and automatically fix discrepancies (release surplus / lock deficit)
+bundle exec rake audit:balances
+
+# Dry-run mode (report only, no changes)
+bundle exec rake audit:balances FIX=false
+
+# Audit a specific user
+bundle exec rake audit:balances USER_ID=user-123
+```
+
+The audit process:
+1. Scans all active orders for the user(s).
+2. Calculates the required reserved balance for each asset.
+3. Compares with the actual `reserved` balance in Redis.
+4. If `Required > Actual`: Locks available funds to cover the deficit. If available funds are insufficient, reports a deficit.
+5. If `Required < Actual`: Releases the surplus reserved funds back to available.
+6. Emits ledger entries for all adjustments (`AUDIT_FIX_LOCK` / `AUDIT_FIX_RELEASE`).
+
 Example rejection when market is halted:
 ```ruby
 exchange.seed_market(

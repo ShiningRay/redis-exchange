@@ -12,6 +12,154 @@ module RedisExchange
 
       finalize_precision_path = File.expand_path('../../redis_scripts/finalize_precision_update.lua', __dir__)
       @finalize_precision_script = register_script(read_script(finalize_precision_path))
+
+      force_cancel_path = File.expand_path('../../redis_scripts/force_cancel_order.lua', __dir__)
+      @force_cancel_script = register_script(read_script(force_cancel_path))
+
+      audit_balance_path = File.expand_path('../../redis_scripts/audit_user_balance.lua', __dir__)
+      @audit_balance_script = register_script(read_script(audit_balance_path))
+    end
+
+    # Audit and reconcile user balances against active orders.
+    # @param user_id [String,nil] specific user to audit, or nil for all users
+    # @param fix [Boolean] whether to apply fixes automatically
+    # @return [Array<Hash>] report of issues found/fixed per user
+    def audit_user_balances(user_id: nil, fix: true)
+      # 1. Gather Symbols
+      symbols = []
+      cursor = '0'
+      loop do
+        cursor, keys = @redis.scan(cursor, match: 'market:*', count: 100)
+        keys.each { |k| symbols << k.sub('market:', '') }
+        break if cursor == '0'
+      end
+      
+      # 2. Gather Users
+      users = []
+      if user_id
+        users << user_id
+      else
+        cursor = '0'
+        loop do
+          cursor, keys = @redis.scan(cursor, match: 'balance:*', count: 1000)
+          keys.each { |k| users << k.sub('balance:', '') }
+          break if cursor == '0'
+        end
+      end
+      
+      # 3. Run Audit per User
+      reports = []
+      ts = current_millis
+      
+      users.each do |uid|
+        payload = {
+          keys: ["balance:#{uid}"],
+          argv: [uid, fix ? '1' : '0', ts.to_s, *symbols]
+        }
+        
+        raw = call_script(@audit_balance_script, payload)
+        res = JSON.parse(raw, symbolize_names: true)
+        
+        if !res[:deficits].empty? || !res[:fixes].empty?
+          reports << { user_id: uid, deficits: res[:deficits], fixes: res[:fixes] }
+        end
+      end
+      
+      reports
+    end
+
+    # Replay ledger events from a starting point and compare against actual balances.
+    # @param initial_balances [Hash] { user_id => { asset => { bucket => amount } } }
+    # @param start_id [String] Ledger ID to start replay from (exclusive)
+    # @param end_id [String] Ledger ID to stop replay at (inclusive)
+    # @param actual_balances [Hash] Current actual balances to compare against
+    # @return [Hash] { success: Boolean, discrepancies: Array<Hash>, expected_balances: Hash }
+    def replay_ledger_audit(initial_balances:, start_id:, end_id:, actual_balances:)
+      # Deep copy initial balances to avoid mutation
+      calculated = JSON.parse(JSON.generate(initial_balances))
+      
+      # Replay Ledger
+      batch_size = 1000
+      current_id = start_id
+      
+      loop do
+        # XRANGE is inclusive, so we handle the exclusive start logic carefully.
+        # If start_id is '0-0', we use '-'. Otherwise we use '(' + start_id if supported, 
+        # but Redis XRANGE min is inclusive.
+        # Standard pattern: use '(' prefix for exclusive start in XRANGE (Redis 6.2+).
+        # Assuming Redis 6.2+. If older, we fetch and skip first if matches.
+        
+        range_start = current_id == '0-0' ? '-' : "(#{current_id}"
+        entries = @redis.xrange('account_ledger', range_start, end_id, count: batch_size)
+        
+        break if entries.empty?
+        
+        entries.each do |id, fields|
+          user_id = fields['user_id']
+          asset = fields['asset']
+          bucket = fields['bucket']
+          delta = fields['delta'].to_i
+          
+          calculated[user_id] ||= {}
+          calculated[user_id][asset] ||= { 'available' => 0, 'reserved' => 0 }
+          calculated[user_id][asset][bucket] ||= 0
+          calculated[user_id][asset][bucket] += delta
+          
+          current_id = id
+        end
+        
+        break if entries.size < batch_size
+      end
+      
+      # Compare
+      discrepancies = []
+      
+      # Check all calculated against actual
+      calculated.each do |uid, assets|
+        assets.each do |asset, buckets|
+          buckets.each do |bucket, expected_amt|
+            actual_amt = actual_balances.dig(uid, asset, bucket) || 0
+            if expected_amt != actual_amt
+              discrepancies << {
+                user_id: uid,
+                asset: asset,
+                bucket: bucket,
+                expected: expected_amt,
+                actual: actual_amt
+              }
+            end
+          end
+        end
+      end
+      
+      # Check for any actual balances that shouldn't exist (not in calculated)
+      # We skip this for now as initial_balances might be partial? 
+      # Assuming initial_balances + ledger covers everything.
+      
+      {
+        success: discrepancies.empty?,
+        discrepancies: discrepancies,
+        expected_balances: calculated
+      }
+    end
+
+    # Force cancel an order, bypassing status checks.
+    # @param order_id [String]
+    # @param mode [Symbol] :delete_only or :best_effort_unlock
+    # @return [Hash]
+    def force_cancel_order(order_id:, mode: :best_effort_unlock)
+      mode_str = case mode
+                 when :delete_only then 'DELETE_ONLY'
+                 when :best_effort_unlock then 'BEST_EFFORT_UNLOCK'
+                 else raise ArgumentError, "invalid mode: #{mode}"
+                 end
+      
+      payload = {
+        keys: ["order:#{order_id}"],
+        argv: [order_id, mode_str]
+      }
+      raw = call_script(@force_cancel_script, payload)
+      JSON.parse(raw, symbolize_names: true)
     end
 
     # Update market precision and revise all active orders using batched processing.

@@ -47,7 +47,19 @@ OptionParser.new do |opts|
   opts.on('--no-color', 'Disable colored output') { options[:color] = false }
   # 新增选项：显示合并深度
   opts.on('--merge-depth [BUCKET_SIZE]', Integer, 'Show merged depth with specified bucket size') { |v| options[:merge_depth] = v || 1000 }
+  # 新增选项：运行结束后执行余额审计
+  opts.on('--audit', 'Run balance audit after completion') { options[:audit] = true }
+  # 新增选项：定期 Ledger 重放审计
+  opts.on('--audit-interval N', Integer, 'Perform ledger replay audit every N operations') { |v| options[:audit_interval] = v }
+  # 新增选项：并发线程数
+  opts.on('--concurrency N', Integer, 'Number of concurrent worker threads (default: 1)') { |v| options[:concurrency] = v }
 end.parse!
+
+options[:concurrency] ||= 1
+if options[:concurrency] > 1 && options[:audit_interval]
+  puts "\e[33m[WARN]\e[0m Periodic audit (--audit-interval) is disabled in concurrency mode."
+  options[:audit_interval] = nil
+end
 
 raise ArgumentError, 'sleep-max must be >= sleep-min' if options[:sleep_max] < options[:sleep_min]
 
@@ -73,18 +85,34 @@ def c(str, *styles)
   "#{codes}#{str}#{COLORS[:reset]}"
 end
 
-redis = Redis.new(url: options[:redis_url])
-exchange = RedisExchange::Client.new(redis: redis)
+# Main setup (single threaded)
+redis_main = Redis.new(url: options[:redis_url])
+exchange_main = RedisExchange::Client.new(redis: redis_main)
 
 if options[:flush]
   puts "#{c('[INIT]', :cyan)} Flushing Redis DB..."
-  redis.flushdb
+  redis_main.flushdb
 end
 
 # Default assets & market scales
 ASSET_SCALES = { 'BTC' => 100_000_000, 'USDT' => 100 }.freeze
 PRICE_SCALE = 100
 QUANTITY_SCALE = 100_000_000
+
+# Audit State (Main thread only)
+audit_baseline_balances = {}
+audit_baseline_id = '0-0'
+
+if options[:audit_interval]
+  puts "#{c('[AUDIT]', :cyan)} Initializing baseline snapshot..."
+  # Capture initial state for replay audit
+  audit_baseline_balances = exchange_main.maintenance.snapshot_balances
+  
+  # Get current ledger max id
+  last_entry = redis_main.xrevrange('account_ledger', '+', '-', count: 1).first
+  audit_baseline_id = last_entry ? last_entry[0] : '0-0'
+  puts "#{c('[AUDIT]', :cyan)} Baseline ID: #{audit_baseline_id}"
+end
 
 # Precision-aware formatting helpers (placed before seeding for availability)
 def decimals_for_scale(scale)
@@ -117,16 +145,13 @@ def format_asset_amount(asset, amount)
   to_dec_str(amount, scale)
 end
 
-# 彩色输出辅助方法（已上移至前面，避免未定义时被调用）
-# COLORS / c(str, *styles)
-
 if options[:seed]
   puts "#{c('[INIT]', :cyan)} Seeding assets and market..."
   # Seed assets
-  exchange.seed_asset(asset: 'BTC', balance_scale: ASSET_SCALES['BTC'], status: 'ACTIVE')
-  exchange.seed_asset(asset: 'USDT', balance_scale: ASSET_SCALES['USDT'], status: 'ACTIVE')
+  exchange_main.seed_asset(asset: 'BTC', balance_scale: ASSET_SCALES['BTC'], status: 'ACTIVE')
+  exchange_main.seed_asset(asset: 'USDT', balance_scale: ASSET_SCALES['USDT'], status: 'ACTIVE')
   # Seed market
-  exchange.seed_market(
+  exchange_main.seed_market(
     symbol: options[:symbol],
     base_asset: 'BTC',
     quote_asset: 'USDT',
@@ -142,34 +167,79 @@ if options[:seed]
   options[:users].each do |u|
     # Deposit some USDT: between 5_000 and 50_000
     usdt_amount = (5_000 + rand(0..45_000)) * ASSET_SCALES['USDT']
-    res1 = exchange.deposit(user_id: u, asset: 'USDT', amount: usdt_amount)
+    res1 = exchange_main.deposit(user_id: u, asset: 'USDT', amount: usdt_amount)
     puts "#{c('[DEPOSIT]', :green)} user=#{u} asset=USDT amount=#{format_asset_amount('USDT', usdt_amount)} => #{JSON.pretty_generate(res1)}"
     # Deposit some BTC: between 0.05 and 0.5 BTC
     btc_amount = (5 + rand(0..45)) * (ASSET_SCALES['BTC'] / 100) # 0.05..0.5 BTC in minor units
-    res2 = exchange.deposit(user_id: u, asset: 'BTC', amount: btc_amount)
+    res2 = exchange_main.deposit(user_id: u, asset: 'BTC', amount: btc_amount)
     puts "#{c('[DEPOSIT]', :green)} user=#{u} asset=BTC amount=#{format_asset_amount('BTC', btc_amount)} => #{JSON.pretty_generate(res2)}"
   end
 end
 
-order_seq = 0
-placed_order_ids = []
+if options[:merge_depth]
+  puts "#{c('[INIT]', :cyan)} Showing initial merged depth..."
+  print_merged_order_book(Time.now.strftime('%H:%M:%S'), exchange_main, options[:symbol], bucket_size: options[:merge_depth], depth_limit: 10)
+  puts
+end
 
-# Helper: pretty print trade results upon successful order placement
-def print_trade_results(ts, res)
+# Helpers for random values respecting scales
+rand_price = lambda do
+  p = rand(2_900_000..3_100_000) # around 29k..31k USDT
+  p - (p % PRICE_SCALE)
+end
+
+rand_quantity = lambda do
+  # 0.05..0.5 BTC in minor units
+  step = QUANTITY_SCALE / 100 # 0.01 BTC
+  n_steps = rand(5..50) # 0.05..0.5 BTC
+  n_steps * step
+end
+
+rand_usdt_amount = lambda do
+  # 1000..50_000 USDT in minor units
+  amt = rand(1_000..50_000) * ASSET_SCALES['USDT']
+  amt
+end
+
+rand_btc_amount = lambda do
+  # 0.01..0.2 BTC in minor units
+  step = ASSET_SCALES['BTC'] / 100 # 0.01 BTC
+  rand(1..20) * step
+end
+
+ops = %i[limit_order market_order deposit withdraw cancel_one]
+
+weights = {
+  limit_order: 40,
+  market_order: 30,
+  deposit: 2,
+  withdraw: 2,
+  cancel_one: 10
+}
+
+pick_op = lambda do
+  bag = ops.flat_map { |op| [op] * weights[op] }
+  bag.sample
+end
+
+# Helper: pretty print trade results
+def print_trade_results(ts, res, thread_id)
   return if res.nil?
   return if res[:error]
   status = res[:status].to_s
   return unless %w[OPEN PARTIALLY_FILLED FILLED].include?(status)
 
   trades = Array(res[:trades])
+  prefix = "[#{ts}] [T#{thread_id}]"
+  
   if trades.empty?
-    puts "[#{ts}] #{c('TRADES', :yellow)} none (executed_quantity=#{format_quantity(res[:executed_quantity] || 0)})"
+    puts "#{prefix} #{c('TRADES', :yellow)} none (executed_quantity=#{format_quantity(res[:executed_quantity] || 0)})"
     return
   end
 
-  puts "[#{ts}] #{c('TRADES', :yellow)} count=#{trades.size} executed_quantity=#{format_quantity(res[:executed_quantity])} taker_quote_spent=#{format_price(res[:taker_quote_spent])} taker_quote_received=#{format_price(res[:taker_quote_received])} taker_base_received=#{format_quantity(res[:taker_base_received])} taker_base_sold=#{format_quantity(res[:taker_base_sold])} taker_fee_paid=#{format_price(res[:taker_fee_paid])} maker_fee_charged=#{format_price(res[:maker_fee_charged])}"
+  puts "#{prefix} #{c('TRADES', :yellow)} count=#{trades.size} executed_quantity=#{format_quantity(res[:executed_quantity])} taker_quote_spent=#{format_price(res[:taker_quote_spent])} taker_quote_received=#{format_price(res[:taker_quote_received])} taker_base_received=#{format_quantity(res[:taker_base_received])} taker_base_sold=#{format_quantity(res[:taker_base_sold])} taker_fee_paid=#{format_price(res[:taker_fee_paid])} maker_fee_charged=#{format_price(res[:maker_fee_charged])}"
   trades.each_with_index do |t, idx|
-    puts "[#{ts}] #{c("TRADE[#{idx + 1}]", :yellow)} taker_side=#{c(t[:taker_side], (t[:taker_side] == 'BUY' ? :green : :red))} buy_id=#{t[:buy_order_id]} sell_id=#{t[:sell_order_id]} price=#{format_price(t[:price])} qty=#{format_quantity(t[:quantity])} quote=#{format_price(t[:quote])} taker_fee=#{format_price(t[:taker_fee])} maker_fee=#{format_price(t[:maker_fee])} ts=#{t[:timestamp]}"
+    puts "#{prefix} #{c("TRADE[#{idx + 1}]", :yellow)} taker_side=#{c(t[:taker_side], (t[:taker_side] == 'BUY' ? :green : :red))} buy_id=#{t[:buy_order_id]} sell_id=#{t[:sell_order_id]} price=#{format_price(t[:price])} qty=#{format_quantity(t[:quantity])} quote=#{format_price(t[:quote])} taker_fee=#{format_price(t[:taker_fee])} maker_fee=#{format_price(t[:maker_fee])} ts=#{t[:timestamp]}"
   end
 end
 
@@ -275,159 +345,186 @@ def print_merged_order_book(ts, exchange, symbol, bucket_size:, depth_limit: 10)
   end
 end
 
-# Helpers for random values respecting scales
-rand_price = lambda do
-  p = rand(2_900_000..3_100_000) # around 29k..31k USDT
-  p - (p % PRICE_SCALE)
+# Worker logic
+run_worker = lambda do |thread_id, iterations, shared_options|
+  # Each thread gets its own Redis connection
+  local_redis = Redis.new(url: shared_options[:redis_url])
+  local_exchange = RedisExchange::Client.new(redis: local_redis)
+  local_placed_order_ids = []
+  
+  order_seq = 0
+  
+  iterations.times do |i|
+    op = pick_op.call
+    user = shared_options[:users].sample
+    ts = Time.now.strftime('%H:%M:%S')
+    prefix = "[#{ts}] [T#{thread_id}]"
+    
+    begin
+      case op
+      when :limit_order
+        side = %w[BUY SELL].sample
+        price = rand_price.call
+        quantity = rand_quantity.call
+        order_id = "bot-T#{thread_id}-lim-#{order_seq += 1}"
+        
+        res = local_exchange.place_limit_order(
+          symbol: shared_options[:symbol],
+          side: side,
+          order_id: order_id,
+          user_id: user,
+          price: price,
+          quantity: quantity
+        )
+        local_placed_order_ids << order_id if res[:status] == 'OPEN' || res[:status] == 'PARTIALLY_FILLED'
+        puts "#{prefix} #{c('LIMIT', :blue)} #{c(side, (side == 'BUY' ? :green : :red))} user=#{user} price=#{format_price(price)} qty=#{format_quantity(quantity)} id=#{order_id} => #{JSON.pretty_generate(res)}"
+        print_trade_results(ts, res, thread_id)
+        
+        if %w[OPEN PARTIALLY_FILLED FILLED].include?(res[:status].to_s)
+          if shared_options[:merge_depth]
+            print_merged_order_book(ts, local_exchange, shared_options[:symbol], bucket_size: shared_options[:merge_depth], depth_limit: 10)
+          else
+            print_order_book(ts, local_exchange, shared_options[:symbol], depth_limit: 10)
+          end
+        end
+
+      when :market_order
+        side = %w[BUY SELL].sample
+        quantity = rand_quantity.call
+        price_cap = [0, rand_price.call].sample
+        order_id = "bot-T#{thread_id}-mkt-#{order_seq += 1}"
+        
+        res = local_exchange.place_market_order(
+          symbol: shared_options[:symbol],
+          side: side,
+          order_id: order_id,
+          user_id: user,
+          quantity: quantity,
+          price_cap: price_cap
+        )
+        cap_str = price_cap.to_i > 0 ? format_price(price_cap) : 'none'
+        puts "#{prefix} #{c('MARKET', :blue)} #{c(side, (side == 'BUY' ? :green : :red))} user=#{user} qty=#{format_quantity(quantity)} cap=#{cap_str} id=#{order_id} => #{JSON.pretty_generate(res)}"
+        print_trade_results(ts, res, thread_id)
+
+        if %w[OPEN PARTIALLY_FILLED FILLED].include?(res[:status].to_s)
+          if shared_options[:merge_depth]
+            print_merged_order_book(ts, local_exchange, shared_options[:symbol], bucket_size: shared_options[:merge_depth], depth_limit: 10)
+          else
+            print_order_book(ts, local_exchange, shared_options[:symbol], depth_limit: 10)
+          end
+        end
+
+      when :deposit
+        asset = %w[USDT BTC].sample
+        amount = asset == 'USDT' ? rand_usdt_amount.call : rand_btc_amount.call
+        res = local_exchange.deposit(user_id: user, asset: asset, amount: amount)
+        puts "#{prefix} #{c('DEPOSIT', :green)} user=#{user} asset=#{asset} amount=#{format_asset_amount(asset, amount)} => #{JSON.pretty_generate(res)}"
+        
+      when :withdraw
+        asset = %w[USDT BTC].sample
+        amount = asset == 'USDT' ? rand_usdt_amount.call : rand_btc_amount.call
+        res = local_exchange.withdraw(user_id: user, asset: asset, amount: amount)
+        puts "#{prefix} #{c('WITHDRAW', :magenta)} user=#{user} asset=#{asset} amount=#{format_asset_amount(asset, amount)} => #{JSON.pretty_generate(res)}"
+        
+      when :cancel_one
+        if local_placed_order_ids.empty?
+          puts "#{prefix} #{c('CANCEL', :yellow)} skip (no known resting orders)"
+        else
+          target = local_placed_order_ids.sample
+          res = local_exchange.cancel_order(target)
+          puts "#{prefix} #{c('CANCEL', :yellow)} id=#{target} => #{JSON.pretty_generate(res)}"
+          if res[:status] == 'CANCELLED' || res[:error] == 'NOT_FOUND'
+            local_placed_order_ids.delete(target)
+          end
+        end
+      end
+    rescue => e
+      puts "#{prefix} #{c('ERROR', :bold, :red)} op=#{op} user=#{user} msg=#{e.class}: #{e.message}"
+    end
+    
+    # Audit interval check is ONLY valid for single thread (concurrency=1)
+    if shared_options[:audit_interval] && shared_options[:concurrency] == 1 && ((i + 1) % shared_options[:audit_interval]).zero?
+      # Logic duplicated from previous implementation but wrapped for single thread worker
+      # Since we are inside the worker block, we use local_exchange/redis
+      puts
+      puts "#{c('[AUDIT]', :cyan)} Running periodic ledger replay check (iteration #{i + 1})..."
+      current_last_entry = local_redis.xrevrange('account_ledger', '+', '-', count: 1).first
+      current_end_id = current_last_entry ? current_last_entry[0] : '0-0'
+      current_actual_balances = local_exchange.maintenance.snapshot_balances
+      
+      audit_res = local_exchange.maintenance.replay_ledger_audit(
+        initial_balances: audit_baseline_balances,
+        start_id: audit_baseline_id,
+        end_id: current_end_id,
+        actual_balances: current_actual_balances
+      )
+      
+      if audit_res[:success]
+        puts "#{c('[AUDIT]', :green)} Check passed! Replayed from #{audit_baseline_id} to #{current_end_id}."
+        audit_baseline_balances = audit_res[:expected_balances]
+        audit_baseline_id = current_end_id
+      else
+        puts "#{c('[AUDIT]', :red, :bold)} Check FAILED!"
+        audit_res[:discrepancies].each do |d|
+          puts "  User #{d[:user_id]} #{d[:asset]} #{d[:bucket]}: Expected #{d[:expected]}, Actual #{d[:actual]}"
+        end
+        exit 1
+      end
+      puts
+    end
+    
+    delay = rand(shared_options[:sleep_min]..shared_options[:sleep_max])
+    sleep(delay)
+  end
+  
+  local_redis.close
 end
 
-rand_quantity = lambda do
-  # 0.05..0.5 BTC in minor units
-  step = QUANTITY_SCALE / 100 # 0.01 BTC
-  n_steps = rand(5..50) # 0.05..0.5 BTC
-  n_steps * step
+puts "#{c('[INIT]', :cyan)} Starting #{options[:concurrency]} worker threads..."
+
+threads = []
+options[:concurrency].times do |t_idx|
+  threads << Thread.new do
+    run_worker.call(t_idx + 1, options[:iterations], options)
+  end
 end
 
-rand_usdt_amount = lambda do
-  # 1000..50_000 USDT in minor units
-  amt = rand(1_000..50_000) * ASSET_SCALES['USDT']
-  amt
-end
+threads.each(&:join)
 
-rand_btc_amount = lambda do
-  # 0.01..0.2 BTC in minor units
-  step = ASSET_SCALES['BTC'] / 100 # 0.01 BTC
-  rand(1..20) * step
-end
-
-ops = %i[limit_order market_order deposit withdraw cancel_one]
-
-weights = {
-  limit_order: 40,
-  market_order: 30,
-  deposit: 2,
-  withdraw: 2,
-  cancel_one: 10
-}
-
-pick_op = lambda do
-  bag = ops.flat_map { |op| [op] * weights[op] }
-  bag.sample
-end
-
-# 如果启用了合并深度显示，先显示一次初始状态
-if options[:merge_depth]
-  puts "#{c('[INIT]', :cyan)} 显示初始合并深度状态..."
-  print_merged_order_book(Time.now.strftime('%H:%M:%S'), exchange, options[:symbol], bucket_size: options[:merge_depth], depth_limit: 10)
+if options[:audit]
   puts
-end
-
-options[:iterations].times do |i|
-  op = pick_op.call
-  user = options[:users].sample
-  ts = Time.now.strftime('%H:%M:%S')
-
+  puts c('[AUDIT]', :cyan, :bold) + " Starting post-run balance audit..."
   begin
-    case op
-    when :limit_order
-      side = %w[BUY SELL].sample
-      price = rand_price.call
-      quantity = rand_quantity.call
-      order_id = "bot-lim-#{order_seq += 1}"
-      res = exchange.place_limit_order(
-        symbol: options[:symbol],
-        side: side,
-        order_id: order_id,
-        user_id: user,
-        price: price,
-        quantity: quantity
-      )
-      placed_order_ids << order_id if res[:status] == 'OPEN' || res[:status] == 'PARTIALLY_FILLED'
-      puts "[#{ts}] #{c('LIMIT', :blue)} #{c(side, (side == 'BUY' ? :green : :red))} user=#{user} price=#{format_price(price)} qty=#{format_quantity(quantity)} id=#{order_id} => #{JSON.pretty_generate(res)}"
-      if res.nil?
-        puts "Empty result"
-      elsif res[:error].nil?
-        # Print trade results (if any)
-        print_trade_results(ts, res)
-        # Print current order book depth on successful placement
-        if %w[OPEN PARTIALLY_FILLED FILLED].include?(res[:status].to_s)
-          if options[:merge_depth]
-            print_merged_order_book(ts, exchange, options[:symbol], bucket_size: options[:merge_depth], depth_limit: 10)
-          else
-            print_order_book(ts, exchange, options[:symbol], depth_limit: 10)
+    reports = exchange_main.maintenance.audit_user_balances(fix: true)
+    
+    if reports.empty?
+      puts "#{c('✅', :green)} No discrepancies found."
+    else
+      puts "#{c('⚠️', :yellow)} Found #{reports.size} user(s) with discrepancies:"
+      
+      reports.each do |r|
+        puts "\nUser: #{r[:user_id]}"
+        
+        unless r[:deficits].empty?
+          puts "  Deficits (Insufficient Funds):"
+          r[:deficits].each do |d|
+            puts "    - #{d[:asset]}: #{d[:amount]} (Missing)"
           end
-        else
-          puts res[:status]
         end
-      else
-        puts res
-      end
-    when :market_order
-      side = %w[BUY SELL].sample
-      quantity = rand_quantity.call
-      price_cap = [0, rand_price.call].sample # sometimes uncapped
-      order_id = "bot-mkt-#{order_seq += 1}"
-      res = exchange.place_market_order(
-        symbol: options[:symbol],
-        side: side,
-        order_id: order_id,
-        user_id: user,
-        quantity: quantity,
-        price_cap: price_cap
-      )
-      cap_str = price_cap.to_i > 0 ? format_price(price_cap) : 'none'
-      puts "[#{ts}] #{c('MARKET', :blue)} #{c(side, (side == 'BUY' ? :green : :red))} user=#{user} qty=#{format_quantity(quantity)} cap=#{cap_str} id=#{order_id} => #{JSON.pretty_generate(res)}"
-      if res.nil?
-        puts "Empty result"
-      elsif res[:error].nil?
-        # Print trade results (if any)
-        print_trade_results(ts, res)
-        # Print current order book depth on successful placement
-        if %w[OPEN PARTIALLY_FILLED FILLED].include?(res[:status].to_s)
-          if options[:merge_depth]
-            print_merged_order_book(ts, exchange, options[:symbol], bucket_size: options[:merge_depth], depth_limit: 10)
-          else
-            print_order_book(ts, exchange, options[:symbol], depth_limit: 10)
+        
+        unless r[:fixes].empty?
+          puts "  Adjustments Applied:"
+          r[:fixes].each do |f|
+            action_icon = f[:action] == 'LOCK' ? '🔒' : '🔓'
+            color = f[:action] == 'LOCK' ? :red : :green
+            puts "    #{action_icon} #{c(f[:action], color)} #{f[:asset]}: #{f[:amount]}"
           end
-        else
-          puts res[:status]
-        end
-      else
-        puts res
-      end
-
-    when :deposit
-      asset = %w[USDT BTC].sample
-      amount = asset == 'USDT' ? rand_usdt_amount.call : rand_btc_amount.call
-      res = exchange.deposit(user_id: user, asset: asset, amount: amount)
-      puts "[#{ts}] #{c('DEPOSIT', :green)} user=#{user} asset=#{asset} amount=#{format_asset_amount(asset, amount)} => #{JSON.pretty_generate(res)}"
-
-    when :withdraw
-      asset = %w[USDT BTC].sample
-      amount = asset == 'USDT' ? rand_usdt_amount.call : rand_btc_amount.call
-      res = exchange.withdraw(user_id: user, asset: asset, amount: amount)
-      puts "[#{ts}] #{c('WITHDRAW', :magenta)} user=#{user} asset=#{asset} amount=#{format_asset_amount(asset, amount)} => #{JSON.pretty_generate(res)}"
-
-    when :cancel_one
-      if placed_order_ids.empty?
-        puts "[#{ts}] #{c('CANCEL', :yellow)} skip (no known resting orders)"
-      else
-        target = placed_order_ids.sample
-        res = exchange.cancel_order(target)
-        puts "[#{ts}] #{c('CANCEL', :yellow)} id=#{target} => #{JSON.pretty_generate(res)}"
-        # Remove from list if cancelled or not found
-        if res[:status] == 'CANCELLED' || res[:error] == 'NOT_FOUND'
-          placed_order_ids.delete(target)
         end
       end
     end
   rescue => e
-    puts "[#{ts}] #{c('ERROR', :bold, :red)} op=#{op} user=#{user} msg=#{e.class}: #{e.message}"
-    puts e.backtrace.take(3).join("\n")
+    puts "#{c('❌', :red)} Audit failed: #{e.message}"
   end
-
-  delay = rand(options[:sleep_min]..options[:sleep_max])
-  sleep(delay)
 end
 
 puts c('[DONE]', :green)
