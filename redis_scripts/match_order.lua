@@ -88,6 +88,17 @@ local function append_ledger(user_id, asset, bucket, delta, reason, ts)
   )
 end
 
+local function publish_depth_update(symbol, side, price, delta, final_volume, ts)
+  redis.call('XADD', 'depth:' .. symbol, 'MAXLEN', '~', 1000000, '*',
+    'e', 'u',
+    's', side,
+    'p', tostring(price),
+    'd', tostring(delta),
+    'v', tostring(final_volume),
+    'ts', tostring(ts)
+  )
+end
+
 -- Store a trade entry so that the response can echo executions.
 local function append_trade(trades, payload)
   trades[#trades + 1] = payload
@@ -619,7 +630,8 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
     redis.call('HSET', maker_order_key, 'remaining', maker_remaining)
 
     -- Update volume first before any cleanup
-    redis.call('HINCRBY', opposite_volume_key, price_member, -trade_qty)
+    local new_maker_vol = redis.call('HINCRBY', opposite_volume_key, price_member, -trade_qty)
+    publish_depth_update(symbol, (is_buy and 'SELL' or 'BUY'), price_member, -trade_qty, new_maker_vol, timestamp)
 
     if maker_remaining == 0 then
       -- Cleanup any residual reserved amounts (dust from rounding)
@@ -782,6 +794,7 @@ else
       end
 
       redis.call('HINCRBY', own_volume_key, price_member, remaining)
+      publish_depth_update(symbol, side, price_member, remaining, redis.call('HGET', own_volume_key, price_member), timestamp)
     end
   end
 end

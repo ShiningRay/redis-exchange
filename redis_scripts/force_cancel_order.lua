@@ -17,6 +17,9 @@ local order_key = KEYS[1]
 local requested_id = ARGV[1]
 local mode = ARGV[2]
 
+local now = redis.call('TIME')
+local ts_ms = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
+
 -- Helpers
 local function to_map(array)
   local map = {}
@@ -48,6 +51,17 @@ local function append_ledger(user_id, asset, bucket, delta, reason, ts)
     'ts', tostring(now_ts),
     'sequence', tostring(seq),
     'biz_id', ledger_biz_id
+  )
+end
+
+local function publish_depth_update(symbol, side, price, delta, final_volume, ts)
+  redis.call('XADD', 'depth:' .. symbol, 'MAXLEN', '~', 1000000, '*',
+    'e', 'u',
+    's', side,
+    'p', tostring(price),
+    'd', tostring(delta),
+    'v', tostring(final_volume),
+    'ts', tostring(ts)
   )
 end
 
@@ -96,13 +110,14 @@ if symbol and side and price and remaining > 0 then
 
   local volume_key = 'volume:' .. symbol .. ':' .. side
   local remaining_volume = redis.call('HINCRBY', volume_key, price_member, -remaining)
+  publish_depth_update(symbol, side, price_member, -remaining, remaining_volume, ts_ms)
   if remaining_volume <= 0 then
     redis.call('HDEL', volume_key, price_member)
     redis.call('DEL', queue_key)
     local book_key = 'book:' .. symbol .. ':' .. side
     redis.call('ZREM', book_key, price_member)
   end
-  
+
   refresh_ticker(symbol)
 end
 
@@ -119,7 +134,7 @@ if mode == 'BEST_EFFORT_UNLOCK' and remaining > 0 and user_id then
     local balance_key = 'balance:' .. user_id
     local asset_to_unlock = nil
     local amount_to_unlock = 0
-    
+
     if side == 'SELL' then
       asset_to_unlock = market['base_asset']
       amount_to_unlock = as_number(order['reserved_base'])
@@ -140,7 +155,7 @@ if mode == 'BEST_EFFORT_UNLOCK' and remaining > 0 and user_id then
       if current_reserved < amount_to_unlock then
         final_unlock = current_reserved
       end
-      
+
       if final_unlock > 0 then
         redis.call('HINCRBY', balance_key, asset_to_unlock .. ':reserved', -final_unlock)
         append_ledger(user_id, asset_to_unlock, 'reserved', -final_unlock, 'FORCE_CANCEL_RELEASE', nil)
@@ -153,14 +168,12 @@ end
 
 -- Publish Event
 if symbol then
-  local now = redis.call('TIME')
-  local ts_ms = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
   local seq_key = 'seq:' .. symbol
   local sequence = redis.call('INCR', seq_key)
   local orders_key = 'orders:' .. symbol
   local market_config = to_map(redis.call('HGETALL', 'market:' .. symbol))
   local orders_maxlen = tonumber(market_config['orders_maxlen']) or 1000000
-  
+
   redis.call('XADD', orders_key, 'MAXLEN', '~', orders_maxlen, '*',
     'order_id', order_id,
     'user_id', user_id,

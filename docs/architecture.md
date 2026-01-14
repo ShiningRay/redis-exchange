@@ -139,6 +139,24 @@ maker_fee     -> fee charged to maker (scaled integer)
 ts            -> unix timestamp in milliseconds
 ```
 
+### Depth Stream
+
+A real-time stream of order book changes is maintained at:
+
+```
+depth:{symbol}
+```
+
+Events are emitted via `XADD` whenever the volume at a price level changes (due to matching, placing, or cancelling).
+
+Fields:
+- `e`: Event type (`u` for update)
+- `s`: Side (`BUY` | `SELL`)
+- `p`: Price level (integer string)
+- `d`: Delta amount (signed integer string; negative means volume decrease)
+- `v`: Final volume at this level (integer string, snapshot for verification)
+- `ts`: Timestamp (ms)
+
 ### Ticker
 
 Per-market ticker information is stored in a hash:

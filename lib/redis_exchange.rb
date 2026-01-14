@@ -415,6 +415,15 @@ module RedisExchange
       c
     end
 
+    # Build a DepthStreamConsumer for a market symbol.
+    # Usage: consumer = exchange.depth_consumer(symbol: 'BTCUSDT', group: 'depth-consumers', consumer: 'worker-1')
+    def depth_consumer(symbol:, group:, consumer:)
+      require_relative 'redis_exchange/depth_stream_consumer'
+      c = RedisExchange::DepthStreamConsumer.new(redis: @redis, symbol: symbol, group: group, consumer: consumer)
+      c.ensure_group(start_id: '$')
+      c
+    end
+
     def maintenance
       require_relative 'redis_exchange/maintenance'
       @maintenance ||= RedisExchange::Maintenance.new(@redis)
@@ -447,6 +456,8 @@ module RedisExchange
         "volume:#{symbol}:SELL",
         "seq:#{symbol}",
         "trades:#{symbol}",
+        "orders:#{symbol}",
+        "depth:#{symbol}",
         "ticker:#{symbol}"
       ]
       @redis.del(*keys)

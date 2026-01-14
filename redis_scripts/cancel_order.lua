@@ -72,6 +72,17 @@ local function append_ledger(user_id, asset, bucket, delta, reason, ts)
   )
 end
 
+local function publish_depth_update(symbol, side, price, delta, final_volume, ts)
+  redis.call('XADD', 'depth:' .. symbol, 'MAXLEN', '~', 1000000, '*',
+    'e', 'u',
+    's', side,
+    'p', tostring(price),
+    'd', tostring(delta),
+    'v', tostring(final_volume),
+    'ts', tostring(ts)
+  )
+end
+
 local function refresh_ticker(symbol)
   local ticker_key = 'ticker:' .. symbol
   local best_bid_member = redis.call('ZRANGE', 'book:' .. symbol .. ':BUY', -1, -1)
@@ -108,6 +119,9 @@ local price = order['price']
 local remaining = as_number(order['remaining'])
 local status = order['status'] or 'UNKNOWN'
 local user_id = order['user_id']
+
+local now = redis.call('TIME')
+local ts_ms = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
 
 if remaining <= 0 then
   return cjson.encode({ status = status, order_id = order_id, symbol = symbol or '' })
@@ -169,9 +183,9 @@ else
   end
   if release_amount > 0 then
     redis.call('HINCRBY', balance_key, quote_asset .. ':reserved', -release_amount)
-    append_ledger(user_id, quote_asset, 'reserved', -release_amount, 'CANCEL_RELEASE', nil)
+    append_ledger(user_id, quote_asset, 'reserved', -release_amount, 'CANCEL_RELEASE', ts_ms)
     redis.call('HINCRBY', balance_key, quote_asset .. ':available', release_amount)
-    append_ledger(user_id, quote_asset, 'available', release_amount, 'CANCEL_REFUND', nil)
+    append_ledger(user_id, quote_asset, 'available', release_amount, 'CANCEL_REFUND', ts_ms)
   end
 end
 
@@ -181,6 +195,8 @@ redis.call('LREM', queue_key, 0, order_id)
 
 local volume_key = 'volume:' .. symbol .. ':' .. side
 local remaining_volume = redis.call('HINCRBY', volume_key, price_member, -remaining)
+publish_depth_update(symbol, side, price_member, -remaining, remaining_volume, ts_ms)
+
 if remaining_volume <= 0 then
   redis.call('HDEL', volume_key, price_member)
   redis.call('DEL', queue_key)
