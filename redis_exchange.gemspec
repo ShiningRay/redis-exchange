@@ -10,9 +10,10 @@ Gem::Specification.new do |spec|
 
   spec.summary       = 'Redis-backed matching engine and ticker powered by Lua'
   spec.description   = 'A reference central limit order book implemented with Redis data structures, a Lua matching script, and built-in market ticker snapshots.'
-  spec.homepage      = 'https://example.com/redis_exchange'
+  spec.homepage      = 'https://github.com/ShiningRay/redis-exchange'
   spec.license       = 'MIT'
   spec.metadata["github_repo"] = "https://github.com/ShiningRay/redis-exchange"
+  spec.metadata["allowed_push_host"] = "https://rubygems.pkg.github.com/ShiningRay"
   spec.required_ruby_version = '>= 3.0'
 
   spec.files = Dir.chdir(File.expand_path(__dir__)) do
