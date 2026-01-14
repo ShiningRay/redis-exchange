@@ -16,10 +16,7 @@ Gem::Specification.new do |spec|
   spec.required_ruby_version = '>= 3.0'
 
   spec.files = Dir.chdir(File.expand_path(__dir__)) do
-    Dir['lib/**/*.rb'] + [
-      'redis_scripts/match_order.lua',
-      'redis_scripts/cancel_order.lua',
-      'redis_scripts/cancel_all_orders.lua',
+    Dir['lib/**/*.rb'] + Dir['redis_scripts/*.lua'] + [
       'README.md',
       'docs/architecture.md'
     ]
