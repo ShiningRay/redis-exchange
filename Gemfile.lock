@@ -19,6 +19,7 @@ GEM
     pry-byebug (3.11.0)
       byebug (~> 12.0)
       pry (>= 0.13, < 0.16)
+    rake (13.3.1)
     redis (5.4.1)
       redis-client (>= 0.22.0)
     redis-client (0.26.1)
@@ -45,6 +46,7 @@ DEPENDENCIES
   hiredis (>= 0.6)
   pry
   pry-byebug
+  rake (>= 13.0)
   redis_exchange!
   rspec (>= 3.12)
 
