@@ -74,5 +74,26 @@ RSpec.describe 'Snapshot Balances', :snapshot_balances do
         File.delete(temp_file) if File.exist?(temp_file)
       end
     end
+
+    it 'generates filename with ledger sequence when output_path is a directory' do
+      # Setup data
+      exchange.set_balance(user_id: alice, asset: 'BTC', available: 10)
+      
+      Dir.mktmpdir do |dir|
+        result_path = exchange.maintenance.snapshot_balances(output_path: dir)
+        
+        # Verify result path is inside dir
+        expect(result_path).to start_with(dir)
+        expect(File.exist?(result_path)).to be true
+        
+        # Verify filename pattern (balances_TIMESTAMP-SEQ.json)
+        filename = File.basename(result_path)
+        expect(filename).to match(/^balances_\d+-\d+\.json$/)
+        
+        content = File.read(result_path)
+        json = JSON.parse(content)
+        expect(json[alice]['BTC']['available']).to eq(10)
+      end
+    end
   end
 end

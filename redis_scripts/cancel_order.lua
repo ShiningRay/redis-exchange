@@ -25,7 +25,7 @@ local requested_id = ARGV[1]
 
 local symbol = redis.call('HGET', order_key, 'symbol')
 if symbol then
-  if redis.call('HGET', 'market:' .. symbol, 'maintenance') == '1' then
+  if redis.call('HGET', 'market:' .. symbol, 'status') == 'MAINTENANCE' then
     return cjson.encode({ error = 'MARKET_MAINTENANCE' })
   end
 end

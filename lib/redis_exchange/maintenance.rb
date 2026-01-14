@@ -6,7 +6,69 @@ module RedisExchange
 
     def initialize(redis)
       @redis = redis
+      
+      migrate_batch_path = File.expand_path('../../redis_scripts/migrate_orders_batch.lua', __dir__)
+      @migrate_batch_script = register_script(read_script(migrate_batch_path))
+
+      finalize_precision_path = File.expand_path('../../redis_scripts/finalize_precision_update.lua', __dir__)
+      @finalize_precision_script = register_script(read_script(finalize_precision_path))
     end
+
+    # Update market precision and revise all active orders using batched processing.
+    # Handles market status changes to ensure safety.
+    # @param symbol [String]
+    # @param new_price_scale [Integer]
+    # @param new_quantity_scale [Integer]
+    # @param batch_size [Integer] number of price levels to process per batch
+    # @return [Hash] { updated_orders: Integer, status: 'OK' } or { error: String }
+    def update_market_precision(symbol:, new_price_scale:, new_quantity_scale:, batch_size: 20)
+      # 1. Ensure Market is NOT OPEN (Use MAINTENANCE mode)
+      initial_status = @redis.hget("market:#{symbol}", 'status')
+      return { error: 'UNKNOWN_MARKET' } unless initial_status
+
+      if initial_status == 'OPEN'
+        enable_market(symbol) # Sets status to MAINTENANCE
+      end
+
+      updated_count = 0
+      
+      begin
+        # 2. Process BUY and SELL sides
+        ['BUY', 'SELL'].each do |side|
+          book_key = "book:#{symbol}:#{side}"
+          price_members = @redis.zrange(book_key, 0, -1)
+          
+          price_members.each_slice(batch_size) do |batch|
+            res = run_migrate_batch(symbol, side, new_price_scale, new_quantity_scale, batch)
+            if res[:error]
+              # Restore status and raise/return error
+              disable_market(symbol) if initial_status == 'OPEN'
+              return res
+            end
+            updated_count += res[:processed_orders].to_i
+          end
+        end
+
+        # 3. Finalize and switch
+        finalize_res = run_finalize_precision(symbol, new_price_scale, new_quantity_scale)
+        if finalize_res[:error]
+          disable_market(symbol) if initial_status == 'OPEN'
+          return finalize_res
+        end
+        
+      ensure
+        # 4. Restore Status (if it was OPEN originally and we didn't crash)
+        if initial_status == 'OPEN'
+          current_status = @redis.hget("market:#{symbol}", 'status')
+          if current_status == 'MAINTENANCE'
+             disable_market(symbol)
+          end
+        end
+      end
+
+      { updated_orders: updated_count, status: 'OK' }
+    end
+
 
     def enable
       @redis.set(MAINTENANCE_KEY, '1')
@@ -21,16 +83,109 @@ module RedisExchange
     end
 
     def enable_market(symbol)
-      @redis.hset("market:#{symbol}", 'maintenance', '1')
+      # Store previous status if we want to be fancy, but simple maintenance overwrite is standard.
+      # However, snapshot_order_book relies on disable_market restoring order.
+      # Let's change enable_market to return previous status? 
+      # No, public API change. Let's just set status=MAINTENANCE.
+      # But snapshot_order_book needs to handle restoration.
+      # Since snapshot_order_book is inside this class, we can update it.
+      @redis.hset("market:#{symbol}", 'status', 'MAINTENANCE')
     end
 
     def disable_market(symbol)
-      @redis.hdel("market:#{symbol}", 'maintenance')
+      # Default to OPEN when disabling maintenance manually
+      @redis.hset("market:#{symbol}", 'status', 'OPEN')
     end
 
     def market_enabled?(symbol)
-      @redis.hget("market:#{symbol}", 'maintenance') == '1'
+      @redis.hget("market:#{symbol}", 'status') == 'MAINTENANCE'
     end
+
+    private
+
+    def run_migrate_batch(symbol, side, new_price_scale, new_quantity_scale, prices)
+      payload = {
+        keys: [
+          "market:#{symbol}",
+          "book:#{symbol}:#{side}:TMP",
+          "volume:#{symbol}:#{side}:TMP",
+          "orders:#{symbol}"
+        ],
+        argv: [
+          symbol,
+          side,
+          new_price_scale.to_s,
+          new_quantity_scale.to_s,
+          current_millis.to_s,
+          *prices.map(&:to_s)
+        ]
+      }
+      raw = call_script(@migrate_batch_script, payload)
+      JSON.parse(raw, symbolize_names: true)
+    end
+
+    def run_finalize_precision(symbol, new_price_scale, new_quantity_scale)
+      payload = {
+        keys: [
+          "market:#{symbol}",
+          "book:#{symbol}:BUY",
+          "book:#{symbol}:SELL",
+          "volume:#{symbol}:BUY",
+          "volume:#{symbol}:SELL",
+          "book:#{symbol}:BUY:TMP",
+          "book:#{symbol}:SELL:TMP",
+          "volume:#{symbol}:BUY:TMP",
+          "volume:#{symbol}:SELL:TMP"
+        ],
+        argv: [
+          symbol,
+          new_price_scale.to_s,
+          new_quantity_scale.to_s
+        ]
+      }
+      raw = call_script(@finalize_precision_script, payload)
+      JSON.parse(raw, symbolize_names: true)
+    end
+
+    def current_millis
+      (Time.now.to_f * 1000).floor
+    end
+
+    def read_script(path)
+      return nil unless path && File.exist?(path)
+      File.read(path)
+    end
+
+    def register_script(lua_source)
+      raise ArgumentError, 'missing Lua source' unless lua_source && !lua_source.empty?
+      LuaScript.new(lua_source)
+    end
+
+    def call_script(script, payload)
+      script.call(@redis, **payload)
+    end
+
+    class LuaScript
+      def initialize(source)
+        @source = source
+        @sha = nil
+      end
+
+      def call(redis, keys:, argv:)
+        @sha ||= redis.script(:load, @source)
+        redis.evalsha(@sha, keys: keys, argv: argv)
+      rescue ::Redis::CommandError => e
+        if e.message =~ /NOSCRIPT/
+          @sha = redis.script(:load, @source)
+          retry
+        else
+          raise
+        end
+      end
+    end
+
+    public
+
 
     # Atomically snapshot order book for a symbol.
     # Uses market-level maintenance mode to ensure consistency without blocking Redis.
@@ -38,6 +193,8 @@ module RedisExchange
     # @param output_path [String,nil] if provided, streams JSON output to this file; otherwise returns Hash
     # @return [Hash,String] returns Hash if output_path is nil; otherwise returns output_path
     def snapshot_order_book(symbol:, output_path: nil)
+      # Capture previous status to restore correctly
+      previous_status = @redis.hget("market:#{symbol}", 'status') || 'OPEN'
       enable_market(symbol)
       output = output_path ? File.open(output_path, 'w') : nil
       
@@ -69,17 +226,28 @@ module RedisExchange
         if output && !output.closed?
           output.close
         end
-        disable_market(symbol)
+        # Restore previous status instead of blind disable
+        @redis.hset("market:#{symbol}", 'status', previous_status)
       end
     end
 
     # Atomically snapshot all user balances.
     # Uses system maintenance mode to ensure consistency without blocking Redis.
-    # @param output_path [String,nil] if provided, streams JSON output to this file; otherwise returns Hash
+    # @param output_path [String,nil] if provided and is a file path, writes to it. 
+    #   If provided and is a directory, generates a filename using the latest ledger stream ID.
     # @return [Hash,String] returns Hash if output_path is nil; otherwise returns output_path
     def snapshot_balances(output_path: nil)
       enable
-      output = output_path ? File.open(output_path, 'w') : {}
+      
+      # Determine output file path
+      final_output_path = output_path
+      if output_path && File.directory?(output_path)
+        last_entry = @redis.xrevrange('account_ledger', '+', '-', count: 1).first
+        ledger_id = last_entry ? last_entry[0] : '0-0'
+        final_output_path = File.join(output_path, "balances_#{ledger_id}.json")
+      end
+
+      output = final_output_path ? File.open(final_output_path, 'w') : {}
       
       begin
         if output.is_a?(File)
@@ -133,7 +301,7 @@ module RedisExchange
         if output.is_a?(File)
           output.write('}')
           output.close
-          output_path
+          final_output_path
         else
           output
         end

@@ -290,7 +290,7 @@ exchange.seed_market(
   taker_fee_bps: 10,
   min_qty: 100_000,
   min_notional: 1_000,
-  status: 'OPEN' # OPEN | HALTED | CLOSED
+  status: 'OPEN' # OPEN | HALTED | CLOSED | MAINTENANCE
 )
 ```
 
@@ -306,14 +306,12 @@ If violated, order placement returns:
 
 ### Market Status Semantics
 
-- `OPEN`: normal operation; order placement proceeds.
-- `HALTED`: new limit/market orders are rejected with `MARKET_HALTED`.
-- `CLOSED`: new limit/market orders are rejected with `MARKET_CLOSED`.
-
-Currently, cancellations are not blocked by market status.
+- `OPEN`: normal operation; order placement and cancellation allowed.
+- `HALTED`: new limit/market orders are rejected with `MARKET_HALTED`; cancellations are **allowed**.
+- `CLOSED`: new limit/market orders are rejected with `MARKET_CLOSED`; cancellations are **allowed**.
+- `MAINTENANCE`: all operations (including cancellation) are rejected with `MARKET_MAINTENANCE`. Used for atomic operations like snapshotting or precision updates.
 
 Example rejection when market is halted:
-
 ```ruby
 exchange.seed_market(
   symbol: 'BTCUSDT', base_asset: 'BTC', quote_asset: 'USDT',

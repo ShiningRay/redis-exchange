@@ -43,7 +43,7 @@ RSpec.describe 'Numeric precision bounds', :precision_bounds do
     end
 
     it 'accepts near-threshold price*quantity without overflow' do
-      exchange.set_balance(user_id: 'maker_near', asset: 'BTC', available: 9_000_000_000_000_000)
+      exchange.set_balance(user_id: 'maker_near', asset: 'BTC', available: RedisExchange::MAX_SAFE_INTEGER)
 
       result = exchange.place_limit_order(
         symbol: symbol,

@@ -32,6 +32,9 @@ module RedisExchange
     best_ask_price
     best_ask_volume
   ].freeze
+
+  # Max integer safe for Lua double precision (approx 9e15)
+  MAX_SAFE_INTEGER = 9_000_000_000_000_000
 end
 
 require_relative 'redis_exchange/version'
@@ -128,7 +131,7 @@ module RedisExchange
                   status: 'OPEN', trades_maxlen: nil, orders_maxlen: nil)
       key = "market:#{symbol}"
       stat = status.to_s.upcase
-      raise ArgumentError, 'invalid market status' unless %w[OPEN HALTED CLOSED].include?(stat)
+      raise ArgumentError, 'invalid market status' unless %w[OPEN HALTED CLOSED MAINTENANCE].include?(stat)
       mapping = {
         'base_asset' => base_asset,
         'quote_asset' => quote_asset,
@@ -150,7 +153,7 @@ module RedisExchange
       return { error: 'UNKNOWN_MARKET' } unless @redis.exists?(key)
 
       stat = status.to_s.upcase
-      raise ArgumentError, 'invalid market status' unless %w[OPEN HALTED CLOSED].include?(stat)
+      raise ArgumentError, 'invalid market status' unless %w[OPEN HALTED CLOSED MAINTENANCE].include?(stat)
 
       @redis.hset(key, 'status', stat)
       market_config(symbol)
@@ -542,7 +545,6 @@ module RedisExchange
 
       # Precision pre-check (Ruby layer): both price_limit and quantity are scaled integers.
       # Prevent sending arguments that would overflow Lua's double precision (~9e15).
-      precision_bound = 9_000_000_000_000_000
       pl = price_limit.to_i
       qty = quantity.to_i
       if pl.negative? || qty <= 0
@@ -551,7 +553,7 @@ module RedisExchange
       if pl > 0
         # If either operand or the product breaches the bound, abort.
         # allow product equal to bound; overflow only when strictly greater
-        if pl >= precision_bound || qty >= precision_bound || (pl.to_i * qty.to_i) > precision_bound
+        if pl >= RedisExchange::MAX_SAFE_INTEGER || qty >= RedisExchange::MAX_SAFE_INTEGER || (pl.to_i * qty.to_i) > RedisExchange::MAX_SAFE_INTEGER
           return { error: 'PRECISION_OVERFLOW' }
         end
       end
@@ -561,7 +563,9 @@ module RedisExchange
       unless mc.empty?
         st = mc[:status].to_s.upcase
         if st != 'OPEN'
-          return { error: st == 'HALTED' ? 'MARKET_HALTED' : 'MARKET_CLOSED' }
+          return { error: 'MARKET_HALTED' } if st == 'HALTED'
+          return { error: 'MARKET_MAINTENANCE' } if st == 'MAINTENANCE'
+          return { error: 'MARKET_CLOSED' }
         end
       end
 

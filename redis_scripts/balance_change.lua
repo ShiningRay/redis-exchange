@@ -93,7 +93,8 @@ redis.call('XADD', ledger_stream_key, 'MAXLEN', '~', ledger_maxlen, '*',
   'sequence', tostring(seq),
   'biz_id', ledger_biz_id
 )
-local result_json = cjson.encode({ ok = true, user_id = user_id, asset = asset, bucket = bucket, delta = delta, value = after, ts = ts, sequence = seq, biz_id = ledger_biz_id })
+local result_json = cjson.encode({ ok = true, user_id = user_id, asset = asset, bucket = bucket, delta = delta, value =
+after, ts = ts, sequence = seq, biz_id = ledger_biz_id })
 
 -- Cache the result for idempotency if biz_id provided (24h TTL)
 if resp_key then

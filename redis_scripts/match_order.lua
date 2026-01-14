@@ -34,12 +34,14 @@ if redis.call('GET', 'system:maintenance_mode') == '1' then
   return cjson.encode({ error = 'SYSTEM_MAINTENANCE' })
 end
 
--- Check for market maintenance mode
-if redis.call('HGET', KEYS[1], 'maintenance') == '1' then
+-- Check for market maintenance mode (via status field)
+local market_status = redis.call('HGET', KEYS[1], 'status')
+if market_status == 'MAINTENANCE' then
   return cjson.encode({ error = 'MARKET_MAINTENANCE' })
 end
-
--- Convert a flat array (HGETALL result) into a key/value table.
+if market_status ~= 'OPEN' then
+  return cjson.encode({ error = 'MARKET_HALTED' })
+end
 local function to_map(array)
   local map = {}
   for i = 1, #array, 2 do
@@ -174,9 +176,9 @@ local function mark_tombstone(oid, status)
   redis.call('SET', 'order_tombstone:' .. oid, status or 'DONE', 'EX', tombstone_ttl_sec)
 end
 
-if market['status'] ~= 'OPEN' then
-  return cjson.encode({ error = 'MARKET_HALTED' })
-end
+-- Redundant check removed as we checked status at start of script
+-- but we need to ensure market dict has it if used elsewhere.
+-- market['status'] is available.
 
 -- Optional stream length cap from market config; default to 1,000,000 entries
 local trades_maxlen = tonumber(market['trades_maxlen']) or 1000000
