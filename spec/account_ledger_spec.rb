@@ -132,4 +132,39 @@ RSpec.describe 'Account Ledger and Balance Changes' do
     expect(entry['reason']).to eq('DEPOSIT')
     expect(entry['delta']).to eq('1000000')
   end
+
+  context '自动缩放支持 (auto_scale)' do
+    before do
+      exchange.seed_asset(asset: 'BTC', balance_scale: 100_000_000)
+      exchange.seed_asset(asset: 'USDT', balance_scale: 100)
+    end
+
+    it 'deposit: 自动将小数金额转换为整数单位' do
+      exchange.deposit(user_id: 'u2', asset: 'BTC', amount: 1.5, auto_scale: true)
+      expect(exchange.balances('u2')[:"BTC:available"]).to eq(150_000_000)
+
+      exchange.deposit(user_id: 'u2', asset: 'USDT', amount: 2500.5, auto_scale: true)
+      expect(exchange.balances('u2')[:"USDT:available"]).to eq(250_050)
+    end
+
+    it 'withdraw: 自动将小数金额转换为整数单位' do
+      exchange.deposit(user_id: 'u2', asset: 'BTC', amount: 150_000_000)
+      exchange.withdraw(user_id: 'u2', asset: 'BTC', amount: 0.5, auto_scale: true)
+      expect(exchange.balances('u2')[:"BTC:available"]).to eq(100_000_000)
+    end
+
+    it 'change_balance: 自动将小数金额转换为整数单位' do
+      exchange.change_balance(user_id: 'u2', asset: 'BTC', delta: 1.23, auto_scale: true)
+      expect(exchange.balances('u2')[:"BTC:available"]).to eq(123_000_000)
+    end
+
+    it 'balances: 自动将整数单位余额转换为小数' do
+      exchange.deposit(user_id: 'u3', asset: 'BTC', amount: 150_000_000)
+      exchange.deposit(user_id: 'u3', asset: 'USDT', amount: 250_050)
+
+      b = exchange.balances('u3', auto_scale: true)
+      expect(b[:"BTC:available"]).to eq(1.5)
+      expect(b[:"USDT:available"]).to eq(2500.5)
+    end
+  end
 end

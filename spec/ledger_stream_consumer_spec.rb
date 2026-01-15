@@ -76,6 +76,24 @@ RSpec.describe RedisExchange::LedgerStreamConsumer do
     # Claim idle (set tiny idle to allow immediate claim)
     claimed = consumer.claim_idle(min_idle_ms: 1, count: 10)
     expect(claimed).to be_a(Array)
+    expect(claimed.first).to be_a(RedisExchange::StreamConsumer::Entry)
+    expect(claimed.first.id).to eq(entries.first.id)
+  end
+
+  it 'supports reading from a specific ID (re-processing)' do
+    # Produce two entries
+    exchange.deposit(user_id: 'u4', asset: 'USDT', amount: 100)
+    exchange.deposit(user_id: 'u4', asset: 'USDT', amount: 200)
+
+    consumer = exchange.ledger_consumer(group: 'ledger-consumers', consumer: 'worker-4')
+    entries = consumer.read(count: 2)
+    expect(entries.size).to eq(2)
+
+    first_id = entries.first.id
+    
+    # Read again starting from '0-0' should return the same entries (since they are in PEL)
+    re_read = consumer.read(id: '0-0', count: 1)
+    expect(re_read.first.id).to eq(first_id)
   end
 
   after do

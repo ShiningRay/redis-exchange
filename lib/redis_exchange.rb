@@ -64,13 +64,17 @@ module RedisExchange
     # @param side [String, Symbol] 'BUY' or 'SELL'
     # @param order_id [String] unique order identifier
     # @param user_id [String] owner of the order
-    # @param price [Integer] scaled limit price
-    # @param quantity [Integer] scaled quantity
+    # @param price [Integer, Float, BigDecimal] limit price
+    # @param quantity [Integer, Float, BigDecimal] quantity
     # @param timestamp_ms [Integer,nil] optional epoch in milliseconds
+    # @param auto_scale [Boolean] if true, scales price and quantity using market config
     # @return [Hash] parsed Lua response
-    def place_limit_order(symbol:, side:, order_id:, user_id:, price:, quantity:, timestamp_ms: nil)
-      raise ArgumentError, 'price must be positive for limit orders' unless price.positive?
-      raise ArgumentError, 'quantity must be positive for limit orders' unless quantity.positive?
+    def place_limit_order(symbol:, side:, order_id:, user_id:, price:, quantity:, timestamp_ms: nil, auto_scale: false)
+      final_price = auto_scale ? scale_price(symbol, price) : price.to_i
+      final_quantity = auto_scale ? scale_quantity(symbol, quantity) : quantity.to_i
+
+      raise ArgumentError, 'price must be positive for limit orders' unless final_price.positive?
+      raise ArgumentError, 'quantity must be positive for limit orders' unless final_quantity.positive?
 
       execute_order(
         symbol: symbol,
@@ -78,17 +82,21 @@ module RedisExchange
         order_type: 'LIMIT',
         order_id: order_id,
         user_id: user_id,
-        price_limit: price,
-        quantity: quantity,
+        price_limit: final_price,
+        quantity: final_quantity,
         timestamp_ms: timestamp_ms
       )
     end
 
     # Submit a market order; optional price_cap acts as a worst-case limit.
-    # @param price_cap [Integer] 0 for uncapped markets
+    # @param price_cap [Integer, Float, BigDecimal] 0 for uncapped markets
+    # @param auto_scale [Boolean] if true, scales price_cap and quantity using market config
     # Other params mirror #place_limit_order
-    def place_market_order(symbol:, side:, order_id:, user_id:, quantity:, price_cap: 0, timestamp_ms: nil)
-      raise ArgumentError, 'price_cap must be non-negative' if price_cap.negative?
+    def place_market_order(symbol:, side:, order_id:, user_id:, quantity:, price_cap: 0, timestamp_ms: nil, auto_scale: false)
+      final_price_cap = auto_scale ? scale_price(symbol, price_cap) : price_cap.to_i
+      final_quantity = auto_scale ? scale_quantity(symbol, quantity) : quantity.to_i
+
+      raise ArgumentError, 'price_cap must be non-negative' if final_price_cap.negative?
 
       execute_order(
         symbol: symbol,
@@ -96,8 +104,8 @@ module RedisExchange
         order_type: 'MARKET',
         order_id: order_id,
         user_id: user_id,
-        price_limit: price_cap,
-        quantity: quantity,
+        price_limit: final_price_cap,
+        quantity: final_quantity,
         timestamp_ms: timestamp_ms
       )
     end
@@ -240,10 +248,22 @@ module RedisExchange
     # Fetch all balance fields for a user as integers keyed by symbols.
     # @param user_id [String]
     # @return [Hash{Symbol=>Integer}]
-    def balances(user_id)
+    # Get all balances for a user.
+    # @param user_id [String] user identifier
+    # @param auto_scale [Boolean] if true, converts integer balances to human-readable floats
+    # @return [Hash{Symbol=>Integer,Float}]
+    def balances(user_id, auto_scale: false)
       raw = @redis.hgetall("balance:#{user_id}")
+      scales = {} if auto_scale
+
       raw.each_with_object({}) do |(field, value), result|
-        result[field.to_sym] = value.to_i
+        val = value.to_i
+        if auto_scale
+          asset = field.split(':').first
+          scales[asset] ||= (asset_config(asset)[:balance_scale] || 1)
+          val = val.to_f / scales[asset]
+        end
+        result[field.to_sym] = val
       end
     end
 
@@ -336,17 +356,24 @@ module RedisExchange
     # @param user_id [String] user identifier
     # @param asset [String] asset symbol
     # @param bucket [String] either 'available' or 'reserved'
-    # @param delta [Integer] amount to add (positive) or subtract (negative)
+    # @param delta [Integer, Float, BigDecimal] amount to add (positive) or subtract (negative)
     # @param reason [String] optional reason for the balance change (defaults to 'MANUAL_ADJUST')
     # @param timestamp_ms [Integer,nil] optional timestamp in milliseconds
     # @param biz_id [String,nil] optional idempotency key to deduplicate requests
+    # @param auto_scale [Boolean] if true, scales delta using asset's balance_scale
     # @return [Hash] parsed Lua response with new value or error
-    def change_balance(user_id:, asset:, bucket: 'available', delta:, reason: 'MANUAL_ADJUST', timestamp_ms: nil, biz_id: nil)
+    def change_balance(user_id:, asset:, bucket: 'available', delta:, reason: 'MANUAL_ADJUST', timestamp_ms: nil, biz_id: nil, auto_scale: false)
+      final_delta = if auto_scale
+                      scale_asset_amount(asset, delta)
+                    else
+                      delta.to_i
+                    end
+
       timestamp = timestamp_ms || current_millis
       biz = (biz_id && !biz_id.to_s.empty?) ? biz_id.to_s : SecureRandom.uuid
       payload = {
         keys: ["balance:#{user_id}"],
-        argv: [user_id, asset, bucket, delta.to_s, reason, timestamp.to_s, biz]
+        argv: [user_id, asset, bucket, final_delta.to_s, reason, timestamp.to_s, biz]
       }
       raw = call_script(@balance_change_script, payload)
       resp = JSON.parse(raw, symbolize_names: true)
@@ -358,13 +385,22 @@ module RedisExchange
     # Emits ledger entry with reason 'DEPOSIT'.
     # @param user_id [String]
     # @param asset [String]
-    # @param amount [Integer] positive scaled integer amount
+    # @param amount [Integer, Float, BigDecimal] positive amount
     # @param timestamp_ms [Integer,nil]
     # @param biz_id [String,nil]
+    # @param auto_scale [Boolean] if true, scales amount using asset's balance_scale
     # @return [Hash]
-    def deposit(user_id:, asset:, amount:, timestamp_ms: nil, biz_id: nil)
-      amt = amount.to_i.abs
-      change_balance(user_id: user_id, asset: asset, bucket: 'available', delta: amt, reason: 'DEPOSIT', timestamp_ms: timestamp_ms, biz_id: biz_id)
+    def deposit(user_id:, asset:, amount:, timestamp_ms: nil, biz_id: nil, auto_scale: false)
+      change_balance(
+        user_id: user_id,
+        asset: asset,
+        bucket: 'available',
+        delta: amount.to_f.abs,
+        reason: 'DEPOSIT',
+        timestamp_ms: timestamp_ms,
+        biz_id: biz_id,
+        auto_scale: auto_scale
+      )
     end
 
     # Convenience: withdraw funds from user's available balance for an asset.
@@ -372,13 +408,22 @@ module RedisExchange
     # Fails with error 'INSUFFICIENT_FUNDS' from Lua when balance insufficient.
     # @param user_id [String]
     # @param asset [String]
-    # @param amount [Integer] positive scaled integer amount
+    # @param amount [Integer, Float, BigDecimal] positive amount
     # @param timestamp_ms [Integer,nil]
     # @param biz_id [String,nil]
+    # @param auto_scale [Boolean] if true, scales amount using asset's balance_scale
     # @return [Hash]
-    def withdraw(user_id:, asset:, amount:, timestamp_ms: nil, biz_id: nil)
-      amt = amount.to_i.abs
-      change_balance(user_id: user_id, asset: asset, bucket: 'available', delta: -amt, reason: 'WITHDRAWAL', timestamp_ms: timestamp_ms, biz_id: biz_id)
+    def withdraw(user_id:, asset:, amount:, timestamp_ms: nil, biz_id: nil, auto_scale: false)
+      change_balance(
+        user_id: user_id,
+        asset: asset,
+        bucket: 'available',
+        delta: -amount.to_f.abs,
+        reason: 'WITHDRAWAL',
+        timestamp_ms: timestamp_ms,
+        biz_id: biz_id,
+        auto_scale: auto_scale
+      )
     end
 
     # 分页查询用户在某交易对的活跃订单（OPEN/PARTIALLY_FILLED 且 remaining>0）。
@@ -777,5 +822,35 @@ module RedisExchange
     
 
     # Fallback-related helpers removed; cancellations handled via Lua scripts.
+
+    private
+
+    # Scale a human-readable asset amount (e.g., 1.5 BTC) into an integer using balance_scale.
+    def scale_asset_amount(asset, amount)
+      cfg = asset_config(asset)
+      scale = cfg[:balance_scale] || 1
+      (amount.to_f * scale).floor
+    end
+
+    # Scale a human-readable price into an integer using market price_scale.
+    def scale_price(symbol, price)
+      cfg = market_config(symbol)
+      scale = cfg[:price_scale] || 1
+      (price.to_f * scale).floor
+    end
+
+    # Scale a human-readable quantity into an integer using market quantity_scale.
+    def scale_quantity(symbol, quantity)
+      cfg = market_config(symbol)
+      scale = cfg[:quantity_scale] || 1
+      (quantity.to_f * scale).floor
+    end
+
+    # Unscale an integer amount into a human-readable float using balance_scale.
+    def unscale_asset_amount(asset, integer_amount)
+      cfg = asset_config(asset)
+      scale = cfg[:balance_scale] || 1
+      integer_amount.to_f / scale
+    end
   end
 end

@@ -89,7 +89,7 @@ local function append_ledger(user_id, asset, bucket, delta, reason, ts)
 end
 
 local function publish_depth_update(symbol, side, price, delta, final_volume, ts)
-  redis.call('XADD', 'depth:' .. symbol, 'MAXLEN', '~', 1000000, '*',
+  redis.call('XADD', 'depth:' .. symbol, 'MAXLEN', '~', 100000, '*',
     'e', 'u',
     's', side,
     'p', tostring(price),
@@ -794,7 +794,8 @@ else
       end
 
       redis.call('HINCRBY', own_volume_key, price_member, remaining)
-      publish_depth_update(symbol, side, price_member, remaining, redis.call('HGET', own_volume_key, price_member), timestamp)
+      publish_depth_update(symbol, side, price_member, remaining, redis.call('HGET', own_volume_key, price_member),
+        timestamp)
     end
   end
 end
