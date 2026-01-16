@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    redis_exchange (0.1.0)
+    redis_exchange (0.2.0)
       csv (>= 3.0)
       redis (>= 5.0)
 
