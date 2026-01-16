@@ -11,6 +11,7 @@
 #   -h, --host <host>     Redis host (default: 127.0.0.1)
 #   -p, --port <port>     Redis port (default: 6379)
 #   -a, --password <pwd>  Redis password
+#   -u, --url <url>       Redis URL (e.g. redis://[:password@]host:port[/db])
 #
 
 set -e
@@ -18,6 +19,7 @@ set -e
 REDIS_HOST="127.0.0.1"
 REDIS_PORT="6379"
 REDIS_PASS=""
+REDIS_URL=""
 USE_REMOTE=false
 POSITIONAL_ARGS=()
 
@@ -35,6 +37,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     -a|--password)
       REDIS_PASS="$2"
+      USE_REMOTE=true
+      shift 2
+      ;;
+    -u|--url)
+      REDIS_URL="$2"
       USE_REMOTE=true
       shift 2
       ;;
@@ -61,13 +68,19 @@ elif [ "$USE_REMOTE" = true ]; then
   fi
   
   RDB_FILE="dump_$(date +%s).rdb"
-  echo "Dumping data from ${REDIS_HOST}:${REDIS_PORT} to ${RDB_FILE}..."
   
-  CMD="redis-cli -h $REDIS_HOST -p $REDIS_PORT"
-  if [ -n "$REDIS_PASS" ]; then
-    CMD="$CMD -a $REDIS_PASS"
+  if [ -n "$REDIS_URL" ]; then
+    echo "Dumping data from Redis URL to ${RDB_FILE}..."
+    CMD="redis-cli -u $REDIS_URL --rdb $RDB_FILE"
+  else
+    echo "Dumping data from ${REDIS_HOST}:${REDIS_PORT} to ${RDB_FILE}..."
+    
+    CMD="redis-cli -h $REDIS_HOST -p $REDIS_PORT"
+    if [ -n "$REDIS_PASS" ]; then
+      CMD="$CMD -a $REDIS_PASS"
+    fi
+    CMD="$CMD --rdb $RDB_FILE"
   fi
-  CMD="$CMD --rdb $RDB_FILE"
   
   $CMD
   
