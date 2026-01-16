@@ -1,5 +1,10 @@
 #!/bin/bash
 # Export balances and ledger sequences from a Redis RDB file to CSV.
+#
+# Outputs:
+#   - balances_{SNAPSHOT_ID}_{TIMESTAMP}.csv: User balances (available, reserved).
+#   - ledger_sequences_{SNAPSHOT_ID}_{TIMESTAMP}.csv: Ledger sequence numbers.
+#
 # Dependencies:
 #   - rdb-cli (included in bin/)
 #   - jq (brew install jq / apt install jq)
@@ -180,8 +185,10 @@ if [ -z "$SNAPSHOT_ID" ] || [ "$SNAPSHOT_ID" == "null" ]; then
 fi
 
 mv balances.csv balances_${SNAPSHOT_ID}_${SNAPSHOT_TS}.csv
+mv ledger_sequences.csv ledger_sequences_${SNAPSHOT_ID}_${SNAPSHOT_TS}.csv
 echo "Snapshot ID: $SNAPSHOT_ID, Timestamp: $SNAPSHOT_TS"
 echo "Renamed balances.csv to balances_${SNAPSHOT_ID}_${SNAPSHOT_TS}.csv"
+echo "Renamed ledger_sequences.csv to ledger_sequences_${SNAPSHOT_ID}_${SNAPSHOT_TS}.csv"
 
 # Cleanup
 if [ "$CLEANUP_RDB" = true ]; then
