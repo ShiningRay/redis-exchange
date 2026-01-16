@@ -54,5 +54,5 @@ jobs:
         cp bin/rdb-cli ../bin/rdb-cli
     - name: Run tests
       env:
-        SPEC_REDIS_URL: redis://redis:6379/15
+        SPEC_REDIS_URL: redis://localhost:6379/15
       run: bundle exec rake
