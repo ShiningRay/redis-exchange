@@ -5,16 +5,86 @@
 #   - jq (brew install jq / apt install jq)
 #
 # Usage:
-#   ./script/export_rdb_data.sh [path/to/dump.rdb]
+#   ./script/export_rdb_data.sh [options] [path/to/dump.rdb]
+#
+# Options:
+#   -h, --host <host>     Redis host (default: 127.0.0.1)
+#   -p, --port <port>     Redis port (default: 6379)
+#   -a, --password <pwd>  Redis password
+#
 
 set -e
 
-RDB_FILE="${1:-dump.rdb}"
+REDIS_HOST="127.0.0.1"
+REDIS_PORT="6379"
+REDIS_PASS=""
+USE_REMOTE=false
+POSITIONAL_ARGS=()
 
-if [ ! -f "$RDB_FILE" ]; then
-  echo "Error: RDB file '$RDB_FILE' not found."
-  echo "Usage: $0 [path/to/dump.rdb]"
-  exit 1
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -h|--host)
+      REDIS_HOST="$2"
+      USE_REMOTE=true
+      shift 2
+      ;;
+    -p|--port)
+      REDIS_PORT="$2"
+      USE_REMOTE=true
+      shift 2
+      ;;
+    -a|--password)
+      REDIS_PASS="$2"
+      USE_REMOTE=true
+      shift 2
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+set -- "${POSITIONAL_ARGS[@]}"
+
+if [ ${#POSITIONAL_ARGS[@]} -gt 0 ]; then
+  RDB_FILE="${POSITIONAL_ARGS[0]}"
+  if [ ! -f "$RDB_FILE" ]; then
+    echo "Error: RDB file '$RDB_FILE' not found."
+    exit 1
+  fi
+  CLEANUP_RDB=false
+elif [ "$USE_REMOTE" = true ]; then
+  if ! command -v redis-cli &> /dev/null; then
+    echo "Error: redis-cli not found. Cannot dump from remote Redis."
+    exit 1
+  fi
+  
+  RDB_FILE="dump_$(date +%s).rdb"
+  echo "Dumping data from ${REDIS_HOST}:${REDIS_PORT} to ${RDB_FILE}..."
+  
+  CMD="redis-cli -h $REDIS_HOST -p $REDIS_PORT"
+  if [ -n "$REDIS_PASS" ]; then
+    CMD="$CMD -a $REDIS_PASS"
+  fi
+  CMD="$CMD --rdb $RDB_FILE"
+  
+  $CMD
+  
+  if [ ! -f "$RDB_FILE" ]; then
+    echo "Error: Failed to dump RDB file from remote."
+    exit 1
+  fi
+  CLEANUP_RDB=true
+else
+  # Default fallback
+  RDB_FILE="dump.rdb"
+  if [ ! -f "$RDB_FILE" ]; then
+    echo "Error: RDB file '$RDB_FILE' not found."
+    echo "Usage: $0 [options] [path/to/dump.rdb]"
+    exit 1
+  fi
+  CLEANUP_RDB=false
 fi
 
 # Check for rdb-cli (librdb)
@@ -85,17 +155,25 @@ echo "Exporting snapshot ID from account_ledger..."
 # rdb-cli output for stream: [{"account_ledger": {"entries": [{"id": "...", "items": {...}}]}}]
 $RDB_CMD "$RDB_FILE" -k "account_ledger" json > stream_raw.json
 
-SNAPSHOT_ID=$(cat stream_raw.json | jq -r '
-  try (.[0].account_ledger.entries | last | .id) catch "0-0"
+SNAPSHOT_DATA=$(cat stream_raw.json | jq -r '
+  try (map(select(.account_ledger != null)) | first | .account_ledger.entries | last | "\(.id) \(.items.ts // 0)") catch "0-0 0"
 ')
+
+SNAPSHOT_ID=$(echo "$SNAPSHOT_DATA" | awk '{print $1}')
+SNAPSHOT_TS=$(echo "$SNAPSHOT_DATA" | awk '{print $2}')
 
 if [ -z "$SNAPSHOT_ID" ] || [ "$SNAPSHOT_ID" == "null" ]; then
   SNAPSHOT_ID="0-0"
 fi
 
-mv balances.csv balances_$SNAPSHOT_ID.csv
-echo "Snapshot ID: $SNAPSHOT_ID"
-echo "Renamed balances.csv to balances_$SNAPSHOT_ID.csv"
+mv balances.csv balances_${SNAPSHOT_ID}_${SNAPSHOT_TS}.csv
+echo "Snapshot ID: $SNAPSHOT_ID, Timestamp: $SNAPSHOT_TS"
+echo "Renamed balances.csv to balances_${SNAPSHOT_ID}_${SNAPSHOT_TS}.csv"
 
 # Cleanup
+if [ "$CLEANUP_RDB" = true ]; then
+  echo "Cleaning up temporary RDB file $RDB_FILE..."
+  rm "$RDB_FILE"
+fi
+
 rm -f balances_raw.json ledger_seq_raw.json stream_raw.json

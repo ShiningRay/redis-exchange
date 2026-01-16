@@ -13,7 +13,7 @@ RSpec.describe 'Export RDB Data Script' do
   let(:tmp_dir) { File.expand_path('../../tmp', __FILE__) }
 
   before do
-    redis.flushdb
+    redis.flushall
     FileUtils.mkdir_p(tmp_dir)
     # Ensure no leftover files
     Dir.glob("#{tmp_dir}/*.csv").each { |f| File.delete(f) }
@@ -21,7 +21,7 @@ RSpec.describe 'Export RDB Data Script' do
   end
 
   after do
-    redis.flushdb
+    redis.flushall
     FileUtils.rm_rf(tmp_dir)
   end
 
@@ -95,9 +95,12 @@ RSpec.describe 'Export RDB Data Script' do
     expect(generated_files).not_to be_empty
     
     balances_csv_path = generated_files.first
-    snapshot_id = File.basename(balances_csv_path).scan(/balances_(.*).csv/).flatten.first
+    filename_suffix = File.basename(balances_csv_path).scan(/balances_(.*).csv/).flatten.first
     
-    expect(snapshot_id).not_to be_nil
+    expect(filename_suffix).not_to be_nil
+    
+    # Expect format: ID_TIMESTAMP (e.g., "1695649068107-0_1695649068107")
+    expect(filename_suffix).to match(/^\d+-\d+_\d+$/)
 
 
     # Debug: Print CSV content
