@@ -46,11 +46,13 @@ jobs:
         bundler-cache: true # runs 'bundle install' and caches installed gems automatically
     - name: Install rdb-cli
       run: |
-        sudo apt-get update && sudo apt-get install -y jq
+        sudo apt-get update && sudo apt-get install -y jq redis-tools
         git clone https://github.com/redis/librdb.git
         cd librdb
         make
         mkdir -p ../bin
         cp bin/rdb-cli ../bin/rdb-cli
     - name: Run tests
+      env:
+        SPEC_REDIS_URL: redis://redis:6379/15
       run: bundle exec rake
