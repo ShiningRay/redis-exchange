@@ -33,6 +33,72 @@ module RedisExchange
     best_ask_volume
   ].freeze
 
+  # Order Sides
+  SIDE_BUY = 'BUY'
+  SIDE_SELL = 'SELL'
+  SIDES = [SIDE_BUY, SIDE_SELL].freeze
+
+  # Order Types
+  ORDER_TYPE_LIMIT = 'LIMIT'
+  ORDER_TYPE_MARKET = 'MARKET'
+  ORDER_TYPES = [ORDER_TYPE_LIMIT, ORDER_TYPE_MARKET].freeze
+
+  # Order Statuses
+  ORDER_STATUS_OPEN = 'OPEN'
+  ORDER_STATUS_PARTIALLY_FILLED = 'PARTIALLY_FILLED'
+  ORDER_STATUS_FILLED = 'FILLED'
+  ORDER_STATUS_CANCELLED = 'CANCELLED'
+  ORDER_STATUS_REJECTED = 'REJECTED'
+  ORDER_STATUS_UNKNOWN = 'UNKNOWN'
+  ORDER_STATUS_NOT_FOUND = 'NOT_FOUND'
+
+  # Market Statuses
+  MARKET_STATUS_OPEN = 'OPEN'
+  MARKET_STATUS_HALTED = 'HALTED'
+  MARKET_STATUS_CLOSED = 'CLOSED'
+  MARKET_STATUS_MAINTENANCE = 'MAINTENANCE'
+  MARKET_STATUSES = [
+    MARKET_STATUS_OPEN,
+    MARKET_STATUS_HALTED,
+    MARKET_STATUS_CLOSED,
+    MARKET_STATUS_MAINTENANCE
+  ].freeze
+
+  # Asset Statuses
+  ASSET_STATUS_ACTIVE = 'ACTIVE'
+  ASSET_STATUS_HALTED = 'HALTED'
+  ASSET_STATUSES = [ASSET_STATUS_ACTIVE, ASSET_STATUS_HALTED].freeze
+
+  # Balance Actions
+  ACTION_ADD = 'ADD'
+  ACTION_SUB = 'SUB'
+  ACTION_LOCK = 'LOCK'
+  ACTION_UNLOCK = 'UNLOCK'
+  ACTION_ADD_LOCKED = 'ADD_LOCKED'
+  ACTION_SUB_LOCKED = 'SUB_LOCKED'
+  BALANCE_ACTIONS = [
+    ACTION_ADD, ACTION_SUB, ACTION_LOCK, ACTION_UNLOCK,
+    ACTION_ADD_LOCKED, ACTION_SUB_LOCKED
+  ].freeze
+
+  # Balance Buckets
+  BUCKET_AVAILABLE = 'available'
+  BUCKET_RESERVED = 'reserved'
+  BUCKETS = [BUCKET_AVAILABLE, BUCKET_RESERVED].freeze
+
+  # Ledger Reasons
+  REASON_DEPOSIT = 'DEPOSIT'
+  REASON_WITHDRAWAL = 'WITHDRAWAL'
+  REASON_MANUAL = 'MANUAL'
+  REASON_MANUAL_ADJUST = 'MANUAL_ADJUST'
+  REASON_LOCK = 'LOCK'
+  REASON_UNLOCK = 'UNLOCK'
+
+  # Force Cancel Modes
+  CANCEL_MODE_DELETE_ONLY = 'DELETE_ONLY'
+  CANCEL_MODE_BEST_EFFORT_UNLOCK = 'BEST_EFFORT_UNLOCK'
+  CANCEL_MODES = [CANCEL_MODE_DELETE_ONLY, CANCEL_MODE_BEST_EFFORT_UNLOCK].freeze
+
   # Max integer safe for Lua double precision (approx 9e15)
   MAX_SAFE_INTEGER = 9_000_000_000_000_000
 end
@@ -43,20 +109,18 @@ require_relative 'redis_exchange/version'
 module RedisExchange
   # Client encapsulates Lua script execution and convenience helpers.
   class Client
+    attr_reader :redis
 
     # @param redis [Redis,nil] configured Redis connection; if nil, auto-connect
     # Auto-connect priority: ENV['REDIS_URL'] -> 'redis://127.0.0.1:6379/0'
     def initialize(redis: nil)
       @redis = redis || Redis.new(url: (ENV['REDIS_URL'] || 'redis://127.0.0.1:6379/0'))
 
-      match_script_path = File.expand_path('../redis_scripts/match_order.lua', __dir__)
-      @match_script = register_script(read_script(match_script_path))
-
-      cancel_path = File.expand_path('../redis_scripts/cancel_order.lua', __dir__)
-      @cancel_script = register_script(read_script(cancel_path))
-
-      balance_change_path = File.expand_path('../redis_scripts/balance_change.lua', __dir__)
-      @balance_change_script = register_script(read_script(balance_change_path))
+      @match_order_script = load_script('match_order.lua')
+      @cancel_order_script = load_script('cancel_order.lua')
+      @balance_op_script = load_script('balance_op.lua')
+      @audit_script = load_script('audit_user_balance.lua')
+      @update_precision_script = load_script('update_market_precision.lua')
     end
 
     # Submit a limit order and return the Redis/Lua response hash.
@@ -79,7 +143,7 @@ module RedisExchange
       execute_order(
         symbol: symbol,
         side: side,
-        order_type: 'LIMIT',
+        order_type: RedisExchange::ORDER_TYPE_LIMIT,
         order_id: order_id,
         user_id: user_id,
         price_limit: final_price,
@@ -101,7 +165,7 @@ module RedisExchange
       execute_order(
         symbol: symbol,
         side: side,
-        order_type: 'MARKET',
+        order_type: RedisExchange::ORDER_TYPE_MARKET,
         order_id: order_id,
         user_id: user_id,
         price_limit: final_price_cap,
@@ -136,10 +200,10 @@ module RedisExchange
     # @param orders_maxlen [Integer,nil] max orders stream length; nil uses default (1_000_000)
     def seed_market(symbol:, base_asset:, quote_asset:, price_scale: 1, quantity_scale: 1,
                   maker_fee_bps: 0, taker_fee_bps: 0, min_qty: 1, min_notional: 1,
-                  status: 'OPEN', trades_maxlen: nil, orders_maxlen: nil)
+                  status: RedisExchange::MARKET_STATUS_OPEN, trades_maxlen: nil, orders_maxlen: nil)
       key = "market:#{symbol}"
       stat = status.to_s.upcase
-      raise ArgumentError, 'invalid market status' unless %w[OPEN HALTED CLOSED MAINTENANCE].include?(stat)
+      raise ArgumentError, 'invalid market status' unless RedisExchange::MARKET_STATUSES.include?(stat)
       mapping = {
         'base_asset' => base_asset,
         'quote_asset' => quote_asset,
@@ -161,7 +225,7 @@ module RedisExchange
       return { error: 'UNKNOWN_MARKET' } unless @redis.exists?(key)
 
       stat = status.to_s.upcase
-      raise ArgumentError, 'invalid market status' unless %w[OPEN HALTED CLOSED MAINTENANCE].include?(stat)
+      raise ArgumentError, 'invalid market status' unless RedisExchange::MARKET_STATUSES.include?(stat)
 
       @redis.hset(key, 'status', stat)
       market_config(symbol)
@@ -172,10 +236,10 @@ module RedisExchange
     # @param asset [String] asset code (e.g., 'BTC')
     # @param balance_scale [Integer] integer minor unit scale for balances/ledger
     # @param status [String] 'ACTIVE' | 'HALTED'
-    def seed_asset(asset:, balance_scale:, status: 'ACTIVE')
+    def seed_asset(asset:, balance_scale:, status: RedisExchange::ASSET_STATUS_ACTIVE)
       raise ArgumentError, 'balance_scale must be positive' unless balance_scale.to_i > 0
       stat = status.to_s.upcase
-      raise ArgumentError, 'invalid status' unless %w[ACTIVE HALTED].include?(stat)
+      raise ArgumentError, 'invalid status' unless RedisExchange::ASSET_STATUSES.include?(stat)
       key = "asset:#{asset}"
       mapping = {
         'balance_scale' => balance_scale.to_i,
@@ -192,7 +256,7 @@ module RedisExchange
       return {} if raw.empty?
       {
         balance_scale: raw.fetch('balance_scale', '0').to_i,
-        status: raw.fetch('status', 'ACTIVE')
+        status: raw.fetch('status', RedisExchange::ASSET_STATUS_ACTIVE)
       }
     end
 
@@ -207,7 +271,7 @@ module RedisExchange
         quote_asset: raw.fetch('quote_asset', nil),
         price_scale: raw.fetch('price_scale', '1').to_i,
         quantity_scale: raw.fetch('quantity_scale', '1').to_i,
-        status: raw.fetch('status', 'OPEN')
+        status: raw.fetch('status', RedisExchange::MARKET_STATUS_OPEN)
       }
     end
 
@@ -296,7 +360,7 @@ module RedisExchange
     # Returns a status hash mirroring Lua responses.
     def cancel_order(order_id)
       payload = { keys: ["order:#{order_id}"], argv: [order_id] }
-      raw = call_script(@cancel_script, payload)
+      raw = call_script(@cancel_order_script, payload)
       JSON.parse(raw, symbolize_names: true)
     end
 
@@ -328,15 +392,15 @@ module RedisExchange
             res = cancel_order(oid)
             
             # 4. Collect successful cancellations
-            if res[:status] == 'CANCELLED'
-              results << res
-              touched_symbols.add(symbol)
-            elsif res[:error] == 'MARKET_MAINTENANCE'
-              # Capture error but continue processing other orders (which might be in different markets)
-              results << { order_id: oid, error: 'MARKET_MAINTENANCE' }
-            elsif res[:status] == 'NOT_FOUND' || res[:status] == 'UNKNOWN'
-               # Order might be already gone or finished, clean up index just in case?
-               # cancel_order.lua doesn't clean up index if order not found in hash.
+      if res[:status] == RedisExchange::ORDER_STATUS_CANCELLED
+        results << res
+        touched_symbols.add(symbol)
+      elsif res[:error] == 'MARKET_MAINTENANCE'
+        # Capture error but continue processing other orders (which might be in different markets)
+        results << { order_id: oid, error: 'MARKET_MAINTENANCE' }
+      elsif res[:status] == RedisExchange::ORDER_STATUS_NOT_FOUND || res[:status] == RedisExchange::ORDER_STATUS_UNKNOWN
+         # Order might be already gone or finished, clean up index just in case?
+         # cancel_order.lua doesn't clean up index if order not found in hash.
                # But if it's not found, we should probably remove it from ZSET to avoid stuck keys.
                # However, standard cancel_order doesn't know about user_id if order hash is gone.
                # Here we know the index_key, so we can clean it.
@@ -352,74 +416,127 @@ module RedisExchange
       results
     end
 
-    # Adjust a user's available or reserved balance for an asset and record the transaction in the ledger.
-    # @param user_id [String] user identifier
-    # @param asset [String] asset symbol
-    # @param bucket [String] either 'available' or 'reserved'
-    # @param delta [Integer, Float, BigDecimal] amount to add (positive) or subtract (negative)
-    # @param reason [String] optional reason for the balance change (defaults to 'MANUAL_ADJUST')
-    # @param timestamp_ms [Integer,nil] optional timestamp in milliseconds
-    # @param biz_id [String,nil] optional idempotency key to deduplicate requests
-    # @param auto_scale [Boolean] if true, scales delta using asset's balance_scale
-    # @return [Hash] parsed Lua response with new value or error
-    def change_balance(user_id:, asset:, bucket: 'available', delta:, reason: 'MANUAL_ADJUST', timestamp_ms: nil, biz_id: nil, auto_scale: false)
-      final_delta = if auto_scale
-                      scale_asset_amount(asset, delta)
-                    else
-                      delta.to_i
-                    end
+    # Generic atomic balance operation.
+    # @param user_id [String]
+    # @param asset [String]
+    # @param action [String] LOCK, UNLOCK, ADD, SUB, SUB_LOCKED, ADD_LOCKED
+    # @param amount [Integer, Float, BigDecimal] positive amount
+    # @param reason [String]
+    # @param timestamp_ms [Integer,nil]
+    # @param biz_id [String,nil]
+    # @param auto_scale [Boolean]
+    # @return [Hash]
+    def operate_balance(user_id:, asset:, action:, amount:, reason: RedisExchange::REASON_MANUAL, timestamp_ms: nil, biz_id: nil, auto_scale: false)
+      raise ArgumentError, 'user_id is required' if user_id.nil? || user_id.to_s.empty?
+      raise ArgumentError, 'asset is required' if asset.nil? || asset.to_s.empty?
+      raise ArgumentError, 'amount must be positive' unless amount.to_f.positive?
+
+      final_amount = if auto_scale
+                       scale_asset_amount(asset, amount)
+                     else
+                       amount.to_i
+                     end
 
       timestamp = timestamp_ms || current_millis
       biz = (biz_id && !biz_id.to_s.empty?) ? biz_id.to_s : SecureRandom.uuid
+
       payload = {
         keys: ["balance:#{user_id}"],
-        argv: [user_id, asset, bucket, final_delta.to_s, reason, timestamp.to_s, biz]
+        argv: [user_id, asset, final_amount.to_s, action, reason, timestamp.to_s, biz]
       }
-      raw = call_script(@balance_change_script, payload)
+      raw = call_script(@balance_op_script, payload)
       resp = JSON.parse(raw, symbolize_names: true)
       resp[:biz_id] = biz
       resp
     end
 
-    # Convenience: deposit funds into user's available balance for an asset.
-    # Emits ledger entry with reason 'DEPOSIT'.
-    # @param user_id [String]
-    # @param asset [String]
-    # @param amount [Integer, Float, BigDecimal] positive amount
-    # @param timestamp_ms [Integer,nil]
-    # @param biz_id [String,nil]
-    # @param auto_scale [Boolean] if true, scales amount using asset's balance_scale
-    # @return [Hash]
-    def deposit(user_id:, asset:, amount:, timestamp_ms: nil, biz_id: nil, auto_scale: false)
-      change_balance(
+    def lock_funds(user_id:, asset:, amount:, reason: RedisExchange::REASON_LOCK, timestamp_ms: nil, biz_id: nil, auto_scale: false)
+      operate_balance(
         user_id: user_id,
         asset: asset,
-        bucket: 'available',
-        delta: amount.to_f.abs,
-        reason: 'DEPOSIT',
+        action: RedisExchange::ACTION_LOCK,
+        amount: amount,
+        reason: reason,
         timestamp_ms: timestamp_ms,
         biz_id: biz_id,
         auto_scale: auto_scale
       )
     end
 
-    # Convenience: withdraw funds from user's available balance for an asset.
-    # Emits ledger entry with reason 'WITHDRAWAL'.
-    # Fails with error 'INSUFFICIENT_FUNDS' from Lua when balance insufficient.
+    def unlock_funds(user_id:, asset:, amount:, reason: RedisExchange::REASON_UNLOCK, timestamp_ms: nil, biz_id: nil, auto_scale: false)
+      operate_balance(
+        user_id: user_id,
+        asset: asset,
+        action: RedisExchange::ACTION_UNLOCK,
+        amount: amount,
+        reason: reason,
+        timestamp_ms: timestamp_ms,
+        biz_id: biz_id,
+        auto_scale: auto_scale
+      )
+    end
+
+    # Deposit funds into user's available balance for an asset.
     # @param user_id [String]
     # @param asset [String]
     # @param amount [Integer, Float, BigDecimal] positive amount
+    # @param reason [String] optional reason (defaults to 'DEPOSIT')
     # @param timestamp_ms [Integer,nil]
     # @param biz_id [String,nil]
     # @param auto_scale [Boolean] if true, scales amount using asset's balance_scale
     # @return [Hash]
-    def withdraw(user_id:, asset:, amount:, timestamp_ms: nil, biz_id: nil, auto_scale: false)
-      change_balance(
+    def add_funds(user_id:, asset:, amount:, reason: RedisExchange::REASON_DEPOSIT, timestamp_ms: nil, biz_id: nil, auto_scale: false)
+      operate_balance(
         user_id: user_id,
         asset: asset,
-        bucket: 'available',
-        delta: -amount.to_f.abs,
-        reason: 'WITHDRAWAL',
+        action: RedisExchange::ACTION_ADD,
+        amount: amount,
+        reason: reason,
+        timestamp_ms: timestamp_ms,
+        biz_id: biz_id,
+        auto_scale: auto_scale
+      )
+    end
+
+    # Withdraw funds from user's available balance for an asset.
+    # @param user_id [String]
+    # @param asset [String]
+    # @param amount [Integer, Float, BigDecimal] positive amount
+    # @param reason [String] optional reason (defaults to 'WITHDRAWAL')
+    # @param timestamp_ms [Integer,nil]
+    # @param biz_id [String,nil]
+    # @param auto_scale [Boolean] if true, scales amount using asset's balance_scale
+    # @return [Hash]
+    def sub_funds(user_id:, asset:, amount:, reason: RedisExchange::REASON_WITHDRAWAL, timestamp_ms: nil, biz_id: nil, auto_scale: false)
+      operate_balance(
+        user_id: user_id,
+        asset: asset,
+        action: RedisExchange::ACTION_SUB,
+        amount: amount,
+        reason: reason,
+        timestamp_ms: timestamp_ms,
+        biz_id: biz_id,
+        auto_scale: auto_scale
+      )
+    end
+
+    # Withdraw funds from user's reserved (locked) balance for an asset.
+    # Useful for manual corrections or external liquidations.
+    # @param user_id [String]
+    # @param asset [String]
+    # @param amount [Integer, Float, BigDecimal] positive amount
+    # @param reason [String] optional reason (defaults to 'WITHDRAWAL')
+    # @param timestamp_ms [Integer,nil]
+    # @param biz_id [String,nil]
+    # @param auto_scale [Boolean] if true, scales amount using asset's balance_scale
+    # @return [Hash]
+    def sub_locked_funds(user_id:, asset:, amount:, reason: RedisExchange::REASON_WITHDRAWAL, timestamp_ms: nil, biz_id: nil, auto_scale: false)
+      operate_balance(
+        user_id: user_id,
+        asset: asset,
+        action: RedisExchange::ACTION_SUB_LOCKED,
+        amount: amount,
+        reason: reason,
         timestamp_ms: timestamp_ms,
         biz_id: biz_id,
         auto_scale: auto_scale
@@ -448,7 +565,7 @@ module RedisExchange
       ids = Array(@redis.public_send(range_method, index_key, start, stop))
       return [] if ids.empty?
 
-      ids.map { |id| order(id) }.select { |o| !o.empty? && o[:remaining].positive? && (o[:status] == 'OPEN' || o[:status] == 'PARTIALLY_FILLED') }
+      ids.map { |id| order(id) }.select { |o| !o.empty? && o[:remaining].positive? && (o[:status] == RedisExchange::ORDER_STATUS_OPEN || o[:status] == RedisExchange::ORDER_STATUS_PARTIALLY_FILLED) }
     end
 
     # Build a TradeStreamConsumer for a market symbol.
@@ -495,10 +612,10 @@ module RedisExchange
     # Remove book, volume, sequence, trades, and ticker keys for tests.
     def clear_books(symbol)
       keys = [
-        "book:#{symbol}:BUY",
-        "book:#{symbol}:SELL",
-        "volume:#{symbol}:BUY",
-        "volume:#{symbol}:SELL",
+        "book:#{symbol}:#{RedisExchange::SIDE_BUY}",
+        "book:#{symbol}:#{RedisExchange::SIDE_SELL}",
+        "volume:#{symbol}:#{RedisExchange::SIDE_BUY}",
+        "volume:#{symbol}:#{RedisExchange::SIDE_SELL}",
         "seq:#{symbol}",
         "trades:#{symbol}",
         "orders:#{symbol}",
@@ -514,8 +631,8 @@ module RedisExchange
     def order_book(symbol, limit: nil)
       limit = limit&.to_i
       {
-        bids: fetch_book_side(symbol, 'BUY', descending: true, limit: limit),
-        asks: fetch_book_side(symbol, 'SELL', descending: false, limit: limit)
+        bids: fetch_book_side(symbol, RedisExchange::SIDE_BUY, descending: true, limit: limit),
+        asks: fetch_book_side(symbol, RedisExchange::SIDE_SELL, descending: false, limit: limit)
       }
     end
 
@@ -528,7 +645,7 @@ module RedisExchange
     # @return [Array<Hash{Symbol=>Integer}>] array of aggregated depth levels
     #   Each hash contains: :price, :volume, :original_levels (count of original levels merged)
     def merge_depth(symbol, side, bucket_size, limit: nil)
-      raise ArgumentError, 'side must be BUY or SELL' unless %w[BUY SELL].include?(side.to_s.upcase)
+      raise ArgumentError, 'side must be BUY or SELL' unless RedisExchange::SIDES.include?(side.to_s.upcase)
       raise ArgumentError, 'bucket_size must be positive' unless bucket_size&.positive?
 
       side_up = side.to_s.upcase
@@ -584,8 +701,8 @@ module RedisExchange
     # @return [Hash{Symbol=>Array<Hash{Symbol=>Integer}>}] merged depth for both sides
     def merge_depth_both_sides(symbol, buy_bucket_size, sell_bucket_size, limit: nil)
       {
-        bids: merge_depth(symbol, 'BUY', buy_bucket_size, limit: limit),
-        asks: merge_depth(symbol, 'SELL', sell_bucket_size, limit: limit)
+        bids: merge_depth(symbol, RedisExchange::SIDE_BUY, buy_bucket_size, limit: limit),
+        asks: merge_depth(symbol, RedisExchange::SIDE_SELL, sell_bucket_size, limit: limit)
       }
     end
 
@@ -593,12 +710,12 @@ module RedisExchange
 
     def check_market_status(market_config)
       st = market_config[:status].to_s.upcase
-      return nil if st == 'OPEN'
+      return nil if st == RedisExchange::MARKET_STATUS_OPEN
 
       case st
-      when 'HALTED' then { error: 'MARKET_HALTED' }
-      when 'MAINTENANCE' then { error: 'MARKET_MAINTENANCE' }
-      when 'CLOSED' then { error: 'MARKET_CLOSED' }
+      when RedisExchange::MARKET_STATUS_HALTED then { error: 'MARKET_HALTED' }
+      when RedisExchange::MARKET_STATUS_MAINTENANCE then { error: 'MARKET_MAINTENANCE' }
+      when RedisExchange::MARKET_STATUS_CLOSED then { error: 'MARKET_CLOSED' }
       else { error: 'MARKET_CLOSED' }
       end
     end
@@ -615,10 +732,10 @@ module RedisExchange
       end
 
       side_up = side.to_s.upcase
-      raise ArgumentError, 'side must be BUY or SELL' unless %w[BUY SELL].include?(side_up)
+      raise ArgumentError, 'side must be BUY or SELL' unless RedisExchange::SIDES.include?(side_up)
 
       type_up = order_type.to_s.upcase
-      raise ArgumentError, 'order_type must be LIMIT or MARKET' unless %w[LIMIT MARKET].include?(type_up)
+      raise ArgumentError, 'order_type must be LIMIT or MARKET' unless RedisExchange::ORDER_TYPES.include?(type_up)
 
       # Precision pre-check (Ruby layer): both price_limit and quantity are scaled integers.
       # Prevent sending arguments that would overflow Lua's double precision (~9e15).
@@ -694,10 +811,10 @@ module RedisExchange
       {
         market: "market:#{symbol}",
         sequence: "seq:#{symbol}",
-        book_buy: "book:#{symbol}:BUY",
-        book_sell: "book:#{symbol}:SELL",
-        volume_buy: "volume:#{symbol}:BUY",
-        volume_sell: "volume:#{symbol}:SELL",
+        book_buy: "book:#{symbol}:#{RedisExchange::SIDE_BUY}",
+        book_sell: "book:#{symbol}:#{RedisExchange::SIDE_SELL}",
+        volume_buy: "volume:#{symbol}:#{RedisExchange::SIDE_BUY}",
+        volume_sell: "volume:#{symbol}:#{RedisExchange::SIDE_SELL}",
         balance: "balance:#{user_id}",
         trades: "trades:#{symbol}",
         orders: "orders:#{symbol}"
@@ -735,13 +852,18 @@ module RedisExchange
     end
 
     def execute_via_match_script(script_payload)
-      call_script(@match_script, script_payload)
+      call_script(@match_order_script, script_payload)
     end
 
     def read_script(path)
       return nil unless path && File.exist?(path)
 
       File.read(path)
+    end
+
+    def load_script(filename)
+      path = File.expand_path("../redis_scripts/#{filename}", __dir__)
+      register_script(read_script(path))
     end
 
     def call_script(script, payload)

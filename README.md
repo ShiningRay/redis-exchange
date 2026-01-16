@@ -5,10 +5,12 @@ Redis Exchange is a Ruby gem that bundles a Redis-backed central limit order boo
 ## Features
 
 - Lua matching engine stored in `redis_scripts/match_order.lua`
-- Atomic cancellation scripts for single orders (`redis_scripts/cancel_order.lua`) and bulk user cancellations (`redis_scripts/cancel_all_orders.lua`)
-- Ruby client (`RedisExchange::Client`) for seeding markets, managing balances, submitting limit/market orders, cancelling orders, and querying tickers
+- Unified atomic balance operations (`redis_scripts/balance_op.lua`) supporting LOCK, UNLOCK, ADD, SUB
+- Atomic cancellation scripts (`redis_scripts/cancel_order.lua`) and bulk cancellations (`redis_scripts/cancel_all_orders.lua`)
+- Ruby client (`RedisExchange::Client`) for seeding markets, managing balances, submitting orders, and querying tickers
+- Comprehensive maintenance tools: balance audit, ledger replay, market precision updates
 - Per-market ticker hash exposing last trade plus top-of-book bid/ask
-- RSpec suite covering core behaviours (resting limit orders, market order execution)
+- RSpec suite covering core behaviours (matching, balance ops, audits)
 - Documentation of Redis data layout in [`docs/architecture.md`](docs/architecture.md)
 
 ## Installation
@@ -49,6 +51,11 @@ exchange.seed_market(
 
 exchange.set_balance(user_id: 'alice', asset: 'USDT', available: 1_000_000)
 exchange.set_balance(user_id: 'bob', asset: 'BTC', available: 100_000_000)
+
+# Or use the new atomic balance operations:
+exchange.operate_balance(user_id: 'alice', asset: 'USDT', action: 'ADD', amount: 500_000)
+exchange.lock_funds(user_id: 'bob', asset: 'BTC', amount: 10_000_000)
+exchange.unlock_funds(user_id: 'bob', asset: 'BTC', amount: 5_000_000)
 
 # Bob posts a sell limit order.
 exchange.place_limit_order(
@@ -176,7 +183,7 @@ consumer = exchange.ledger_consumer(group: 'ledger-consumers', consumer: 'worker
 loop do
   entries = consumer.read(count: 100, block_ms: 2000)
   entries.each do |e|
-    fields = e.fields # { 'user_id' => 'u1', 'asset' => 'USDT', 'bucket' => 'available', 'delta' => '1000', 'reason' => 'DEPOSIT', 'ts' => '...', 'sequence' => '1', 'biz_id' => '...' }
+    fields = e.fields # { 'user_id' => 'u1', 'asset' => 'USDT', 'action' => 'ADD', 'amount' => '1000', 'reason' => 'DEPOSIT', 'ts' => '...', 'sequence' => '1', 'biz_id' => '...' }
 
     # Persist with idempotency: use e.id as unique key in your DB
     # Convert numeric fields to integers before saving
@@ -195,8 +202,8 @@ end
 Fields of each ledger entry:
 - `user_id` (String)
 - `asset` (String)
-- `bucket` (String: `available`|`reserved`)
-- `delta` (String integer; scaled)
+- `action` (String: `LOCK`, `UNLOCK`, `ADD`, `SUB`, `SUB_LOCKED`, `ADD_LOCKED`)
+- `amount` (String integer; scaled; always positive)
 - `reason` (String)
 - `ts` (String integer; milliseconds)
 - `sequence` (String integer; per user+asset incremental)
@@ -213,34 +220,62 @@ bundle exec rspec
 
 ## Account Ledger & Balance Helpers
 
-Convenience helpers are provided for deposits and withdrawals. All changes append entries to the `account_ledger` stream with a per-user-asset sequence counter:
+Convenience helpers are provided for managing funds and direct balance operations. All changes are executed atomically via Lua and emit events to the `account_ledger` stream.
 
 ```ruby
 exchange = RedisExchange::Client.new(redis: Redis.new)
 
-# Deposit 100 USDT (scaled integer)
-exchange.deposit(user_id: 'u1', asset: 'USDT', amount: 100_000)
+# Add 100 USDT (scaled integer) - internally calls operate_balance with action=ADD
+exchange.add_funds(user_id: 'u1', asset: 'USDT', amount: 100_000)
 
-# Withdraw 50 USDT
-exchange.withdraw(user_id: 'u1', asset: 'USDT', amount: 50_000)
+# Subtract 50 USDT - internally calls operate_balance with action=SUB
+exchange.sub_funds(user_id: 'u1', asset: 'USDT', amount: 50_000)
 
-# Generic balance change (available or reserved)
-exchange.change_balance(user_id: 'u1', asset: 'BTC', bucket: 'reserved', delta: 10_000_000, reason: 'ORDER_RESERVE')
+# Subtract 10 USDT from locked (reserved) balance - internally calls operate_balance with action=SUB_LOCKED
+exchange.sub_locked_funds(user_id: 'u1', asset: 'USDT', amount: 10_000)
+
+# Lock funds (move from available to reserved)
+exchange.lock_funds(user_id: 'u1', asset: 'USDT', amount: 10_000, reason: 'ORDER_RESERVE')
+
+# Unlock funds (move from reserved to available)
+exchange.unlock_funds(user_id: 'u1', asset: 'USDT', amount: 5_000, reason: 'CANCEL_REFUND')
 ```
 
-Each ledger entry includes: `user_id`, `asset`, `bucket`, `delta`, `reason`, `ts`, `sequence`, `biz_id`.
+Each ledger entry includes: `user_id`, `asset`, `action`, `amount`, `reason`, `ts`, `sequence`, `biz_id`.
 
-Idempotency: `change_balance` accepts an optional `biz_id` to deduplicate duplicate requests. When provided, the Redis Lua script returns a cached response for the same `{user_id, asset, bucket, biz_id}` within 24 hours and does not append a duplicate ledger entry or re-apply the balance mutation. The ledger entry will include the same `biz_id`.
+Idempotency: `operate_balance` (and helpers like `add_funds`/`sub_funds`) accepts an optional `biz_id` to deduplicate requests. When provided, the Redis Lua script returns a cached response for the same `{user_id, asset, action, biz_id}` within 24 hours and does not append a duplicate ledger entry or re-apply the balance mutation.
 
 ```ruby
 # Using biz_id to prevent duplicate submissions
 biz_id = 'req-123'
-exchange.change_balance(user_id: 'u1', asset: 'USDT', bucket: 'available', delta: 50_000, reason: 'MANUAL_ADJUST', biz_id: biz_id)
+exchange.operate_balance(user_id: 'u1', asset: 'USDT', action: 'ADD', amount: 50_000, reason: 'MANUAL_ADJUST', biz_id: biz_id)
 # A repeated call with the same biz_id returns the same response and does not duplicate effects
-exchange.change_balance(user_id: 'u1', asset: 'USDT', bucket: 'available', delta: 50_000, reason: 'MANUAL_ADJUST', biz_id: biz_id)
+exchange.operate_balance(user_id: 'u1', asset: 'USDT', action: 'ADD', amount: 50_000, reason: 'MANUAL_ADJUST', biz_id: biz_id)
 ```
 
 If `biz_id` is omitted, the client auto-generates a UUID and includes it in the response as `:biz_id`; the ledger entry will also carry this generated `biz_id`. Internally generated events (e.g., matching/cancellation) attach an auto `biz_id` as well.
+
+## Random Bot (Stress Test)
+
+A random trading bot is included for stress testing and verification. It performs random balance operations (add/sub), limit orders, and market orders while validating ledger consistency.
+
+```bash
+# Run with default settings (100 iterations, 1 concurrent thread)
+ruby script/random_bot.rb
+
+# Run heavily concurrent load (5 threads, 1000 iterations each) with final audit
+ruby script/random_bot.rb --concurrency 5 --iterations 1000 --audit
+
+# Options:
+#   --redis-url URL       Redis connection string
+#   --symbol SYMBOL       Market symbol (default: BTCUSDT)
+#   --iterations N        Number of operations per thread
+#   --concurrency N       Number of concurrent worker threads
+#   --audit               Run full balance audit and ledger replay check after completion
+#   --audit-interval N    (Single-thread only) Run partial replay audit every N operations
+#   --no-seed             Skip initial asset/market seeding
+#   --flush               Flush DB before starting
+```
 
 ## Benchmarking
 

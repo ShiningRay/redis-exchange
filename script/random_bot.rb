@@ -8,7 +8,7 @@ require 'redis'
 require 'bigdecimal'
 require_relative '../lib/redis_exchange'
 
-# Random trading bot: performs random deposits/withdrawals, limit & market orders,
+# Random trading bot: performs random add_funds/sub_funds, limit & market orders,
 # with random waits between operations and prints every result.
 #
 # Usage:
@@ -167,11 +167,11 @@ if options[:seed]
   options[:users].each do |u|
     # Deposit some USDT: between 5_000 and 50_000
     usdt_amount = (5_000 + rand(0..45_000)) * ASSET_SCALES['USDT']
-    res1 = exchange_main.deposit(user_id: u, asset: 'USDT', amount: usdt_amount)
+    res1 = exchange_main.add_funds(user_id: u, asset: 'USDT', amount: usdt_amount)
     puts "#{c('[DEPOSIT]', :green)} user=#{u} asset=USDT amount=#{format_asset_amount('USDT', usdt_amount)} => #{JSON.pretty_generate(res1)}"
     # Deposit some BTC: between 0.05 and 0.5 BTC
     btc_amount = (5 + rand(0..45)) * (ASSET_SCALES['BTC'] / 100) # 0.05..0.5 BTC in minor units
-    res2 = exchange_main.deposit(user_id: u, asset: 'BTC', amount: btc_amount)
+    res2 = exchange_main.add_funds(user_id: u, asset: 'BTC', amount: btc_amount)
     puts "#{c('[DEPOSIT]', :green)} user=#{u} asset=BTC amount=#{format_asset_amount('BTC', btc_amount)} => #{JSON.pretty_generate(res2)}"
   end
 end
@@ -207,13 +207,13 @@ rand_btc_amount = lambda do
   rand(1..20) * step
 end
 
-ops = %i[limit_order market_order deposit withdraw cancel_one]
+ops = %i[limit_order market_order add_funds sub_funds cancel_one]
 
 weights = {
   limit_order: 40,
   market_order: 30,
-  deposit: 2,
-  withdraw: 2,
+  add_funds: 2,
+  sub_funds: 2,
   cancel_one: 10
 }
 
@@ -414,16 +414,16 @@ run_worker = lambda do |thread_id, iterations, shared_options|
           end
         end
 
-      when :deposit
+      when :add_funds
         asset = %w[USDT BTC].sample
         amount = asset == 'USDT' ? rand_usdt_amount.call : rand_btc_amount.call
-        res = local_exchange.deposit(user_id: user, asset: asset, amount: amount)
+        res = local_exchange.add_funds(user_id: user, asset: asset, amount: amount)
         puts "#{prefix} #{c('DEPOSIT', :green)} user=#{user} asset=#{asset} amount=#{format_asset_amount(asset, amount)} => #{JSON.pretty_generate(res)}"
         
-      when :withdraw
+      when :sub_funds
         asset = %w[USDT BTC].sample
         amount = asset == 'USDT' ? rand_usdt_amount.call : rand_btc_amount.call
-        res = local_exchange.withdraw(user_id: user, asset: asset, amount: amount)
+        res = local_exchange.sub_funds(user_id: user, asset: asset, amount: amount)
         puts "#{prefix} #{c('WITHDRAW', :magenta)} user=#{user} asset=#{asset} amount=#{format_asset_amount(asset, amount)} => #{JSON.pretty_generate(res)}"
         
       when :cancel_one

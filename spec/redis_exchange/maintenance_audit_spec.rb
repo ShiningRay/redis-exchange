@@ -134,4 +134,39 @@ RSpec.describe RedisExchange::Maintenance do
       end
     end
   end
+
+  describe '#replay_ledger_audit' do
+    it 'replays ledger events correctly with new action format' do
+      # 1. Initial State
+      initial_balances = {
+        user_id => {
+          'USDT' => { 'available' => 0, 'reserved' => 0 },
+          'BTC' => { 'available' => 0, 'reserved' => 0 }
+        }
+      }
+      
+      # 2. Perform Operations
+      exchange.add_funds(user_id: user_id, asset: 'USDT', amount: 1000)
+      exchange.lock_funds(user_id: user_id, asset: 'USDT', amount: 100)
+      exchange.unlock_funds(user_id: user_id, asset: 'USDT', amount: 50)
+      exchange.sub_funds(user_id: user_id, asset: 'USDT', amount: 200)
+      
+      # 3. Capture End State
+      current_last_entry = redis.xrevrange('account_ledger', '+', '-', count: 1).first
+      end_id = current_last_entry ? current_last_entry[0] : '0-0'
+      actual_balances = maintenance.snapshot_balances(lock_system: false) # Don't lock to keep it simple
+      
+      # 4. Run Replay
+      res = maintenance.replay_ledger_audit(
+        initial_balances: initial_balances,
+        start_id: '0-0',
+        end_id: end_id,
+        actual_balances: actual_balances
+      )
+      
+      expect(res[:success]).to be true
+      expect(res[:expected_balances][user_id]['USDT']['available']).to eq(1000 - 100 + 50 - 200) # 750
+      expect(res[:expected_balances][user_id]['USDT']['reserved']).to eq(100 - 50) # 50
+    end
+  end
 end

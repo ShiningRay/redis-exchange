@@ -50,7 +50,34 @@ balance:{user_id}
     {asset}:reserved  -> funds locked on active orders
 ```
 
-All balances are stored as integers in the asset's minor units (`asset.balance_scale`). Matching uses market scales (`price_scale`, `quantity_scale`) and converts to asset units before applying.
+All balances are stored as integers in the asset's minor units (`asset.balance_scale`). 
+
+**Atomic Operations (`balance_op.lua`)**:
+All balance mutations are performed via a unified Lua script supporting these primitives:
+- `LOCK`: Move funds from `available` to `reserved`.
+- `UNLOCK`: Move funds from `reserved` to `available`.
+- `ADD`: Increase `available`.
+- `SUB`: Decrease `available` (ensure non-negative).
+- `ADD_LOCKED`: Increase `reserved`.
+- `SUB_LOCKED`: Decrease `reserved` (ensure non-negative).
+
+### Account Ledger Stream
+
+A global stream records all balance changes for auditing and reconciliation:
+
+```
+account_ledger
+```
+
+**Entry Fields**:
+- `user_id`: User identifier.
+- `asset`: Asset symbol (e.g., BTC).
+- `action`: One of `LOCK`, `UNLOCK`, `ADD`, `SUB`, `ADD_LOCKED`, `SUB_LOCKED`.
+- `amount`: Absolute change amount (always positive integer string).
+- `reason`: Context string (e.g., `MATCH`, `CANCEL`, `DEPOSIT`).
+- `ts`: Timestamp in ms.
+- `sequence`: Per-user-asset incremental sequence number.
+- `biz_id`: Idempotency key or auto-generated unique ID.
 
 ### Order Books
 
@@ -114,48 +141,64 @@ seq:{symbol} -> integer
 
 The sequence is appended to the order hash (`sequence`) and is used purely for auditing; FIFO ordering is handled by the Redis lists.
 
-### Trades
+### Trades Stream
 
-Matches are appended to a capped stream/list for downstream consumers:
+Matches are appended to a capped stream for downstream consumers (tickers, candles, history):
 
 ```
 trades:{symbol}
 ```
 
-Each trade entry is broadcast to `trades:{symbol}` via `XADD` with fields:
+**Entry Fields**:
+- `symbol`: Market symbol (e.g., BTCUSDT).
+- `taker_order_id`: ID of the incoming order.
+- `maker_order_id`: ID of the resting order.
+- `buy_order_id`: Normalized ID for the buyer.
+- `sell_order_id`: Normalized ID for the seller.
+- `taker_side`: `BUY` or `SELL`.
+- `price`: Executed price (scaled integer).
+- `quantity`: Executed base quantity (scaled integer).
+- `quote`: Executed quote amount (scaled integer).
+- `taker_fee`: Fee charged to taker (scaled integer).
+- `maker_fee`: Fee charged to maker (scaled integer).
+- `ts`: Unix timestamp in milliseconds.
+
+### Orders Stream (Private Events)
+
+Order lifecycle events are emitted to a capped stream for user data push:
 
 ```
-symbol        -> market symbol (e.g., BTCUSDT)
-taker_order_id
-maker_order_id
-buy_order_id  -> normalized convenience id (buyer side)
-sell_order_id -> normalized convenience id (seller side)
-taker_side    -> 'BUY' | 'SELL'
-price         -> executed price (scaled integer)
-quantity      -> executed base quantity (scaled integer)
-quote         -> executed quote amount (scaled integer)
-taker_fee     -> fee charged to taker (scaled integer)
-maker_fee     -> fee charged to maker (scaled integer)
-ts            -> unix timestamp in milliseconds
+orders:{symbol}
 ```
 
-### Depth Stream
+**Entry Fields**:
+- `order_id`: Unique order identifier.
+- `user_id`: Owner of the order.
+- `symbol`: Market symbol.
+- `side`: `BUY` or `SELL`.
+- `type`: `LIMIT` or `MARKET`.
+- `status`: New status (`OPEN`, `PARTIALLY_FILLED`, `FILLED`, `CANCELLED`, `NO_LIQUIDITY`).
+- `price`: Limit price (scaled).
+- `quantity`: Original quantity (scaled).
+- `remaining`: Remaining quantity (scaled).
+- `ts`: Timestamp in ms.
+- `sequence`: Market-wide sequence number.
 
-A real-time stream of order book changes is maintained at:
+### Depth Stream (Public Events)
+
+A real-time stream of order book changes:
 
 ```
 depth:{symbol}
 ```
 
-Events are emitted via `XADD` whenever the volume at a price level changes (due to matching, placing, or cancelling).
-
-Fields:
-- `e`: Event type (`u` for update)
-- `s`: Side (`BUY` | `SELL`)
-- `p`: Price level (integer string)
-- `d`: Delta amount (signed integer string; negative means volume decrease)
-- `v`: Final volume at this level (integer string, snapshot for verification)
-- `ts`: Timestamp (ms)
+**Entry Fields**:
+- `e`: Event type (`u` for update).
+- `s`: Side (`BUY` | `SELL`).
+- `p`: Price level (integer string).
+- `d`: Delta amount (signed integer string; negative = volume decrease).
+- `v`: Final volume at this level (snapshot).
+- `ts`: Timestamp (ms).
 
 ### Ticker
 

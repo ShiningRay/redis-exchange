@@ -67,25 +67,58 @@ end
 
 -- Append an account ledger entry for a balance change.
 -- Uses per-user-asset sequence `ledger_seq:{user_id}:{asset}` and global stream `account_ledger`.
-local function append_ledger(user_id, asset, bucket, delta, reason, ts)
-  if delta == 0 then return end
+local function append_ledger(user_id, asset, action, amount, reason, ts)
+  if amount == 0 then return end
   local now_ts = ts
   if not now_ts or now_ts <= 0 then
     local now = redis.call('TIME')
     now_ts = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
   end
   local seq = redis.call('INCR', 'ledger_seq:' .. user_id .. ':' .. asset)
-  local ledger_biz_id = 'AUTO:' .. user_id .. ':' .. asset .. ':' .. bucket .. ':' .. tostring(seq)
+  local ledger_biz_id = 'AUTO:' .. user_id .. ':' .. asset .. ':' .. action .. ':' .. tostring(seq)
   redis.call('XADD', 'account_ledger', 'MAXLEN', '~', 1000000, '*',
     'user_id', user_id,
     'asset', asset,
-    'bucket', bucket,
-    'delta', tostring(delta),
+    'action', action,
+    'amount', tostring(amount),
     'reason', reason or 'MATCH',
     'ts', tostring(now_ts),
     'sequence', tostring(seq),
     'biz_id', ledger_biz_id
   )
+end
+
+-- Balance Primitives
+local function op_lock(user_id, asset, amount, reason, ts)
+  if amount <= 0 then return end
+  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':available', -amount)
+  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':reserved', amount)
+  append_ledger(user_id, asset, 'LOCK', amount, reason, ts)
+end
+
+local function op_unlock(user_id, asset, amount, reason, ts)
+  if amount <= 0 then return end
+  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':reserved', -amount)
+  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':available', amount)
+  append_ledger(user_id, asset, 'UNLOCK', amount, reason, ts)
+end
+
+local function op_add(user_id, asset, amount, reason, ts)
+  if amount <= 0 then return end
+  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':available', amount)
+  append_ledger(user_id, asset, 'ADD', amount, reason, ts)
+end
+
+local function op_sub(user_id, asset, amount, reason, ts)
+  if amount <= 0 then return end
+  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':available', -amount)
+  append_ledger(user_id, asset, 'SUB', amount, reason, ts)
+end
+
+local function op_sub_locked(user_id, asset, amount, reason, ts)
+  if amount <= 0 then return end
+  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':reserved', -amount)
+  append_ledger(user_id, asset, 'SUB_LOCKED', amount, reason, ts)
 end
 
 local function publish_depth_update(symbol, side, price, delta, final_volume, ts)
@@ -535,24 +568,20 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
 
         -- Now perform WRITES for Taker (BUY)
         taker_available_quote_after = taker_available_quote_after - debit_balance
-        hincrby(taker_balance_key, quote_available_field, -debit_balance)
-        append_ledger(user_id, quote_asset, 'available', -debit_balance, 'TAKER_SPEND', timestamp)
+        op_sub(user_id, quote_asset, debit_balance, 'TAKER_SPEND', timestamp)
 
-        hincrby(taker_balance_key, base_available_field, trade_qty_balance)
-        append_ledger(user_id, base_asset, 'available', trade_qty_balance, 'TAKER_RECEIVE', timestamp)
+        op_add(user_id, base_asset, trade_qty_balance, 'TAKER_RECEIVE', timestamp)
 
         taker_quote_spent = taker_quote_spent + debit_market
         taker_base_received = taker_base_received + trade_qty
 
         -- WRITES for Maker (SELL)
-        hincrby(maker_balance_key, base_reserved_field, -trade_qty_balance_maker)
-        append_ledger(maker_user_id, base_asset, 'reserved', -trade_qty_balance_maker, 'MAKER_RELEASE', timestamp)
+        op_sub_locked(maker_user_id, base_asset, trade_qty_balance_maker, 'MAKER_RELEASE', timestamp)
         if redis.call('HEXISTS', maker_order_key, 'reserved_base') == 1 then
           redis.call('HINCRBY', maker_order_key, 'reserved_base', -trade_qty_balance_maker)
         end
 
-        hincrby(maker_balance_key, quote_available_field, credit_balance_maker)
-        append_ledger(maker_user_id, quote_asset, 'available', credit_balance_maker, 'MAKER_RECEIVE', timestamp)
+        op_add(maker_user_id, quote_asset, credit_balance_maker, 'MAKER_RECEIVE', timestamp)
       else
         -- Maker is BUY, Taker is BUY? Impossible as opposite_side is logic.
         -- Wait, opposite_side logic:
@@ -603,24 +632,20 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
 
       -- Writes for Taker (SELL)
       taker_available_base_after = taker_available_base_after - trade_qty_balance
-      hincrby(taker_balance_key, base_available_field, -trade_qty_balance)
-      append_ledger(user_id, base_asset, 'available', -trade_qty_balance, 'TAKER_SELL', timestamp)
+      op_sub(user_id, base_asset, trade_qty_balance, 'TAKER_SELL', timestamp)
 
-      hincrby(taker_balance_key, quote_available_field, credit_balance)
-      append_ledger(user_id, quote_asset, 'available', credit_balance, 'TAKER_RECEIVE', timestamp)
+      op_add(user_id, quote_asset, credit_balance, 'TAKER_RECEIVE', timestamp)
 
       taker_quote_received = taker_quote_received + credit_market
       taker_base_sold = taker_base_sold + trade_qty
 
       -- Writes for Maker (BUY)
-      hincrby(maker_balance_key, quote_reserved_field, -debit_balance_maker)
-      append_ledger(maker_user_id, quote_asset, 'reserved', -debit_balance_maker, 'MAKER_RELEASE', timestamp)
+      op_sub_locked(maker_user_id, quote_asset, debit_balance_maker, 'MAKER_RELEASE', timestamp)
       if redis.call('HEXISTS', maker_order_key, 'reserved_quote') == 1 then
         redis.call('HINCRBY', maker_order_key, 'reserved_quote', -debit_balance_maker)
       end
 
-      hincrby(maker_balance_key, base_available_field, trade_qty_balance_maker)
-      append_ledger(maker_user_id, base_asset, 'available', trade_qty_balance_maker, 'MAKER_RECEIVE', timestamp)
+      op_add(maker_user_id, base_asset, trade_qty_balance_maker, 'MAKER_RECEIVE', timestamp)
     end
 
     maker_remaining = maker_remaining - trade_qty
@@ -637,17 +662,11 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       -- Cleanup any residual reserved amounts (dust from rounding)
       local residual_base = as_number(redis.call('HGET', maker_order_key, 'reserved_base'))
       if residual_base > 0 then
-        hincrby(maker_balance_key, base_reserved_field, -residual_base)
-        hincrby(maker_balance_key, base_available_field, residual_base)
-        append_ledger(maker_user_id, base_asset, 'reserved', -residual_base, 'DUST_RELEASE', timestamp)
-        append_ledger(maker_user_id, base_asset, 'available', residual_base, 'DUST_RELEASE', timestamp)
+        op_unlock(maker_user_id, base_asset, residual_base, 'DUST_RELEASE', timestamp)
       end
       local residual_quote = as_number(redis.call('HGET', maker_order_key, 'reserved_quote'))
       if residual_quote > 0 then
-        hincrby(maker_balance_key, quote_reserved_field, -residual_quote)
-        hincrby(maker_balance_key, quote_available_field, residual_quote)
-        append_ledger(maker_user_id, quote_asset, 'reserved', -residual_quote, 'DUST_RELEASE', timestamp)
-        append_ledger(maker_user_id, quote_asset, 'available', residual_quote, 'DUST_RELEASE', timestamp)
+        op_unlock(maker_user_id, quote_asset, residual_quote, 'DUST_RELEASE', timestamp)
       end
 
       redis.call('HSET', maker_order_key, 'status', 'FILLED')
@@ -758,10 +777,7 @@ else
           taker_available_quote_after = taker_available_quote_after - reserve_quote_balance
           taker_reserved_quote = taker_reserved_quote + reserve_quote_balance
           reserved_quote_for_order = reserve_quote_balance
-          hincrby(taker_balance_key, quote_available_field, -reserve_quote_balance)
-          append_ledger(user_id, quote_asset, 'available', -reserve_quote_balance, 'TAKER_RESERVE', timestamp)
-          hincrby(taker_balance_key, quote_reserved_field, reserve_quote_balance)
-          append_ledger(user_id, quote_asset, 'reserved', reserve_quote_balance, 'TAKER_RESERVE', timestamp)
+          op_lock(user_id, quote_asset, reserve_quote_balance, 'TAKER_RESERVE', timestamp)
         end
       else
         local reserve_qty = remaining
@@ -776,10 +792,7 @@ else
           taker_available_base_after = taker_available_base_after - reserve_qty_balance
           taker_reserved_base = taker_reserved_base + reserve_qty_balance
           reserved_base_for_order = reserve_qty_balance
-          hincrby(taker_balance_key, base_available_field, -reserve_qty_balance)
-          append_ledger(user_id, base_asset, 'available', -reserve_qty_balance, 'TAKER_RESERVE', timestamp)
-          hincrby(taker_balance_key, base_reserved_field, reserve_qty_balance)
-          append_ledger(user_id, base_asset, 'reserved', reserve_qty_balance, 'TAKER_RESERVE', timestamp)
+          op_lock(user_id, base_asset, reserve_qty_balance, 'TAKER_RESERVE', timestamp)
         end
       end
 

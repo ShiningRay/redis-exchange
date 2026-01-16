@@ -30,20 +30,20 @@ local function as_number(value)
   return tonumber(value) or 0
 end
 
-local function append_ledger(uid, asset, bucket, delta, reason, timestamp)
-  if delta == 0 then return end
+local function append_ledger(uid, asset, action, amount, reason, timestamp)
+  if amount == 0 then return end
   local now_ts = timestamp
   if not now_ts or tonumber(now_ts) <= 0 then
     local now = redis.call('TIME')
     now_ts = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
   end
   local seq = redis.call('INCR', 'ledger_seq:' .. uid .. ':' .. asset)
-  local ledger_biz_id = 'AUDIT:' .. uid .. ':' .. asset .. ':' .. bucket .. ':' .. tostring(seq)
+  local ledger_biz_id = 'AUDIT:' .. uid .. ':' .. asset .. ':' .. action .. ':' .. tostring(seq)
   redis.call('XADD', 'account_ledger', 'MAXLEN', '~', 1000000, '*',
     'user_id', uid,
     'asset', asset,
-    'bucket', bucket,
-    'delta', tostring(delta),
+    'action', action,
+    'amount', tostring(amount),
     'reason', reason,
     'ts', tostring(now_ts),
     'sequence', tostring(seq),
@@ -58,7 +58,7 @@ for _, symbol in ipairs(symbols) do
   local index_key = 'user_orders:' .. user_id .. ':' .. symbol
   -- Use ZRANGE to get all order IDs
   local order_ids = redis.call('ZRANGE', index_key, 0, -1)
-  
+
   if #order_ids > 0 then
     -- Optimize: We need base/quote asset for this symbol.
     -- We can fetch it once per symbol.
@@ -66,14 +66,14 @@ for _, symbol in ipairs(symbols) do
     local m = redis.call('HMGET', market_key, 'base_asset', 'quote_asset')
     local base_asset = m[1]
     local quote_asset = m[2]
-    
+
     if base_asset and quote_asset then
       for _, oid in ipairs(order_ids) do
         local order_key = 'order:' .. oid
         local reserved = redis.call('HMGET', order_key, 'reserved_base', 'reserved_quote')
         local r_base = as_number(reserved[1])
         local r_quote = as_number(reserved[2])
-        
+
         if r_base > 0 then
           required[base_asset] = (required[base_asset] or 0) + r_base
         end
@@ -91,7 +91,7 @@ local fixes = {}
 
 -- We iterate over all assets that have requirements OR exist in balance?
 -- Ideally we should also check if we have reserved balance for assets with NO orders.
--- But iterating all fields in balance hash is expensive if it's huge? 
+-- But iterating all fields in balance hash is expensive if it's huge?
 -- Usually user balance hash has limited fields. Let's iterate all reserved fields in balance too.
 
 local all_assets = {}
@@ -111,7 +111,7 @@ for asset, _ in pairs(all_assets) do
   local req_amount = required[asset] or 0
   local actual_reserved = as_number(redis.call('HGET', balance_key, asset .. ':reserved'))
   local diff = req_amount - actual_reserved
-  
+
   if diff > 0 then
     -- Deficit: Need to lock more
     local actual_available = as_number(redis.call('HGET', balance_key, asset .. ':available'))
@@ -119,32 +119,27 @@ for asset, _ in pairs(all_assets) do
     if actual_available < to_lock then
       to_lock = actual_available
     end
-    
+
     if fix_mode and to_lock > 0 then
       redis.call('HINCRBY', balance_key, asset .. ':available', -to_lock)
-      append_ledger(user_id, asset, 'available', -to_lock, 'AUDIT_FIX_LOCK', ts)
-      
       redis.call('HINCRBY', balance_key, asset .. ':reserved', to_lock)
-      append_ledger(user_id, asset, 'reserved', to_lock, 'AUDIT_FIX_LOCK', ts)
-      
+      append_ledger(user_id, asset, 'LOCK', to_lock, 'AUDIT_FIX_LOCK', ts)
+
       table.insert(fixes, { asset = asset, action = 'LOCK', amount = to_lock })
     end
-    
+
     local remaining_deficit = diff - to_lock
     if remaining_deficit > 0 then
       table.insert(deficits, { asset = asset, amount = remaining_deficit })
     end
-    
   elseif diff < 0 then
     -- Surplus: Locked too much. Release to available.
     local to_release = -diff
     if fix_mode then
       redis.call('HINCRBY', balance_key, asset .. ':reserved', -to_release)
-      append_ledger(user_id, asset, 'reserved', -to_release, 'AUDIT_FIX_RELEASE', ts)
-      
       redis.call('HINCRBY', balance_key, asset .. ':available', to_release)
-      append_ledger(user_id, asset, 'available', to_release, 'AUDIT_FIX_RELEASE', ts)
-      
+      append_ledger(user_id, asset, 'UNLOCK', to_release, 'AUDIT_FIX_RELEASE', ts)
+
       table.insert(fixes, { asset = asset, action = 'RELEASE', amount = to_release })
     end
   end

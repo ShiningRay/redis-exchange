@@ -51,25 +51,32 @@ end
 
 -- Append an account ledger entry for a balance change.
 -- Uses per-user-asset sequence `ledger_seq:{user_id}:{asset}` and global stream `account_ledger`.
-local function append_ledger(user_id, asset, bucket, delta, reason, ts)
-  if delta == 0 then return end
+local function append_ledger(user_id, asset, action, amount, reason, ts)
+  if amount == 0 then return end
   local now_ts = ts
   if not now_ts or now_ts <= 0 then
     local now = redis.call('TIME')
     now_ts = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
   end
   local seq = redis.call('INCR', 'ledger_seq:' .. user_id .. ':' .. asset)
-  local ledger_biz_id = 'AUTO:' .. user_id .. ':' .. asset .. ':' .. bucket .. ':' .. tostring(seq)
+  local ledger_biz_id = 'AUTO:' .. user_id .. ':' .. asset .. ':' .. action .. ':' .. tostring(seq)
   redis.call('XADD', 'account_ledger', 'MAXLEN', '~', 1000000, '*',
     'user_id', user_id,
     'asset', asset,
-    'bucket', bucket,
-    'delta', tostring(delta),
+    'action', action,
+    'amount', tostring(amount),
     'reason', reason or 'CANCEL',
     'ts', tostring(now_ts),
     'sequence', tostring(seq),
     'biz_id', ledger_biz_id
   )
+end
+
+local function op_unlock(user_id, asset, amount, reason, ts)
+  if amount <= 0 then return end
+  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':reserved', -amount)
+  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':available', amount)
+  append_ledger(user_id, asset, 'UNLOCK', amount, reason, ts)
 end
 
 local function publish_depth_update(symbol, side, price, delta, final_volume, ts)
@@ -157,10 +164,7 @@ if side == 'SELL' then
   if release_amount <= 0 then
     release_amount = remaining
   end
-  redis.call('HINCRBY', balance_key, base_asset .. ':reserved', -release_amount)
-  append_ledger(user_id, base_asset, 'reserved', -release_amount, 'CANCEL_RELEASE', nil)
-  redis.call('HINCRBY', balance_key, base_asset .. ':available', release_amount)
-  append_ledger(user_id, base_asset, 'available', release_amount, 'CANCEL_REFUND', nil)
+  op_unlock(user_id, base_asset, release_amount, 'CANCEL_REFUND', nil)
 
   -- If we released the full reserved amount for the order, we should zero it out in the hash too,
   -- although the order is being deleted shortly. But critically, if this was a partial cancel
@@ -182,10 +186,7 @@ else
     -- But wait, if we have stored reserved_quote, we trust it.
   end
   if release_amount > 0 then
-    redis.call('HINCRBY', balance_key, quote_asset .. ':reserved', -release_amount)
-    append_ledger(user_id, quote_asset, 'reserved', -release_amount, 'CANCEL_RELEASE', ts_ms)
-    redis.call('HINCRBY', balance_key, quote_asset .. ':available', release_amount)
-    append_ledger(user_id, quote_asset, 'available', release_amount, 'CANCEL_REFUND', ts_ms)
+    op_unlock(user_id, quote_asset, release_amount, 'CANCEL_REFUND', ts_ms)
   end
 end
 
