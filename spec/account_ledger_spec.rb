@@ -166,5 +166,19 @@ RSpec.describe 'Account Ledger and Balance Changes' do
       expect(b[:"BTC:available"]).to eq(1.5)
       expect(b[:"USDT:available"]).to eq(2500.5)
     end
+
+    it 'balance: 查询单个币种余额并支持自动缩放' do
+      exchange.add_funds(user_id: 'u4', asset: 'BTC', amount: 250_000_000)
+      
+      # Test without auto_scale (default)
+      b_raw = exchange.balance(user_id: 'u4', asset: 'BTC')
+      expect(b_raw[:available]).to eq(250_000_000)
+      expect(b_raw[:reserved]).to eq(0)
+
+      # Test with auto_scale
+      b_scaled = exchange.balance(user_id: 'u4', asset: 'BTC', auto_scale: true)
+      expect(b_scaled[:available]).to eq(2.5)
+      expect(b_scaled[:reserved]).to eq(0.0)
+    end
   end
 end

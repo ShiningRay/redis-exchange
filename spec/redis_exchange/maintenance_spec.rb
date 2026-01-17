@@ -50,8 +50,8 @@ RSpec.describe 'Maintenance Mode', :maintenance do
   end
   
   it 'rejects cancel all orders when maintenance mode is active' do
-     exchange.maintenance.enable
-     result = exchange.cancel_all_orders('u1')
-     expect(result[:error]).to eq('SYSTEM_MAINTENANCE')
+    exchange.maintenance.enable
+    result = exchange.cancel_all_orders('u1')
+    expect(result[:error]).to eq('SYSTEM_MAINTENANCE')
   end
 end

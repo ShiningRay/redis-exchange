@@ -331,6 +331,26 @@ module RedisExchange
       end
     end
 
+    # Get balance for a specific asset.
+    # @param user_id [String]
+    # @param asset [String]
+    # @param auto_scale [Boolean]
+    # @return [Hash] { available: Integer|Float, reserved: Integer|Float }
+    def balance(user_id:, asset:, auto_scale: false)
+      key = "balance:#{user_id}"
+      vals = @redis.hmget(key, "#{asset}:available", "#{asset}:reserved")
+      available = vals[0].to_i
+      reserved = vals[1].to_i
+
+      if auto_scale
+        scale = asset_config(asset)[:balance_scale] || 1
+        available = available.to_f / scale
+        reserved = reserved.to_f / scale
+      end
+
+      { available: available, reserved: reserved }
+    end
+
     # Retrieve an order snapshot by id with typed fields.
     # @param order_id [String]
     # @return [Hash] empty hash when not found; otherwise typed fields
