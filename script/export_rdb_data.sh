@@ -71,24 +71,27 @@ elif [ "$USE_REMOTE" = true ]; then
     echo "Error: redis-cli not found. Cannot dump from remote Redis."
     exit 1
   fi
-  
-  RDB_FILE="dump_$(date +%s).rdb"
-  
+
+  # Create tmp directory if it doesn't exist
+  mkdir -p tmp
+
+  RDB_FILE="tmp/dump_$(date +%s).rdb"
+
   if [ -n "$REDIS_URL" ]; then
     echo "Dumping data from Redis URL to ${RDB_FILE}..."
     CMD="redis-cli -u $REDIS_URL --rdb $RDB_FILE"
   else
     echo "Dumping data from ${REDIS_HOST}:${REDIS_PORT} to ${RDB_FILE}..."
-    
+
     CMD="redis-cli -h $REDIS_HOST -p $REDIS_PORT"
     if [ -n "$REDIS_PASS" ]; then
       CMD="$CMD -a $REDIS_PASS"
     fi
     CMD="$CMD --rdb $RDB_FILE"
   fi
-  
+
   $CMD
-  
+
   if [ ! -f "$RDB_FILE" ]; then
     echo "Error: Failed to dump RDB file from remote."
     exit 1
@@ -124,16 +127,19 @@ fi
 
 echo "Processing $RDB_FILE..."
 
-echo "Exporting balances to balances.csv..."
-echo "user_id,asset,available,reserved" > balances.csv
+# Create tmp directory if it doesn't exist
+mkdir -p tmp
+
+echo "Exporting balances to tmp/balances.csv..."
+echo "user_id,asset,available,reserved" > tmp/balances.csv
 
 # rdb-cli json outputs: [{"key": value, "key2": value2}] (Array of objects, usually one per DB)
 # We filter for keys starting with "balance:" using -k
-$RDB_CMD "$RDB_FILE" -k "balance:*" json > balances_raw.json
+$RDB_CMD "$RDB_FILE" -k "balance:*" json > tmp/balances_raw.json
 # echo "Raw JSON:"
-# cat balances_raw.json
+# cat tmp/balances_raw.json
 
-cat balances_raw.json | jq -r '
+cat tmp/balances_raw.json | jq -r '
   .[] | to_entries[] |
   .key as $k |
   .value | to_entries |
@@ -149,46 +155,66 @@ cat balances_raw.json | jq -r '
     reserved: (map(select(.bucket=="reserved"))[0].val // "0")
   } |
   "\(.user),\(.asset),\(.avail),\(.reserved)"
-' >> balances.csv
+' >> tmp/balances.csv
 
-echo "  -> Wrote $(wc -l < balances.csv) lines (including header)"
+echo "  -> Wrote $(wc -l < tmp/balances.csv) lines (including header)"
 
-echo "Exporting ledger sequences to ledger_sequences.csv..."
-echo "user_id,asset,sequence" > ledger_sequences.csv
+echo "Exporting ledger sequences to tmp/ledger_sequences.csv..."
+echo "user_id,asset,sequence" > tmp/ledger_sequences.csv
 
 # Filter for keys starting with "ledger_seq:"
-$RDB_CMD "$RDB_FILE" -k "ledger_seq:*" json > ledger_seq_raw.json
+$RDB_CMD "$RDB_FILE" -k "ledger_seq:*" json > tmp/ledger_seq_raw.json
 
-cat ledger_seq_raw.json | jq -r '
+cat tmp/ledger_seq_raw.json | jq -r '
   .[] | to_entries[] |
   (.key | split(":")) as $p |
   "\( $p[1] ),\( $p[2] ),\( .value )"
-' >> ledger_sequences.csv
-  
-echo "  -> Wrote $(wc -l < ledger_sequences.csv) lines (including header)"
+' >> tmp/ledger_sequences.csv
+
+echo "  -> Wrote $(wc -l < tmp/ledger_sequences.csv) lines (including header)"
 
 # 3. Export Snapshot ID (Last Entry ID from account_ledger)
 echo "Exporting snapshot ID from account_ledger..."
 
-# rdb-cli output for stream: [{"account_ledger": {"entries": [{"id": "...", "items": {...}}]}}]
-$RDB_CMD "$RDB_FILE" -k "account_ledger" json > stream_raw.json
+# rdb-cli output for stream varies based on Redis stream structure
+# Try to get the last entry from account_ledger stream
+# Note: rdb-cli outputs invalid JSON ("account_ledger":) for empty streams, so we need to fix that
+$RDB_CMD "$RDB_FILE" -k "account_ledger" json | sed 's/"account_ledger":$/&null/' > tmp/stream_raw.json
 
-SNAPSHOT_DATA=$(cat stream_raw.json | jq -r '
-  try (map(select(.account_ledger != null)) | first | .account_ledger.entries | last | "\(.id) \(.items.ts // 0)") catch "0-0 0"
+# Debug: show the raw JSON structure (commented out)
+# cat stream_raw.json
+
+# Actual JSON structure from rdb-cli for Redis streams:
+# [{"account_ledger": {"entries": [{"id": "...", "items": {"ts": "...", ...}}, ...]}}]
+# Note: Some databases may have empty account_ledger, so we need to filter them out
+SNAPSHOT_DATA=$(cat tmp/stream_raw.json | jq -r '
+  try (
+    .[] |
+    select(has("account_ledger") and .account_ledger != null and (.account_ledger.entries // null) != null) |
+    .account_ledger.entries |
+    select(length > 0) |
+    last | "\(.id) \(.items.ts // 0)"
+  ) catch "0-0 0"
 ')
 
-SNAPSHOT_ID=$(echo "$SNAPSHOT_DATA" | awk '{print $1}')
-SNAPSHOT_TS=$(echo "$SNAPSHOT_DATA" | awk '{print $2}')
+# Take the last non-empty line (from the database with actual data)
+SNAPSHOT_LINE=$(echo "$SNAPSHOT_DATA" | grep -v '^0-0 0$' | tail -n 1)
+if [ -z "$SNAPSHOT_LINE" ]; then
+  SNAPSHOT_LINE="0-0 0"
+fi
+
+SNAPSHOT_ID=$(echo "$SNAPSHOT_LINE" | awk '{print $1}')
+SNAPSHOT_TS=$(echo "$SNAPSHOT_LINE" | awk '{print $2}')
 
 if [ -z "$SNAPSHOT_ID" ] || [ "$SNAPSHOT_ID" == "null" ]; then
   SNAPSHOT_ID="0-0"
 fi
 
-mv balances.csv balances_${SNAPSHOT_ID}_${SNAPSHOT_TS}.csv
-mv ledger_sequences.csv ledger_sequences_${SNAPSHOT_ID}_${SNAPSHOT_TS}.csv
+mv tmp/balances.csv tmp/balances_${SNAPSHOT_ID}_${SNAPSHOT_TS}.csv
+mv tmp/ledger_sequences.csv tmp/ledger_sequences_${SNAPSHOT_ID}_${SNAPSHOT_TS}.csv
 echo "Snapshot ID: $SNAPSHOT_ID, Timestamp: $SNAPSHOT_TS"
-echo "Renamed balances.csv to balances_${SNAPSHOT_ID}_${SNAPSHOT_TS}.csv"
-echo "Renamed ledger_sequences.csv to ledger_sequences_${SNAPSHOT_ID}_${SNAPSHOT_TS}.csv"
+echo "Renamed balances.csv to tmp/balances_${SNAPSHOT_ID}_${SNAPSHOT_TS}.csv"
+echo "Renamed ledger_sequences.csv to tmp/ledger_sequences_${SNAPSHOT_ID}_${SNAPSHOT_TS}.csv"
 
 # Cleanup
 if [ "$CLEANUP_RDB" = true ]; then
@@ -196,4 +222,4 @@ if [ "$CLEANUP_RDB" = true ]; then
   rm "$RDB_FILE"
 fi
 
-rm -f balances_raw.json ledger_seq_raw.json stream_raw.json
+rm -f tmp/balances_raw.json tmp/ledger_seq_raw.json tmp/stream_raw.json

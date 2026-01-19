@@ -42,6 +42,31 @@ RSpec.describe RedisExchange::Client do
         expect(fields_hash['status']).to eq('CANCELLED')
       end
 
+      it 'records a UNLOCK ledger entry with standardized biz_id' do
+        exchange.set_balance(user_id: 'maker', asset: 'BTC', available: 100_000_000)
+
+        exchange.place_limit_order(
+          symbol: symbol,
+          side: 'SELL',
+          order_id: 'cancel-biz-1',
+          user_id: 'maker',
+          price: 3_000_000,
+          quantity: 100_000_000
+        )
+
+        exchange.cancel_order('cancel-biz-1')
+
+        entries = redis.xrevrange('account_ledger', '+', '-', count: 1)
+        expect(entries).not_to be_empty
+        _, fields = entries.first
+        fields = fields.is_a?(Hash) ? fields : Hash[*fields]
+
+        expect(fields['action']).to eq('UNLOCK')
+        expect(fields['reason']).to eq('CANCEL_REFUND')
+        # biz_id format: order_cancel:[market_seq]:[order_id]
+        expect(fields['biz_id']).to match(/^order_cancel:\d+:cancel-biz-1$/)
+      end
+
       it 'cancels a resting BUY order and releases notional and maker fee reserve' do
         exchange.set_balance(user_id: 'buyer', asset: 'USDT', available: 5_000_000)
 

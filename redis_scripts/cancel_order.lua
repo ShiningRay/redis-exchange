@@ -2,6 +2,7 @@
 --
 -- KEYS:
 --   1. order hash (order:{order_id})
+--   2. market sequence counter (seq:{symbol})
 -- ARGV:
 --   1. requested order_id (for error responses)
 --
@@ -17,6 +18,7 @@ end
 
 -- order_key is KEYS[1]
 local order_key = KEYS[1]
+local seq_key = KEYS[2]
 local requested_id = ARGV[1]
 
 -- To check market maintenance, we need the symbol.
@@ -51,7 +53,7 @@ end
 
 -- Append an account ledger entry for a balance change.
 -- Uses per-user-asset sequence `ledger_seq:{user_id}:{asset}` and global stream `account_ledger`.
-local function append_ledger(user_id, asset, action, amount, reason, ts)
+local function append_ledger(user_id, asset, action, amount, reason, ts, biz_id)
   if amount == 0 then return end
   local now_ts = ts
   if not now_ts or now_ts <= 0 then
@@ -59,7 +61,10 @@ local function append_ledger(user_id, asset, action, amount, reason, ts)
     now_ts = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
   end
   local seq = redis.call('INCR', 'ledger_seq:' .. user_id .. ':' .. asset)
-  local ledger_biz_id = 'AUTO:' .. user_id .. ':' .. asset .. ':' .. action .. ':' .. tostring(seq)
+  local ledger_biz_id = biz_id
+  if not ledger_biz_id then
+    ledger_biz_id = 'AUTO:' .. user_id .. ':' .. asset .. ':' .. action .. ':' .. tostring(seq)
+  end
   redis.call('XADD', 'account_ledger', 'MAXLEN', '~', 1000000, '*',
     'user_id', user_id,
     'asset', asset,
@@ -72,11 +77,11 @@ local function append_ledger(user_id, asset, action, amount, reason, ts)
   )
 end
 
-local function op_unlock(user_id, asset, amount, reason, ts)
+local function op_unlock(user_id, asset, amount, reason, ts, biz_id)
   if amount <= 0 then return end
   redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':reserved', -amount)
   redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':available', amount)
-  append_ledger(user_id, asset, 'UNLOCK', amount, reason, ts)
+  append_ledger(user_id, asset, 'UNLOCK', amount, reason, ts, biz_id)
 end
 
 local function publish_depth_update(symbol, side, price, delta, final_volume, ts)
@@ -129,6 +134,7 @@ local user_id = order['user_id']
 
 local now = redis.call('TIME')
 local ts_ms = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
+local sequence = redis.call('INCR', seq_key)
 
 if remaining <= 0 then
   return cjson.encode({ status = status, order_id = order_id, symbol = symbol or '' })
@@ -164,7 +170,7 @@ if side == 'SELL' then
   if release_amount <= 0 then
     release_amount = remaining
   end
-  op_unlock(user_id, base_asset, release_amount, 'CANCEL_REFUND', nil)
+  op_unlock(user_id, base_asset, release_amount, 'CANCEL_REFUND', nil, 'order_cancel:' .. sequence .. ':' .. order_id)
 
   -- If we released the full reserved amount for the order, we should zero it out in the hash too,
   -- although the order is being deleted shortly. But critically, if this was a partial cancel
@@ -186,7 +192,8 @@ else
     -- But wait, if we have stored reserved_quote, we trust it.
   end
   if release_amount > 0 then
-    op_unlock(user_id, quote_asset, release_amount, 'CANCEL_REFUND', ts_ms)
+    op_unlock(user_id, quote_asset, release_amount, 'CANCEL_REFUND', ts_ms,
+      'order_cancel:' .. sequence .. ':' .. order_id)
   end
 end
 
@@ -220,8 +227,6 @@ end
 do
   local now = redis.call('TIME')
   local ts_ms = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
-  local seq_key = 'seq:' .. symbol
-  local sequence = redis.call('INCR', seq_key)
   local orders_key = 'orders:' .. symbol
   local order_type = order['type'] or ''
   local quantity = order['quantity'] or '0'

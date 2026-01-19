@@ -40,6 +40,7 @@ RSpec.describe 'Numeric precision bounds', :precision_bounds do
     )
 
     expect(result[:error]).to eq('PRECISION_OVERFLOW')
+    expect(result[:details]).to include('price_limit * quantity: 10000000000 * 1000000000')
     end
 
     it 'accepts near-threshold price*quantity without overflow' do
@@ -85,6 +86,7 @@ RSpec.describe 'Numeric precision bounds', :precision_bounds do
       )
 
       expect(outcome[:error]).to eq('PRECISION_OVERFLOW')
+      expect(outcome[:details]).to include('price_limit * quantity: 10000000000 * 1500000000')
     end
 
     it 'accepts near-threshold matching without overflow' do
@@ -116,5 +118,44 @@ RSpec.describe 'Numeric precision bounds', :precision_bounds do
 
   after do
     redis.close if redis.respond_to?(:close)
+  end
+
+  it 'returns details when Lua matches overflow (Ruby check passes)' do
+    # Setup high precision asset and market
+    exchange.seed_asset(asset: 'HIGH_USDT', balance_scale: 9_000_000_000_000_000, status: 'ACTIVE') # 9e15
+    exchange.seed_market(
+      symbol: 'BTC_HIGH_USDT',
+      base_asset: 'BTC',
+      quote_asset: 'HIGH_USDT',
+      price_scale: 1,
+      quantity_scale: 1,
+      maker_fee_bps: 0,
+      taker_fee_bps: 0,
+      min_qty: 1,
+      min_notional: 1
+    )
+    
+    # Fund the user
+    exchange.set_balance(user_id: 'taker_lua', asset: 'HIGH_USDT', available: 20_000_000_000_000_000) # 2e16 (enough balance)
+
+    # Place order: Price 2, Qty 1.
+    # Ruby check: 2 * 1 = 2 < 9e15. OK.
+    # Lua: quote_factor = 9e15 / 1 = 9e15.
+    # Required quote = 2 * 9e15 = 1.8e16 > 9e15. Overflow.
+    result = exchange.place_limit_order(
+      symbol: 'BTC_HIGH_USDT',
+      side: 'BUY',
+      order_id: 'lua-overflow-1',
+      user_id: 'taker_lua',
+      price: 2,
+      quantity: 1
+    )
+
+    expect(result[:error]).to eq('PRECISION_OVERFLOW')
+    # Expect details from Lua
+    # The error from Lua is: overflow_error(required_quote_market, quote_factor)
+    # required_quote_market = 2
+    # quote_factor = 9e15
+    expect(result[:details]).to match(/required_quote \* quote_factor: 2(\.0)? \* 9\.?0*e\+?15/)
   end
 end

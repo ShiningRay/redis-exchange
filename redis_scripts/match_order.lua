@@ -67,7 +67,7 @@ end
 
 -- Append an account ledger entry for a balance change.
 -- Uses per-user-asset sequence `ledger_seq:{user_id}:{asset}` and global stream `account_ledger`.
-local function append_ledger(user_id, asset, action, amount, reason, ts)
+local function append_ledger(user_id, asset, action, amount, reason, ts, biz_id)
   if amount == 0 then return end
   local now_ts = ts
   if not now_ts or now_ts <= 0 then
@@ -75,7 +75,10 @@ local function append_ledger(user_id, asset, action, amount, reason, ts)
     now_ts = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
   end
   local seq = redis.call('INCR', 'ledger_seq:' .. user_id .. ':' .. asset)
-  local ledger_biz_id = 'AUTO:' .. user_id .. ':' .. asset .. ':' .. action .. ':' .. tostring(seq)
+  local ledger_biz_id = biz_id
+  if not ledger_biz_id then
+    ledger_biz_id = 'AUTO:' .. user_id .. ':' .. asset .. ':' .. action .. ':' .. tostring(seq)
+  end
   redis.call('XADD', 'account_ledger', 'MAXLEN', '~', 1000000, '*',
     'user_id', user_id,
     'asset', asset,
@@ -89,36 +92,36 @@ local function append_ledger(user_id, asset, action, amount, reason, ts)
 end
 
 -- Balance Primitives
-local function op_lock(user_id, asset, amount, reason, ts)
+local function op_lock(user_id, asset, amount, reason, ts, biz_id)
   if amount <= 0 then return end
-  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':available', -amount)
-  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':reserved', amount)
-  append_ledger(user_id, asset, 'LOCK', amount, reason, ts)
+  hincrby('balance:' .. user_id, asset .. ':available', -amount)
+  hincrby('balance:' .. user_id, asset .. ':reserved', amount)
+  append_ledger(user_id, asset, 'LOCK', amount, reason, ts, biz_id)
 end
 
-local function op_unlock(user_id, asset, amount, reason, ts)
+local function op_unlock(user_id, asset, amount, reason, ts, biz_id)
   if amount <= 0 then return end
-  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':reserved', -amount)
-  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':available', amount)
-  append_ledger(user_id, asset, 'UNLOCK', amount, reason, ts)
+  hincrby('balance:' .. user_id, asset .. ':reserved', -amount)
+  hincrby('balance:' .. user_id, asset .. ':available', amount)
+  append_ledger(user_id, asset, 'UNLOCK', amount, reason, ts, biz_id)
 end
 
-local function op_add(user_id, asset, amount, reason, ts)
+local function op_add(user_id, asset, amount, reason, ts, biz_id)
   if amount <= 0 then return end
-  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':available', amount)
-  append_ledger(user_id, asset, 'ADD', amount, reason, ts)
+  hincrby('balance:' .. user_id, asset .. ':available', amount)
+  append_ledger(user_id, asset, 'ADD', amount, reason, ts, biz_id)
 end
 
-local function op_sub(user_id, asset, amount, reason, ts)
+local function op_sub(user_id, asset, amount, reason, ts, biz_id)
   if amount <= 0 then return end
-  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':available', -amount)
-  append_ledger(user_id, asset, 'SUB', amount, reason, ts)
+  hincrby('balance:' .. user_id, asset .. ':available', -amount)
+  append_ledger(user_id, asset, 'SUB', amount, reason, ts, biz_id)
 end
 
-local function op_sub_locked(user_id, asset, amount, reason, ts)
+local function op_sub_locked(user_id, asset, amount, reason, ts, biz_id)
   if amount <= 0 then return end
-  redis.call('HINCRBY', 'balance:' .. user_id, asset .. ':reserved', -amount)
-  append_ledger(user_id, asset, 'SUB_LOCKED', amount, reason, ts)
+  hincrby('balance:' .. user_id, asset .. ':reserved', -amount)
+  append_ledger(user_id, asset, 'SUB_LOCKED', amount, reason, ts, biz_id)
 end
 
 local function publish_depth_update(symbol, side, price, delta, final_volume, ts)
@@ -271,14 +274,22 @@ local function would_overflow_mul(a, b)
   return (a > 0 and b > 0) and (a >= PRECISION_BOUND or b >= PRECISION_BOUND or (a * b) > PRECISION_BOUND)
 end
 
+local function overflow_error(context, a, b)
+  return cjson.encode({
+    error = 'PRECISION_OVERFLOW',
+    details = context .. ': ' .. tostring(a) .. ' * ' .. tostring(b)
+  })
+end
+
 if quantity < min_qty then
   return cjson.encode({ error = 'MIN_QTY_NOT_SATISFIED' })
 end
 
+if has_price_limit and would_overflow_mul(price_limit, quantity) then
+  return overflow_error('price_limit * quantity', price_limit, quantity)
+end
+
 if order_type == 'LIMIT' then
-  if has_price_limit and would_overflow_mul(price_limit, quantity) then
-    return cjson.encode({ error = 'PRECISION_OVERFLOW' })
-  end
   local notional = math.floor((price_limit * quantity) / quantity_scale)
   if notional < min_notional then
     return cjson.encode({ error = 'MIN_NOTIONAL_NOT_SATISFIED' })
@@ -301,9 +312,6 @@ local taker_available_quote_after = taker_available_quote
 local reserved_base_for_order = 0
 local reserved_quote_for_order = 0
 
-if has_price_limit and would_overflow_mul(price_limit, quantity) then
-  return cjson.encode({ error = 'PRECISION_OVERFLOW' })
-end
 local max_quote_needed = math.floor((price_limit * quantity) / quantity_scale)
 local taker_fee_estimate = math.floor((max_quote_needed * taker_fee_bps) / 10000)
 local maker_fee_estimate = math.floor((max_quote_needed * maker_fee_bps) / 10000)
@@ -326,7 +334,7 @@ if is_buy then
     end
     local required_quote_market = max_quote_needed + required_fee
     if would_overflow_mul(required_quote_market, quote_factor) then
-      return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+      return overflow_error('required_quote * quote_factor', required_quote_market, quote_factor)
     end
     local required_quote_balance = required_quote_market * quote_factor
     if taker_available_quote < required_quote_balance then
@@ -335,7 +343,7 @@ if is_buy then
   end
 else
   if would_overflow_mul(quantity, base_factor) then
-    return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+    return overflow_error('quantity * base_factor', quantity, base_factor)
   end
   local required_base_balance = quantity * base_factor
   if taker_available_base < required_base_balance then
@@ -460,6 +468,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
   if stop_matching then
     break
   end
+  local market_seq = redis.call('INCR', seq_key)
   local level = best_price_key_for_side(opposite_book_key, is_buy)
   if #level == 0 then
     break
@@ -514,13 +523,15 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
 
     local trade_price = tonumber(maker_order['price'] or level_price)
     if would_overflow_mul(trade_price, trade_qty) then
-      return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+      return overflow_error('trade_price * trade_qty', trade_price, trade_qty)
     end
     local trade_quote = math.floor((trade_price * trade_qty) / quantity_scale)
     local maker_side = maker_order['side']
     local maker_user_id = maker_order['user_id']
     local maker_balance_key = 'balance:' .. maker_user_id
 
+    -- Standard trade_seq for trades
+    local trade_seq = redis.call('INCR', seq_key)
     local taker_fee = math.floor((trade_quote * taker_fee_bps) / 10000)
     local maker_fee = math.floor((trade_quote * maker_fee_bps) / 10000)
 
@@ -528,7 +539,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       local debit_market = trade_quote + taker_fee
       if would_overflow_mul(debit_market, quote_factor) then
         -- Overflow detected before any writes for this match
-        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+        return overflow_error('debit_market * quote_factor', debit_market, quote_factor)
       end
       local debit_balance = debit_market * quote_factor
       if taker_available_quote_after < debit_balance then
@@ -539,7 +550,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       end
 
       if would_overflow_mul(trade_qty, base_factor) then
-        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+        return overflow_error('trade_qty * base_factor', trade_qty, base_factor)
       end
       local trade_qty_balance = trade_qty * base_factor
 
@@ -548,12 +559,12 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       local maker_balance_key = 'balance:' .. maker_user_id
       if maker_side == 'SELL' then
         if would_overflow_mul(trade_qty, base_factor) then
-          return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+          return overflow_error('trade_qty * base_factor', trade_qty, base_factor)
         end
         local trade_qty_balance_maker = trade_qty * base_factor
         local credit_market_maker = trade_quote - maker_fee
         if would_overflow_mul(credit_market_maker, quote_factor) then
-          return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+          return overflow_error('credit_market_maker * quote_factor', credit_market_maker, quote_factor)
         end
         local credit_balance_maker = credit_market_maker * quote_factor
 
@@ -562,26 +573,30 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
         maker_fees_collected = maker_fees_collected + maker_fee
         local fee_total_market = taker_fee + maker_fee
         if would_overflow_mul(fee_total_market, quote_factor) then
-          return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+          return overflow_error('fee_total_market * quote_factor', fee_total_market, quote_factor)
         end
         add_fee(quote_asset, fee_total_market * quote_factor)
 
         -- Now perform WRITES for Taker (BUY)
         taker_available_quote_after = taker_available_quote_after - debit_balance
-        op_sub(user_id, quote_asset, debit_balance, 'TAKER_SPEND', timestamp)
+        op_sub(user_id, quote_asset, debit_balance, 'TAKER_SPEND', timestamp,
+          'TAKER_SPEND:' .. market_seq .. '_' .. trade_seq .. ':' .. order_id)
 
-        op_add(user_id, base_asset, trade_qty_balance, 'TAKER_RECEIVE', timestamp)
+        op_add(user_id, base_asset, trade_qty_balance, 'TAKER_RECEIVE', timestamp,
+          'TAKER_RECEIVE:' .. market_seq .. '_' .. trade_seq .. ':' .. order_id)
 
         taker_quote_spent = taker_quote_spent + debit_market
         taker_base_received = taker_base_received + trade_qty
 
         -- WRITES for Maker (SELL)
-        op_sub_locked(maker_user_id, base_asset, trade_qty_balance_maker, 'MAKER_RELEASE', timestamp)
+        op_sub_locked(maker_user_id, base_asset, trade_qty_balance_maker, 'MAKER_RELEASE', timestamp,
+          'MAKER_RELEASE:' .. market_seq .. '_' .. trade_seq .. ':' .. maker_order_id)
         if redis.call('HEXISTS', maker_order_key, 'reserved_base') == 1 then
           redis.call('HINCRBY', maker_order_key, 'reserved_base', -trade_qty_balance_maker)
         end
 
-        op_add(maker_user_id, quote_asset, credit_balance_maker, 'MAKER_RECEIVE', timestamp)
+        op_add(maker_user_id, quote_asset, credit_balance_maker, 'MAKER_RECEIVE', timestamp,
+          'MAKER_RECEIVE:' .. market_seq .. '_' .. trade_seq .. ':' .. maker_order_id)
       else
         -- Maker is BUY, Taker is BUY? Impossible as opposite_side is logic.
         -- Wait, opposite_side logic:
@@ -595,7 +610,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
     else
       -- Taker is SELL
       if would_overflow_mul(trade_qty, base_factor) then
-        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+        return overflow_error('trade_qty * base_factor', trade_qty, base_factor)
       end
       local trade_qty_balance = trade_qty * base_factor
       if taker_available_base_after < trade_qty_balance then
@@ -605,7 +620,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
 
       local credit_market = trade_quote - taker_fee
       if would_overflow_mul(credit_market, quote_factor) then
-        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+        return overflow_error('credit_market * quote_factor', credit_market, quote_factor)
       end
       local credit_balance = credit_market * quote_factor
 
@@ -613,11 +628,11 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       -- Maker BUY checks
       local debit_market_maker = trade_quote + maker_fee
       if would_overflow_mul(debit_market_maker, quote_factor) then
-        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+        return overflow_error('debit_market_maker * quote_factor', debit_market_maker, quote_factor)
       end
       local debit_balance_maker = debit_market_maker * quote_factor
       if would_overflow_mul(trade_qty, base_factor) then
-        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+        return overflow_error('trade_qty * base_factor', trade_qty, base_factor)
       end
       local trade_qty_balance_maker = trade_qty * base_factor
 
@@ -626,26 +641,30 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       maker_fees_collected = maker_fees_collected + maker_fee
       local fee_total_market = taker_fee + maker_fee
       if would_overflow_mul(fee_total_market, quote_factor) then
-        return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+        return overflow_error('fee_total_market * quote_factor', fee_total_market, quote_factor)
       end
       add_fee(quote_asset, fee_total_market * quote_factor)
 
       -- Writes for Taker (SELL)
       taker_available_base_after = taker_available_base_after - trade_qty_balance
-      op_sub(user_id, base_asset, trade_qty_balance, 'TAKER_SELL', timestamp)
+      op_sub(user_id, base_asset, trade_qty_balance, 'TAKER_SPEND', timestamp,
+        'TAKER_SPEND:' .. market_seq .. '_' .. trade_seq .. ':' .. order_id)
 
-      op_add(user_id, quote_asset, credit_balance, 'TAKER_RECEIVE', timestamp)
+      op_add(user_id, quote_asset, credit_balance, 'TAKER_RECEIVE', timestamp,
+        'TAKER_RECEIVE:' .. market_seq .. '_' .. trade_seq .. ':' .. order_id)
 
       taker_quote_received = taker_quote_received + credit_market
       taker_base_sold = taker_base_sold + trade_qty
 
       -- Writes for Maker (BUY)
-      op_sub_locked(maker_user_id, quote_asset, debit_balance_maker, 'MAKER_RELEASE', timestamp)
+      op_sub_locked(maker_user_id, quote_asset, debit_balance_maker, 'MAKER_RELEASE', timestamp,
+        'MAKER_RELEASE:' .. market_seq .. '_' .. trade_seq .. ':' .. maker_order_id)
       if redis.call('HEXISTS', maker_order_key, 'reserved_quote') == 1 then
         redis.call('HINCRBY', maker_order_key, 'reserved_quote', -debit_balance_maker)
       end
 
-      op_add(maker_user_id, base_asset, trade_qty_balance_maker, 'MAKER_RECEIVE', timestamp)
+      op_add(maker_user_id, base_asset, trade_qty_balance_maker, 'MAKER_RECEIVE', timestamp,
+        'MAKER_RECEIVE:' .. market_seq .. '_' .. trade_seq .. ':' .. maker_order_id)
     end
 
     maker_remaining = maker_remaining - trade_qty
@@ -662,11 +681,13 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       -- Cleanup any residual reserved amounts (dust from rounding)
       local residual_base = as_number(redis.call('HGET', maker_order_key, 'reserved_base'))
       if residual_base > 0 then
-        op_unlock(maker_user_id, base_asset, residual_base, 'DUST_RELEASE', timestamp)
+        op_unlock(maker_user_id, base_asset, residual_base, 'DUST_RELEASE', timestamp,
+          'DUST_RELEASE:' .. market_seq .. '_' .. trade_seq .. ':' .. maker_order_id)
       end
       local residual_quote = as_number(redis.call('HGET', maker_order_key, 'reserved_quote'))
       if residual_quote > 0 then
-        op_unlock(maker_user_id, quote_asset, residual_quote, 'DUST_RELEASE', timestamp)
+        op_unlock(maker_user_id, quote_asset, residual_quote, 'DUST_RELEASE', timestamp,
+          'DUST_RELEASE:' .. market_seq .. '_' .. trade_seq .. ':' .. maker_order_id)
       end
 
       redis.call('HSET', maker_order_key, 'status', 'FILLED')
@@ -746,7 +767,7 @@ end
 local remaining_before_post = remaining
 local order_status
 
-local seq = redis.call('INCR', seq_key)
+local market_seq = redis.call('INCR', seq_key)
 if is_market then
   if executed_quantity == 0 then
     order_status = 'NO_LIQUIDITY'
@@ -768,7 +789,7 @@ else
         local reserve_total = reserve_quote + reserve_fee
         if reserve_total > 0 then
           if would_overflow_mul(reserve_total, quote_factor) then
-            return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+            return overflow_error('reserve_total * quote_factor', reserve_total, quote_factor)
           end
           local reserve_quote_balance = reserve_total * quote_factor
           if taker_available_quote_after < reserve_quote_balance then
@@ -777,13 +798,14 @@ else
           taker_available_quote_after = taker_available_quote_after - reserve_quote_balance
           taker_reserved_quote = taker_reserved_quote + reserve_quote_balance
           reserved_quote_for_order = reserve_quote_balance
-          op_lock(user_id, quote_asset, reserve_quote_balance, 'TAKER_RESERVE', timestamp)
+          op_lock(user_id, quote_asset, reserve_quote_balance, 'TAKER_RESERVE', timestamp,
+            'order_submit:' .. market_seq .. ':' .. order_id)
         end
       else
         local reserve_qty = remaining
         if reserve_qty > 0 then
           if would_overflow_mul(reserve_qty, base_factor) then
-            return cjson.encode({ error = 'PRECISION_OVERFLOW' })
+            return overflow_error('reserve_qty * base_factor', reserve_qty, base_factor)
           end
           local reserve_qty_balance = reserve_qty * base_factor
           if taker_available_base_after < reserve_qty_balance then
@@ -792,7 +814,8 @@ else
           taker_available_base_after = taker_available_base_after - reserve_qty_balance
           taker_reserved_base = taker_reserved_base + reserve_qty_balance
           reserved_base_for_order = reserve_qty_balance
-          op_lock(user_id, base_asset, reserve_qty_balance, 'TAKER_RESERVE', timestamp)
+          op_lock(user_id, base_asset, reserve_qty_balance, 'TAKER_RESERVE', timestamp,
+            'order_submit:' .. market_seq .. ':' .. order_id)
         end
       end
 
@@ -826,14 +849,14 @@ redis.call('HMSET', order_key,
   'reserved_quote', tostring(reserved_quote_for_order),
   'status', order_status,
   'created_at', tostring(timestamp),
-  'sequence', tostring(seq)
+  'sequence', tostring(market_seq)
 )
 
 -- Maintain per-user active orders index for the taker.
 -- Index only resting LIMIT orders with remaining > 0.
 local taker_index_key = 'user_orders:' .. user_id .. ':' .. symbol
 if order_type == 'LIMIT' and remaining > 0 and (order_status == 'OPEN' or order_status == 'PARTIALLY_FILLED') then
-  redis.call('ZADD', taker_index_key, seq, order_id)
+  redis.call('ZADD', taker_index_key, market_seq, order_id)
 else
   redis.call('ZREM', taker_index_key, order_id)
 end
@@ -852,7 +875,7 @@ redis.call('XADD', orders_key, 'MAXLEN', '~', orders_maxlen, '*',
   'quantity', tostring(quantity),
   'remaining', tostring(remaining),
   'ts', tostring(timestamp),
-  'sequence', tostring(seq)
+  'sequence', tostring(market_seq)
 )
 
 -- Delete terminal taker orders to keep memory bounded

@@ -379,7 +379,26 @@ module RedisExchange
     # Cancel a resting order and release any reserved balances.
     # Returns a status hash mirroring Lua responses.
     def cancel_order(order_id)
-      payload = { keys: ["order:#{order_id}"], argv: [order_id] }
+      # We need symbol to determine seq key.
+      # However, cancel_order.lua currently only takes order_key as KEYS[1].
+      # To provide seq key as KEYS[2], we need to know the symbol beforehand.
+      # But the caller only provides order_id.
+      # Option 1: Look up symbol from order hash first (requires extra RTT).
+      # Option 2: Change Lua script to accept symbol as ARGV and construct seq key? No, dynamic keys are bad for cluster.
+      # But seq key is {seq:{symbol}}, so we need symbol in KEYS for cluster compatibility.
+      
+      # Let's read the order first to get the symbol.
+      # This adds a round trip, but ensures correctness for cluster/key slots.
+      symbol = @redis.hget("order:#{order_id}", "symbol")
+      
+      # If order is not found, the Lua script will handle it gracefully if we just pass a dummy key or handle it here.
+      # If we don't find symbol, the order likely doesn't exist.
+      return { status: 'NOT_FOUND', order_id: order_id } unless symbol
+
+      payload = { 
+        keys: ["order:#{order_id}", "seq:#{symbol}"], 
+        argv: [order_id] 
+      }
       raw = call_script(@cancel_order_script, payload)
       JSON.parse(raw, symbolize_names: true)
     end
@@ -768,7 +787,7 @@ module RedisExchange
         # If either operand or the product breaches the bound, abort.
         # allow product equal to bound; overflow only when strictly greater
         if pl >= RedisExchange::MAX_SAFE_INTEGER || qty >= RedisExchange::MAX_SAFE_INTEGER || (pl.to_i * qty.to_i) > RedisExchange::MAX_SAFE_INTEGER
-          return { error: 'PRECISION_OVERFLOW' }
+          return { error: 'PRECISION_OVERFLOW', details: "price_limit * quantity: #{pl} * #{qty}" }
         end
       end
 

@@ -118,6 +118,31 @@ RSpec.describe 'Account Ledger and Balance Changes' do
     expect(entry_fields['biz_id']).to eq(biz_id)
   end
 
+  it 'records a LOCK entry when an order is placed' do
+      # 1. Place a limit buy order
+      exchange.place_limit_order(
+        symbol: 'BTC_USDT',
+        side: 'BUY',
+        order_id: 'order-1',
+        user_id: 'u1',
+        price: 3_000_000,
+        quantity: 10_000_000
+      )
+
+      # 2. Verify account ledger
+      entries = redis.xrevrange('account_ledger', '+', '-', count: 1)
+      expect(entries).not_to be_empty
+      _, fields = entries.first
+      fields = fields.is_a?(Hash) ? fields : Hash[*fields]
+
+      expect(fields['user_id']).to eq('u1')
+      expect(fields['asset']).to eq('USDT')
+      expect(fields['action']).to eq('LOCK')
+      expect(fields['amount']).to eq('300150') # (3000000 * 10000000 / 10^8) * 1.0005
+      expect(fields['reason']).to eq('TAKER_RESERVE')
+      expect(fields['biz_id']).to match(/^order_submit:\d+:order-1$/)
+    end
+
   it 'ledger_seq：按用户资产独立递增' do
     exchange.add_funds(user_id: 'u1', asset: 'USDT', amount: 100_000)
     exchange.add_funds(user_id: 'u1', asset: 'USDT', amount: 50_000)
