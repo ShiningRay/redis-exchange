@@ -12,7 +12,7 @@ Expected KEYS (1-9):
   8. trade stream (trades:{symbol})
   9. order event stream (orders:{symbol})
 
-Expected ARGV (1-8):
+Expected ARGV (1-9):
   1. symbol
   2. side (BUY|SELL)
   3. order type (LIMIT|MARKET)
@@ -21,6 +21,7 @@ Expected ARGV (1-8):
   6. price limit (scaled integer, 0 when unrestricted)
   7. quantity (scaled integer)
   8. timestamp in milliseconds
+  9. user taker fee in basis points (optional, nil uses market default)
 
 Returns a JSON blob describing execution outcome or an error code.
 The ticker hash (`ticker:{symbol}`) is also refreshed with last trade and top-of-book data.
@@ -89,6 +90,17 @@ local function append_ledger(user_id, asset, action, amount, reason, ts, biz_id)
     'sequence', tostring(seq),
     'biz_id', ledger_biz_id
   )
+end
+
+-- Get user-specific fee rates for a given user
+local function get_user_fees(user_id)
+  local fees = to_map(redis.call('HGETALL', 'user_fees:' .. user_id))
+  if next(fees) == nil then
+    return nil, nil
+  end
+  local m_bps = tonumber(fees['maker_fee_bps'])
+  local t_bps = tonumber(fees['taker_fee_bps'])
+  return m_bps, t_bps
 end
 
 -- Balance Primitives
@@ -239,6 +251,12 @@ local min_notional = tonumber(market['min_notional'] or '0')
 local maker_fee_bps = tonumber(market['maker_fee_bps'] or '0')
 local taker_fee_bps = tonumber(market['taker_fee_bps'] or '0')
 local price_scale = tonumber(market['price_scale'] or '1')
+
+-- Taker user-specific fee rate takes precedence over market default
+local user_taker_fee_bps = tonumber(ARGV[9])
+if user_taker_fee_bps and user_taker_fee_bps >= 0 and user_taker_fee_bps <= 10000 then
+  taker_fee_bps = user_taker_fee_bps
+end
 
 -- Read asset balance scales and validate compatibility with market scales.
 local base_asset_map = to_map(redis.call('HGETALL', 'asset:' .. base_asset))
@@ -532,8 +550,14 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
 
     -- Standard trade_seq for trades
     local trade_seq = redis.call('INCR', seq_key)
+
+    -- Taker fee uses taker's configured rate
     local taker_fee = math.floor((trade_quote * taker_fee_bps) / 10000)
-    local maker_fee = math.floor((trade_quote * maker_fee_bps) / 10000)
+
+    -- Maker fee uses maker's configured rate (fetch from user_fees if set)
+    local maker_user_maker_fee_bps, _ = get_user_fees(maker_user_id)
+    local actual_maker_fee_bps = maker_user_maker_fee_bps or maker_fee_bps
+    local maker_fee = math.floor((trade_quote * actual_maker_fee_bps) / 10000)
 
     if is_buy then
       local debit_market = trade_quote + taker_fee

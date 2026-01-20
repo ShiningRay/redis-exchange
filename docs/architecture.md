@@ -40,6 +40,20 @@ asset:{asset}
 - All deposits/withdrawals/ledger entries must use `balance_scale` minor units for the asset.
 - Markets reference assets via `base_asset` and `quote_asset`; the matching script converts market-scale deltas into asset `balance_scale` when mutating balances and writing ledger.
 
+### User Fee Rates
+
+```
+user_fees:{user_id}
+    maker_fee_bps     -> maker fee in basis points for this user (0..10000)
+    taker_fee_bps     -> taker fee in basis points for this user (0..10000)
+```
+
+- Purpose: allow per-user customization of trading fee rates.
+- User fees take precedence over market default fees when placing orders.
+- If `user_fees:{user_id}` does not exist, the user is charged market default fees.
+- Fee rates are specified in basis points (bps), where 100 bps = 1%.
+- Zero fee rates (0 bps) are supported for fee-free trading.
+
 ### Balances
 
 Balances live in a hash per user:
@@ -225,12 +239,18 @@ ticker:{symbol}
    - Order quantity must satisfy the market minimum; limit orders must also meet the minimum notional.
    - The taker must have sufficient `available` balance to cover the order (quote asset for buys, base asset for sells).
 
-2. **Execution**
+2. **Fee Rate Selection**
+   - The Ruby client checks `user_fees:{user_id}` for user-specific fee rates.
+   - If user fees are configured, they are passed to the Lua script as optional parameters.
+   - Inside Lua, user fees take precedence over market default fees (`market:{symbol}`).
+   - If user fees are not set or are invalid, market defaults are used.
+
+3. **Execution**
    - Iterate through the book on the opposite side, starting at the best price level.
    - Stop when either the book is empty or the next maker price falls outside the taker limit (for market orders a price cap of zero means "no limit").
    - Pop maker orders FIFO from the price level queue, loading their order hash for remaining quantity and owner id.
    - Compute the trade size (minimum of taker remaining and maker remaining) and notional.
-   - Apply fees: taker fee debited from the taker’s filled amount, maker fee debited from the maker’s proceeds.
+   - Apply fees: taker fee debited from the taker’s filled amount, maker fee debited from the maker’s proceeds. Fee rates are selected per-user (taker uses taker's rate, maker uses maker's rate).
    - Update balances atomically:
      - Buyer receives base asset in `available`, quote asset is decreased (reserved for taker, available for maker).
      - Seller receives quote asset in `available`, base asset reserved is released.

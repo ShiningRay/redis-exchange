@@ -582,6 +582,53 @@ module RedisExchange
       )
     end
 
+    # Set user-specific trading fee rates.
+    # User fees take precedence over market default fees when placing orders.
+    # @param user_id [String] user identifier
+    # @param maker_fee_bps [Integer] maker fee in basis points (0..10000)
+    # @param taker_fee_bps [Integer] taker fee in basis points (0..10000)
+    # @return [Hash] { ok: true } or { error: String }
+    def set_user_fees(user_id:, maker_fee_bps:, taker_fee_bps:)
+      raise ArgumentError, 'user_id is required' if user_id.nil? || user_id.to_s.empty?
+      raise ArgumentError, 'maker_fee_bps must be between 0 and 10000' unless (0..10000).include?(maker_fee_bps.to_i)
+      raise ArgumentError, 'taker_fee_bps must be between 0 and 10000' unless (0..10000).include?(taker_fee_bps.to_i)
+
+      key = "user_fees:#{user_id}"
+      @redis.hset(key, 'maker_fee_bps', maker_fee_bps.to_i, 'taker_fee_bps', taker_fee_bps.to_i)
+      { ok: true }
+    end
+
+    # Get user-specific trading fee rates.
+    # @param user_id [String] user identifier
+    # @return [Hash] { maker_fee_bps: Integer, taker_fee_bps: Integer } or {} if not set
+    def get_user_fees(user_id:)
+      raise ArgumentError, 'user_id is required' if user_id.nil? || user_id.to_s.empty?
+
+      key = "user_fees:#{user_id}"
+      raw = @redis.hgetall(key)
+      return {} if raw.empty?
+
+      {
+        maker_fee_bps: raw.fetch('maker_fee_bps', '0').to_i,
+        taker_fee_bps: raw.fetch('taker_fee_bps', '0').to_i
+      }
+    end
+
+    # Delete user-specific trading fee rates, reverting to market defaults.
+    # @param user_id [String] user identifier
+    # @return [Hash] { ok: true } or { error: String }
+    def delete_user_fees(user_id:)
+      raise ArgumentError, 'user_id is required' if user_id.nil? || user_id.to_s.empty?
+
+      key = "user_fees:#{user_id}"
+      unless @redis.exists?(key)
+        return { error: 'USER_FEES_NOT_FOUND' }
+      end
+
+      @redis.del(key)
+      { ok: true }
+    end
+
     # 分页查询用户在某交易对的活跃订单（OPEN/PARTIALLY_FILLED 且 remaining>0）。
     # 依赖 Lua 维护的 ZSET 索引：`user_orders:{user_id}:{symbol}`，score 使用撮合序列。
     # @param user_id [String]
@@ -816,6 +863,11 @@ module RedisExchange
       end
 
       ts = (timestamp_ms || current_millis).to_i
+      
+      # Load user-specific taker fee rate if configured
+      user_fees = get_user_fees(user_id: user_id)
+      user_taker_fee_bps = user_fees[:taker_fee_bps].to_s
+      
       keys = market_keys(symbol: symbol, user_id: user_id)
       script_payload = {
         keys: [
@@ -837,7 +889,8 @@ module RedisExchange
           user_id,
           price_limit.to_s,
           quantity.to_s,
-          ts.to_s
+          ts.to_s,
+          user_taker_fee_bps
         ]
       }
 
