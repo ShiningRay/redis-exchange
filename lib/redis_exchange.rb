@@ -22,6 +22,11 @@ require 'time'
 require 'securerandom'
 
 module RedisExchange
+  # Returns the root directory of the gem
+  def self.root
+    File.expand_path('..', __dir__)
+  end
+
   TICKER_FIELDS = %w[
     last_price
     last_quantity
