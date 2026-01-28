@@ -35,9 +35,10 @@ module RedisExchange
 
     # Read a batch of entries as Entry objects.
     # Returns [] on timeout or when no entries are available.
-    def read(count: 100, block_ms: 2000)
+    # @param id [String] '>' for new entries, '0' for pending entries
+    def read(count: 100, block_ms: 2000, id: '>')
       # Use positional args form to support older redis-rb versions
-      raw = @redis.xreadgroup(group, consumer, stream_key, '>', count: count, block: block_ms)
+      raw = @redis.xreadgroup(group, consumer, stream_key, id, count: count, block: block_ms)
       normalize_read_result(raw)
     end
 
@@ -74,14 +75,32 @@ module RedisExchange
     end
 
     # Claim idle pending entries older than min_idle_ms for this consumer.
-    # Returns claimed entry ids.
+    # Returns claimed Entry objects.
     def claim_idle(min_idle_ms: 60_000, count: 10)
-      summary = @redis.xpending(stream_key, group, '-', '+', count, consumer)
+      # Find pending entries from any consumer that are idle
+      summary = @redis.xpending(stream_key, group, '-', '+', count)
       ids = Array(summary).map { |row| row.is_a?(Array) ? row[0] : row['entry_id'] }.compact
-      ids = ids.first(count)
       return [] if ids.empty?
-      @redis.xclaim(stream_key, group, consumer, min_idle_ms, ids)
-      ids
+
+      # Claim them - this moves them to our PEL and returns the message content
+      raw = @redis.xclaim(stream_key, group, consumer, min_idle_ms, ids)
+      
+      # xclaim returns entries in a slightly different format than xreadgroup
+      # Format: [[id, [k, v, ...]], ...]
+      entries = []
+      Array(raw).each do |pair|
+        id, fields = pair
+        entries << Entry.new(stream_key, id, fields_to_hash(fields))
+      end
+      entries
+    end
+
+    # Manually trim the stream to a maximum length.
+    # @param maxlen [Integer] Maximum number of entries to keep
+    # @param approximate [Boolean] Whether to use approximate trimming (~), which is more efficient
+    # @return [Integer] Number of entries removed
+    def trim(maxlen:, approximate: true)
+      @redis.xtrim(stream_key, maxlen, approximate: approximate)
     end
 
     private

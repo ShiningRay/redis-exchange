@@ -97,13 +97,39 @@ module RedisExchange
         entries.each do |id, fields|
           user_id = fields['user_id']
           asset = fields['asset']
-          bucket = fields['bucket']
-          delta = fields['delta'].to_i
           
           calculated[user_id] ||= {}
-          calculated[user_id][asset] ||= { 'available' => 0, 'reserved' => 0 }
-          calculated[user_id][asset][bucket] ||= 0
-          calculated[user_id][asset][bucket] += delta
+          calculated[user_id][asset] ||= { RedisExchange::BUCKET_AVAILABLE => 0, RedisExchange::BUCKET_RESERVED => 0 }
+
+          if fields['action']
+            # New format: action + amount
+            action = fields['action']
+            amount = fields['amount'].to_i
+            
+            case action
+            when RedisExchange::ACTION_ADD
+              calculated[user_id][asset][RedisExchange::BUCKET_AVAILABLE] += amount
+            when RedisExchange::ACTION_SUB
+              calculated[user_id][asset][RedisExchange::BUCKET_AVAILABLE] -= amount
+            when RedisExchange::ACTION_LOCK
+              calculated[user_id][asset][RedisExchange::BUCKET_AVAILABLE] -= amount
+              calculated[user_id][asset][RedisExchange::BUCKET_RESERVED] += amount
+            when RedisExchange::ACTION_UNLOCK
+              calculated[user_id][asset][RedisExchange::BUCKET_RESERVED] -= amount
+              calculated[user_id][asset][RedisExchange::BUCKET_AVAILABLE] += amount
+            when RedisExchange::ACTION_SUB_LOCKED
+              calculated[user_id][asset][RedisExchange::BUCKET_RESERVED] -= amount
+            when RedisExchange::ACTION_ADD_LOCKED
+              calculated[user_id][asset][RedisExchange::BUCKET_RESERVED] += amount
+            end
+          else
+            # Legacy format: bucket + delta
+            bucket = fields['bucket']
+            delta = fields['delta'].to_i
+            if bucket && calculated[user_id][asset][bucket]
+              calculated[user_id][asset][bucket] += delta
+            end
+          end
           
           current_id = id
         end
@@ -149,8 +175,8 @@ module RedisExchange
     # @return [Hash]
     def force_cancel_order(order_id:, mode: :best_effort_unlock)
       mode_str = case mode
-                 when :delete_only then 'DELETE_ONLY'
-                 when :best_effort_unlock then 'BEST_EFFORT_UNLOCK'
+                 when :delete_only then RedisExchange::CANCEL_MODE_DELETE_ONLY
+                 when :best_effort_unlock then RedisExchange::CANCEL_MODE_BEST_EFFORT_UNLOCK
                  else raise ArgumentError, "invalid mode: #{mode}"
                  end
       
@@ -168,21 +194,36 @@ module RedisExchange
     # @param new_price_scale [Integer]
     # @param new_quantity_scale [Integer]
     # @param batch_size [Integer] number of price levels to process per batch
-    # @return [Hash] { updated_orders: Integer, status: 'OK' } or { error: String }
-    def update_market_precision(symbol:, new_price_scale:, new_quantity_scale:, batch_size: 20)
+    # @param dry [Boolean] if true, simulate only and return predicted changes
+    # @return [Hash] { updated_orders: Integer, status: 'OK' } or { error: String } or { new_order_book: Hash, revised_balances: Array, status: 'SIMULATED' }
+    def update_market_precision(symbol:, new_price_scale:, new_quantity_scale:, batch_size: 20, dry: false)
       # 1. Ensure Market is NOT OPEN (Use MAINTENANCE mode)
       initial_status = @redis.hget("market:#{symbol}", 'status')
       return { error: 'UNKNOWN_MARKET' } unless initial_status
 
-      if initial_status == 'OPEN'
+      if initial_status == RedisExchange::MARKET_STATUS_OPEN
         enable_market(symbol) # Sets status to MAINTENANCE
+      end
+
+      if dry
+        begin
+          res = simulate_precision_update(symbol, new_price_scale, new_quantity_scale)
+          res[:dry] = true
+          return res
+        ensure
+          # Restore status for dry run
+          if initial_status == RedisExchange::MARKET_STATUS_OPEN
+            current_status = @redis.hget("market:#{symbol}", 'status')
+            disable_market(symbol) if current_status == RedisExchange::MARKET_STATUS_MAINTENANCE
+          end
+        end
       end
 
       updated_count = 0
       
       begin
         # 2. Process BUY and SELL sides
-        ['BUY', 'SELL'].each do |side|
+        [RedisExchange::SIDE_BUY, RedisExchange::SIDE_SELL].each do |side|
           book_key = "book:#{symbol}:#{side}"
           price_members = @redis.zrange(book_key, 0, -1)
           
@@ -190,7 +231,7 @@ module RedisExchange
             res = run_migrate_batch(symbol, side, new_price_scale, new_quantity_scale, batch)
             if res[:error]
               # Restore status and raise/return error
-              disable_market(symbol) if initial_status == 'OPEN'
+              disable_market(symbol) if initial_status == RedisExchange::MARKET_STATUS_OPEN
               return res
             end
             updated_count += res[:processed_orders].to_i
@@ -200,15 +241,15 @@ module RedisExchange
         # 3. Finalize and switch
         finalize_res = run_finalize_precision(symbol, new_price_scale, new_quantity_scale)
         if finalize_res[:error]
-          disable_market(symbol) if initial_status == 'OPEN'
+          disable_market(symbol) if initial_status == RedisExchange::MARKET_STATUS_OPEN
           return finalize_res
         end
         
       ensure
         # 4. Restore Status (if it was OPEN originally and we didn't crash)
-        if initial_status == 'OPEN'
+        if initial_status == RedisExchange::MARKET_STATUS_OPEN
           current_status = @redis.hget("market:#{symbol}", 'status')
-          if current_status == 'MAINTENANCE'
+          if current_status == RedisExchange::MARKET_STATUS_MAINTENANCE
              disable_market(symbol)
           end
         end
@@ -383,9 +424,10 @@ module RedisExchange
     # Uses system maintenance mode to ensure consistency without blocking Redis.
     # @param output_path [String,nil] if provided and is a file path, writes to it. 
     #   If provided and is a directory, generates a filename using the latest ledger stream ID.
+    # @param lock_system [Boolean] whether to lock the system in maintenance mode during snapshot (default: true)
     # @return [Hash,String] returns Hash if output_path is nil; otherwise returns output_path
-    def snapshot_balances(output_path: nil)
-      enable
+    def snapshot_balances(output_path: nil, lock_system: true)
+      enable if lock_system
       
       # Determine output file path
       final_output_path = output_path
@@ -419,21 +461,21 @@ module RedisExchange
               
               user_balance = {}
               fields.each do |field, value|
-                 # Field format: "ASSET:available" or "ASSET:reserved"
-                 parts = field.split(':')
-                 if parts.length == 2
-                   asset = parts[0]
-                   type = parts[1]
-                   if type == 'available' || type == 'reserved'
-                     user_balance[asset] ||= { 'available' => 0, 'reserved' => 0 }
-                     user_balance[asset][type] = value.to_i
-                   end
-                 end
+                # Field format: "ASSET:available" or "ASSET:reserved"
+                parts = field.split(':')
+                if parts.length == 2
+                  asset = parts[0]
+                  type = parts[1]
+                  if type == 'available' || type == 'reserved'
+                    user_balance[asset] ||= { 'available' => 0, 'reserved' => 0 }
+                    user_balance[asset][type] = value.to_i
+                  end
+                end
               end
               
               unless user_balance.empty?
                 if output.is_a?(File)
-                  output.write(',') unless first_entry
+                  output.write(",\n") unless first_entry
                   output.write("#{JSON.generate(user_id)}:#{JSON.generate(user_balance)}")
                   first_entry = false
                 else
@@ -457,7 +499,7 @@ module RedisExchange
         if output.is_a?(File) && !output.closed?
           output.close
         end
-        disable
+        disable if lock_system
       end
     end
 
@@ -492,6 +534,108 @@ module RedisExchange
         
         break if cursor == '0'
       end
+    end
+
+    def simulate_precision_update(symbol, new_price_scale, new_quantity_scale)
+      market_config = @redis.hgetall("market:#{symbol}")
+      base_asset = market_config['base_asset']
+      quote_asset = market_config['quote_asset']
+      old_price_scale = market_config['price_scale'].to_i
+      old_quantity_scale = market_config['quantity_scale'].to_i
+      maker_fee_bps = market_config['maker_fee_bps'].to_i
+      
+      base_balance_scale = @redis.hget("asset:#{base_asset}", 'balance_scale').to_i
+      quote_balance_scale = @redis.hget("asset:#{quote_asset}", 'balance_scale').to_i
+
+      new_base_factor = (base_balance_scale / new_quantity_scale.to_f).floor
+      new_quote_factor = (quote_balance_scale / new_price_scale.to_f).floor
+      
+      if (new_base_factor * new_quantity_scale) != base_balance_scale || 
+         (new_quote_factor * new_price_scale) != quote_balance_scale
+        return { error: 'ASSET_SCALE_MISMATCH' }
+      end
+
+      new_order_book = { symbol: symbol, bids: [], asks: [] }
+      revised_balances = []
+      updated_orders = 0
+
+      # Helper to simulate processing an order
+      process_order = lambda do |order_id, price, side|
+        order = @redis.hgetall("order:#{order_id}")
+        return unless order['order_id']
+        updated_orders += 1
+
+        old_qty = order['quantity'].to_i
+        old_rem = order['remaining'].to_i
+        old_reserved_base = order['reserved_base'].to_i
+        old_reserved_quote = order['reserved_quote'].to_i
+        user_id = order['user_id']
+
+        new_price = (price * new_price_scale.to_f / old_price_scale).floor
+        new_qty = (old_qty * new_quantity_scale.to_f / old_quantity_scale).floor
+        new_rem = (old_rem * new_quantity_scale.to_f / old_quantity_scale).floor
+
+        new_reserved_base = 0
+        new_reserved_quote = 0
+
+        if side == RedisExchange::SIDE_SELL
+          new_reserved_base = new_rem * new_base_factor
+        else
+          quote_val = ((new_price * new_rem) / new_quantity_scale.to_f).floor
+          fee = ((quote_val * maker_fee_bps) / 10000.0).floor
+          total_quote = quote_val + fee
+          new_reserved_quote = total_quote * new_quote_factor
+        end
+
+        refund_base = old_reserved_base - new_reserved_base
+        refund_quote = old_reserved_quote - new_reserved_quote
+
+        if refund_base > 0
+          revised_balances << { user_id: user_id, asset: base_asset, delta: refund_base, type: 'DUST_REFUND' }
+        end
+        if refund_quote > 0
+          revised_balances << { user_id: user_id, asset: quote_asset, delta: refund_quote, type: 'DUST_REFUND' }
+        end
+
+        if new_rem > 0
+          entry = { price: new_price, volume: new_rem }
+          target_list = (side == RedisExchange::SIDE_BUY) ? new_order_book[:bids] : new_order_book[:asks]
+          
+          # Aggregate volume for same price
+          existing = target_list.find { |e| e[:price] == new_price }
+          if existing
+            existing[:volume] += new_rem
+          else
+            target_list << entry
+          end
+        end
+      end
+
+      # Process Asks (SELL)
+      price_members = @redis.zrange("book:#{symbol}:#{RedisExchange::SIDE_SELL}", 0, -1)
+      price_members.each do |pm|
+        orders = @redis.lrange("queue:#{symbol}:#{RedisExchange::SIDE_SELL}:#{pm}", 0, -1)
+        orders.each { |oid| process_order.call(oid, pm.to_i, RedisExchange::SIDE_SELL) }
+      end
+
+      # Process Bids (BUY)
+      # Bids are stored with negative scores, but price members are positive strings
+      price_members = @redis.zrange("book:#{symbol}:#{RedisExchange::SIDE_BUY}", 0, -1)
+      price_members.each do |pm|
+        orders = @redis.lrange("queue:#{symbol}:#{RedisExchange::SIDE_BUY}:#{pm}", 0, -1)
+        orders.each { |oid| process_order.call(oid, pm.to_i, RedisExchange::SIDE_BUY) }
+      end
+      
+      # Sort simulated books
+      new_order_book[:asks].sort_by! { |e| e[:price] }
+      new_order_book[:bids].sort_by! { |e| -e[:price] }
+
+      { 
+         simulated_order_book: new_order_book, 
+         simulated_balance_adjustments: revised_balances, 
+         updated_orders: updated_orders,
+         status: 'SIMULATED' 
+       }
     end
   end
 end

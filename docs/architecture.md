@@ -40,6 +40,20 @@ asset:{asset}
 - All deposits/withdrawals/ledger entries must use `balance_scale` minor units for the asset.
 - Markets reference assets via `base_asset` and `quote_asset`; the matching script converts market-scale deltas into asset `balance_scale` when mutating balances and writing ledger.
 
+### User Fee Rates
+
+```
+user_fees:{user_id}
+    maker_fee_bps     -> maker fee in basis points for this user (0..10000)
+    taker_fee_bps     -> taker fee in basis points for this user (0..10000)
+```
+
+- Purpose: allow per-user customization of trading fee rates.
+- User fees take precedence over market default fees when placing orders.
+- If `user_fees:{user_id}` does not exist, the user is charged market default fees.
+- Fee rates are specified in basis points (bps), where 100 bps = 1%.
+- Zero fee rates (0 bps) are supported for fee-free trading.
+
 ### Balances
 
 Balances live in a hash per user:
@@ -50,7 +64,34 @@ balance:{user_id}
     {asset}:reserved  -> funds locked on active orders
 ```
 
-All balances are stored as integers in the asset's minor units (`asset.balance_scale`). Matching uses market scales (`price_scale`, `quantity_scale`) and converts to asset units before applying.
+All balances are stored as integers in the asset's minor units (`asset.balance_scale`). 
+
+**Atomic Operations (`balance_op.lua`)**:
+All balance mutations are performed via a unified Lua script supporting these primitives:
+- `LOCK`: Move funds from `available` to `reserved`.
+- `UNLOCK`: Move funds from `reserved` to `available`.
+- `ADD`: Increase `available`.
+- `SUB`: Decrease `available` (ensure non-negative).
+- `ADD_LOCKED`: Increase `reserved`.
+- `SUB_LOCKED`: Decrease `reserved` (ensure non-negative).
+
+### Account Ledger Stream
+
+A global stream records all balance changes for auditing and reconciliation:
+
+```
+account_ledger
+```
+
+**Entry Fields**:
+- `user_id`: User identifier.
+- `asset`: Asset symbol (e.g., BTC).
+- `action`: One of `LOCK`, `UNLOCK`, `ADD`, `SUB`, `ADD_LOCKED`, `SUB_LOCKED`.
+- `amount`: Absolute change amount (always positive integer string).
+- `reason`: Context string (e.g., `MATCH`, `CANCEL`, `DEPOSIT`).
+- `ts`: Timestamp in ms.
+- `sequence`: Per-user-asset incremental sequence number.
+- `biz_id`: Idempotency key or auto-generated unique ID.
 
 ### Order Books
 
@@ -114,48 +155,64 @@ seq:{symbol} -> integer
 
 The sequence is appended to the order hash (`sequence`) and is used purely for auditing; FIFO ordering is handled by the Redis lists.
 
-### Trades
+### Trades Stream
 
-Matches are appended to a capped stream/list for downstream consumers:
+Matches are appended to a capped stream for downstream consumers (tickers, candles, history):
 
 ```
 trades:{symbol}
 ```
 
-Each trade entry is broadcast to `trades:{symbol}` via `XADD` with fields:
+**Entry Fields**:
+- `symbol`: Market symbol (e.g., BTCUSDT).
+- `taker_order_id`: ID of the incoming order.
+- `maker_order_id`: ID of the resting order.
+- `buy_order_id`: Normalized ID for the buyer.
+- `sell_order_id`: Normalized ID for the seller.
+- `taker_side`: `BUY` or `SELL`.
+- `price`: Executed price (scaled integer).
+- `quantity`: Executed base quantity (scaled integer).
+- `quote`: Executed quote amount (scaled integer).
+- `taker_fee`: Fee charged to taker (scaled integer).
+- `maker_fee`: Fee charged to maker (scaled integer).
+- `ts`: Unix timestamp in milliseconds.
+
+### Orders Stream (Private Events)
+
+Order lifecycle events are emitted to a capped stream for user data push:
 
 ```
-symbol        -> market symbol (e.g., BTCUSDT)
-taker_order_id
-maker_order_id
-buy_order_id  -> normalized convenience id (buyer side)
-sell_order_id -> normalized convenience id (seller side)
-taker_side    -> 'BUY' | 'SELL'
-price         -> executed price (scaled integer)
-quantity      -> executed base quantity (scaled integer)
-quote         -> executed quote amount (scaled integer)
-taker_fee     -> fee charged to taker (scaled integer)
-maker_fee     -> fee charged to maker (scaled integer)
-ts            -> unix timestamp in milliseconds
+orders:{symbol}
 ```
 
-### Depth Stream
+**Entry Fields**:
+- `order_id`: Unique order identifier.
+- `user_id`: Owner of the order.
+- `symbol`: Market symbol.
+- `side`: `BUY` or `SELL`.
+- `type`: `LIMIT` or `MARKET`.
+- `status`: New status (`OPEN`, `PARTIALLY_FILLED`, `FILLED`, `CANCELLED`, `NO_LIQUIDITY`).
+- `price`: Limit price (scaled).
+- `quantity`: Original quantity (scaled).
+- `remaining`: Remaining quantity (scaled).
+- `ts`: Timestamp in ms.
+- `sequence`: Market-wide sequence number.
 
-A real-time stream of order book changes is maintained at:
+### Depth Stream (Public Events)
+
+A real-time stream of order book changes:
 
 ```
 depth:{symbol}
 ```
 
-Events are emitted via `XADD` whenever the volume at a price level changes (due to matching, placing, or cancelling).
-
-Fields:
-- `e`: Event type (`u` for update)
-- `s`: Side (`BUY` | `SELL`)
-- `p`: Price level (integer string)
-- `d`: Delta amount (signed integer string; negative means volume decrease)
-- `v`: Final volume at this level (integer string, snapshot for verification)
-- `ts`: Timestamp (ms)
+**Entry Fields**:
+- `e`: Event type (`u` for update).
+- `s`: Side (`BUY` | `SELL`).
+- `p`: Price level (integer string).
+- `d`: Delta amount (signed integer string; negative = volume decrease).
+- `v`: Final volume at this level (snapshot).
+- `ts`: Timestamp (ms).
 
 ### Ticker
 
@@ -182,12 +239,18 @@ ticker:{symbol}
    - Order quantity must satisfy the market minimum; limit orders must also meet the minimum notional.
    - The taker must have sufficient `available` balance to cover the order (quote asset for buys, base asset for sells).
 
-2. **Execution**
+2. **Fee Rate Selection**
+   - The Ruby client checks `user_fees:{user_id}` for user-specific fee rates.
+   - If user fees are configured, they are passed to the Lua script as optional parameters.
+   - Inside Lua, user fees take precedence over market default fees (`market:{symbol}`).
+   - If user fees are not set or are invalid, market defaults are used.
+
+3. **Execution**
    - Iterate through the book on the opposite side, starting at the best price level.
    - Stop when either the book is empty or the next maker price falls outside the taker limit (for market orders a price cap of zero means "no limit").
    - Pop maker orders FIFO from the price level queue, loading their order hash for remaining quantity and owner id.
    - Compute the trade size (minimum of taker remaining and maker remaining) and notional.
-   - Apply fees: taker fee debited from the taker’s filled amount, maker fee debited from the maker’s proceeds.
+   - Apply fees: taker fee debited from the taker’s filled amount, maker fee debited from the maker’s proceeds. Fee rates are selected per-user (taker uses taker's rate, maker uses maker's rate).
    - Update balances atomically:
      - Buyer receives base asset in `available`, quote asset is decreased (reserved for taker, available for maker).
      - Seller receives quote asset in `available`, base asset reserved is released.

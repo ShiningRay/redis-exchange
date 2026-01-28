@@ -33,7 +33,7 @@ local function as_number(value)
   return tonumber(value) or 0
 end
 
-local function append_ledger(user_id, asset, bucket, delta, reason, ts)
+local function append_ledger(user_id, asset, bucket, delta, reason, ts, biz_id)
   if delta == 0 then return end
   local now_ts = ts
   if not now_ts or now_ts <= 0 then
@@ -41,7 +41,10 @@ local function append_ledger(user_id, asset, bucket, delta, reason, ts)
     now_ts = (tonumber(now[1]) or 0) * 1000 + math.floor((tonumber(now[2]) or 0) / 1000)
   end
   local seq = redis.call('INCR', 'ledger_seq:' .. user_id .. ':' .. asset)
-  local ledger_biz_id = 'AUTO:' .. user_id .. ':' .. asset .. ':' .. bucket .. ':' .. tostring(seq)
+  local ledger_biz_id = biz_id
+  if not ledger_biz_id then
+    ledger_biz_id = 'AUTO:' .. user_id .. ':' .. asset .. ':' .. bucket .. ':' .. tostring(seq)
+  end
   redis.call('XADD', 'account_ledger', 'MAXLEN', '~', 1000000, '*',
     'user_id', user_id,
     'asset', asset,
@@ -96,6 +99,12 @@ end
 
 local order_id = order['order_id'] or requested_id
 local symbol = order['symbol']
+local sequence = 0
+if symbol then
+  local seq_key = 'seq:' .. symbol
+  sequence = redis.call('INCR', seq_key)
+end
+
 local side = order['side']
 local price = order['price']
 local remaining = as_number(order['remaining'])
@@ -158,9 +167,11 @@ if mode == 'BEST_EFFORT_UNLOCK' and remaining > 0 and user_id then
 
       if final_unlock > 0 then
         redis.call('HINCRBY', balance_key, asset_to_unlock .. ':reserved', -final_unlock)
-        append_ledger(user_id, asset_to_unlock, 'reserved', -final_unlock, 'FORCE_CANCEL_RELEASE', nil)
+        append_ledger(user_id, asset_to_unlock, 'reserved', -final_unlock, 'FORCE_CANCEL_RELEASE', nil,
+          'order_cancel:' .. sequence .. ':' .. order_id)
         redis.call('HINCRBY', balance_key, asset_to_unlock .. ':available', final_unlock)
-        append_ledger(user_id, asset_to_unlock, 'available', final_unlock, 'FORCE_CANCEL_REFUND', nil)
+        append_ledger(user_id, asset_to_unlock, 'available', final_unlock, 'FORCE_CANCEL_REFUND', nil,
+          'order_cancel:' .. sequence .. ':' .. order_id)
       end
     end
   end
@@ -168,8 +179,7 @@ end
 
 -- Publish Event
 if symbol then
-  local seq_key = 'seq:' .. symbol
-  local sequence = redis.call('INCR', seq_key)
+  -- sequence is already incremented above
   local orders_key = 'orders:' .. symbol
   local market_config = to_map(redis.call('HGETALL', 'market:' .. symbol))
   local orders_maxlen = tonumber(market_config['orders_maxlen']) or 1000000

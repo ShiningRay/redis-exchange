@@ -26,9 +26,9 @@ RSpec.describe RedisExchange::LedgerStreamConsumer do
   end
 
   it 'reads ledger entries from stream and acknowledges them' do
-    # Produce some ledger events via deposit and withdraw
-    exchange.deposit(user_id: 'u1', asset: 'USDT', amount: 1_000, timestamp_ms: 1000)
-    exchange.withdraw(user_id: 'u1', asset: 'USDT', amount: 200, timestamp_ms: 2000)
+    # Produce some ledger events via add_funds and sub_funds
+    exchange.add_funds(user_id: 'u1', asset: 'USDT', amount: 1_000, timestamp_ms: 1000)
+    exchange.sub_funds(user_id: 'u1', asset: 'USDT', amount: 200, timestamp_ms: 2000)
 
     consumer = exchange.ledger_consumer(group: 'ledger-consumers', consumer: 'worker-1')
     entries = consumer.read(count: 10, block_ms: 200)
@@ -41,7 +41,7 @@ RSpec.describe RedisExchange::LedgerStreamConsumer do
     expect(entry.fields).to be_a(Hash)
     expect(entry.fields['user_id']).to eq('u1')
     expect(entry.fields['asset']).to eq('USDT')
-    expect(%w[available reserved]).to include(entry.fields['bucket'])
+    expect(%w[ADD SUB LOCK UNLOCK SUB_LOCKED ADD_LOCKED]).to include(entry.fields['action'])
     expect(entry.fields['biz_id']).to be_a(String)
 
     acked = consumer.ack(entry.id)
@@ -50,7 +50,7 @@ RSpec.describe RedisExchange::LedgerStreamConsumer do
 
   it 'supports breaking the loop via each returning :halt' do
     # Produce one event
-    exchange.deposit(user_id: 'u2', asset: 'USDT', amount: 500, timestamp_ms: 3000)
+    exchange.add_funds(user_id: 'u2', asset: 'USDT', amount: 500, timestamp_ms: 3000)
 
     consumer = exchange.ledger_consumer(group: 'ledger-consumers', consumer: 'worker-2')
     seen = []
@@ -63,7 +63,7 @@ RSpec.describe RedisExchange::LedgerStreamConsumer do
 
   it 'exposes pending summary and allows claiming idle entries' do
     # Produce an entry but do not ack to create pending
-    exchange.deposit(user_id: 'u3', asset: 'USDT', amount: 100, timestamp_ms: 4000)
+    exchange.add_funds(user_id: 'u3', asset: 'USDT', amount: 100, timestamp_ms: 4000)
     consumer = exchange.ledger_consumer(group: 'ledger-consumers', consumer: 'worker-3')
 
     # Read without auto ack
@@ -76,6 +76,24 @@ RSpec.describe RedisExchange::LedgerStreamConsumer do
     # Claim idle (set tiny idle to allow immediate claim)
     claimed = consumer.claim_idle(min_idle_ms: 1, count: 10)
     expect(claimed).to be_a(Array)
+    expect(claimed.first).to be_a(RedisExchange::StreamConsumer::Entry)
+    expect(claimed.first.id).to eq(entries.first.id)
+  end
+
+  it 'supports reading from a specific ID (re-processing)' do
+    # Produce two entries
+    exchange.add_funds(user_id: 'u4', asset: 'USDT', amount: 100)
+    exchange.add_funds(user_id: 'u4', asset: 'USDT', amount: 200)
+
+    consumer = exchange.ledger_consumer(group: 'ledger-consumers', consumer: 'worker-4')
+    entries = consumer.read(count: 2)
+    expect(entries.size).to eq(2)
+
+    first_id = entries.first.id
+    
+    # Read again starting from '0-0' should return the same entries (since they are in PEL)
+    re_read = consumer.read(id: '0-0', count: 1)
+    expect(re_read.first.id).to eq(first_id)
   end
 
   after do

@@ -8,7 +8,7 @@ require 'redis'
 require 'bigdecimal'
 require_relative '../lib/redis_exchange'
 
-# Random trading bot: performs random deposits/withdrawals, limit & market orders,
+# Random trading bot: performs random add_funds/sub_funds, limit & market orders,
 # with random waits between operations and prints every result.
 #
 # Usage:
@@ -167,11 +167,11 @@ if options[:seed]
   options[:users].each do |u|
     # Deposit some USDT: between 5_000 and 50_000
     usdt_amount = (5_000 + rand(0..45_000)) * ASSET_SCALES['USDT']
-    res1 = exchange_main.deposit(user_id: u, asset: 'USDT', amount: usdt_amount)
+    res1 = exchange_main.add_funds(user_id: u, asset: 'USDT', amount: usdt_amount)
     puts "#{c('[DEPOSIT]', :green)} user=#{u} asset=USDT amount=#{format_asset_amount('USDT', usdt_amount)} => #{JSON.pretty_generate(res1)}"
     # Deposit some BTC: between 0.05 and 0.5 BTC
     btc_amount = (5 + rand(0..45)) * (ASSET_SCALES['BTC'] / 100) # 0.05..0.5 BTC in minor units
-    res2 = exchange_main.deposit(user_id: u, asset: 'BTC', amount: btc_amount)
+    res2 = exchange_main.add_funds(user_id: u, asset: 'BTC', amount: btc_amount)
     puts "#{c('[DEPOSIT]', :green)} user=#{u} asset=BTC amount=#{format_asset_amount('BTC', btc_amount)} => #{JSON.pretty_generate(res2)}"
   end
 end
@@ -179,6 +179,189 @@ end
 if options[:merge_depth]
   puts "#{c('[INIT]', :cyan)} Showing initial merged depth..."
   print_merged_order_book(Time.now.strftime('%H:%M:%S'), exchange_main, options[:symbol], bucket_size: options[:merge_depth], depth_limit: 10)
+  puts
+end
+
+# Balance Conservation Audit Helper
+def run_balance_conservation_audit(redis, exchange, symbol, initial_balances, assets, initial_ledger_id)
+  puts "#{c('[AUDIT]', :cyan, :bold)} Running balance conservation check..."
+  puts
+  
+  # 1. Calculate final balances
+  final_balances = {}
+  cursor = '0'
+  loop do
+    cursor, keys = redis.scan(cursor, match: 'balance:*', count: 1000)
+    keys.each do |key|
+      fields = redis.hgetall(key)
+      fields.each do |field, value|
+        parts = field.split(':')
+        if parts.length == 2
+          asset = parts[0]
+          bucket = parts[1]
+          if bucket == 'available' || bucket == 'reserved'
+            final_balances[asset] ||= 0
+            final_balances[asset] += value.to_i
+          end
+        end
+      end
+    end
+    break if cursor == '0'
+  end
+  
+  # 2. Collect fees from trades
+  fees_collected = {}
+  trade_stream_key = "trades:#{symbol}"
+  
+  # Use XRANGE to get all entries from the trade stream
+  # XRANGE returns entries in chronological order
+  trade_entries = redis.xrange(trade_stream_key, '-', '+', count: 10000)
+  
+  # Get quote asset from market config
+  market_config = redis.hgetall("market:#{symbol}")
+  quote_asset = market_config['quote_asset'] || 'USDT'
+  
+  trade_entries.each do |entry_id, fields|
+    taker_fee = fields['taker_fee'].to_i
+    maker_fee = fields['maker_fee'].to_i
+    total_fee = taker_fee + maker_fee
+    
+    fees_collected[quote_asset] ||= 0
+    fees_collected[quote_asset] += total_fee
+  end
+  
+  # 3. Collect ONLY external deposits and withdrawals from ledger (ADD/SUB only)
+  # Note: Trading-related ADD/SUB operations are internal asset transfers and
+  # should not be counted as external deposits/withdrawals for this audit
+  # We will rely on the fact that trading conserves total balance (assets are just transferred between users)
+  external_deposits = {}
+  external_withdrawals = {}
+  
+  # Use XRANGE to get ledger entries after initial ledger ID
+  ledger_entries = redis.xrange('account_ledger', '-', '+', count: 10000)
+  
+  processed_count = 0
+  skipped_count = 0
+  ledger_entries.each do |entry_id, fields|
+    # Skip entries that were already accounted for in initial balances
+    # We compare to timestamp part of the ID (second number in "timestamp-sequence")
+    entry_timestamp = entry_id.split('-').first.to_i
+    initial_timestamp = initial_ledger_id.split('-').first.to_i
+    
+    if entry_timestamp <= initial_timestamp
+      skipped_count += 1
+      next
+    end
+    
+    processed_count += 1
+    action = fields['action']
+    asset = fields['asset']
+    amount = fields['amount'].to_i
+    reason = fields['reason'] || ''
+    
+    # Only count external deposits/withdrawals (DEPOSIT, WITHDRAWAL reasons)
+    # Trading operations have different reasons or are part of the same transaction
+    case action
+    when 'ADD'
+      if reason == 'DEPOSIT' || reason == 'add_funds'
+        external_deposits[asset] ||= 0
+        external_deposits[asset] += amount
+      end
+    when 'SUB'
+      if reason == 'WITHDRAWAL' || reason == 'sub_funds'
+        external_withdrawals[asset] ||= 0
+        external_withdrawals[asset] += amount
+      end
+    when 'LOCK', 'UNLOCK', 'SUB_LOCKED', 'ADD_LOCKED'
+      # Internal balance transfers - skip
+    end
+  end
+  
+  # 4. Run audit for all assets
+  # Formula: Initial + External Deposits - External Withdrawals - Fees = Final
+  # Trading operations should conserve total balance (assets are transferred, not created/destroyed)
+  all_assets = (initial_balances.keys + final_balances.keys + fees_collected.keys + external_deposits.keys + external_withdrawals.keys).uniq
+  
+  discrepancies = []
+  all_assets.each do |asset|
+    initial = initial_balances[asset] || 0
+    final = final_balances[asset] || 0
+    fees = fees_collected[asset] || 0
+    deposit = external_deposits[asset] || 0
+    withdrawal = external_withdrawals[asset] || 0
+    
+    # Formula: Initial + External Deposits - External Withdrawals - Fees = Final
+    expected = initial + deposit - withdrawal - fees
+    diff = final - expected
+    
+    puts "#{c('Asset:', :yellow)} #{asset}"
+    puts "  Initial:     #{format_asset_amount(asset, initial)}"
+    if fees > 0
+      puts "  - Fees:      #{format_asset_amount(asset, fees)} (collected from trades)"
+    end
+    if deposit > 0
+      puts "  + Deposits:  #{format_asset_amount(asset, deposit)}"
+    end
+    if withdrawal > 0
+      puts "  - Withdrawals: #{format_asset_amount(asset, withdrawal)}"
+    end
+    puts "  = Expected:   #{format_asset_amount(asset, expected)}"
+    puts "  Actual:      #{format_asset_amount(asset, final)}"
+    
+    if diff == 0
+      puts "  Diff:        #{format_asset_amount(asset, diff)} #{c('✅', :green)}"
+    else
+      puts "  Diff:        #{format_asset_amount(asset, diff)} #{c('❌', :red)}"
+      discrepancies << { asset: asset, diff: diff, expected: expected, actual: final }
+    end
+    puts
+  end
+  
+  if discrepancies.empty?
+    puts "#{c('✅', :green)} Balance conservation check PASSED! All assets balanced."
+  else
+    puts "#{c('❌', :red, :bold)} Balance conservation check FAILED! #{discrepancies.size} discrepancy(ies) found."
+  end
+  
+  { success: discrepancies.empty?, discrepancies: discrepancies }
+end
+
+# Capture initial balances for conservation audit
+initial_balances_by_asset = {}
+initial_ledger_id = nil
+if options[:audit]
+  puts "#{c('[INIT]', :cyan)} Capturing initial balance snapshot for conservation audit..."
+  
+  # Capture the latest ledger ID at this point
+  last_entry = redis_main.xrevrange('account_ledger', '+', '-', count: 1).first
+  initial_ledger_id = last_entry ? last_entry[0] : '0-0'
+  puts "#{c('[INIT]', :cyan)} Initial ledger ID: #{initial_ledger_id}"
+  
+  # Scan all balance keys
+  cursor = '0'
+  loop do
+    cursor, keys = redis_main.scan(cursor, match: 'balance:*', count: 1000)
+    keys.each do |key|
+      fields = redis_main.hgetall(key)
+      fields.each do |field, value|
+        parts = field.split(':')
+        if parts.length == 2
+          asset = parts[0]
+          bucket = parts[1]
+          if bucket == 'available' || bucket == 'reserved'
+            initial_balances_by_asset[asset] ||= 0
+            initial_balances_by_asset[asset] += value.to_i
+          end
+        end
+      end
+    end
+    break if cursor == '0'
+  end
+  
+  puts "#{c('[INIT]', :cyan)} Initial balances captured for #{initial_balances_by_asset.size} asset(s)"
+  initial_balances_by_asset.each do |asset, amount|
+    puts "  #{asset}: #{format_asset_amount(asset, amount)}"
+  end
   puts
 end
 
@@ -207,13 +390,13 @@ rand_btc_amount = lambda do
   rand(1..20) * step
 end
 
-ops = %i[limit_order market_order deposit withdraw cancel_one]
+ops = %i[limit_order market_order add_funds sub_funds cancel_one]
 
 weights = {
   limit_order: 40,
   market_order: 30,
-  deposit: 2,
-  withdraw: 2,
+  add_funds: 2,
+  sub_funds: 2,
   cancel_one: 10
 }
 
@@ -414,16 +597,16 @@ run_worker = lambda do |thread_id, iterations, shared_options|
           end
         end
 
-      when :deposit
+      when :add_funds
         asset = %w[USDT BTC].sample
         amount = asset == 'USDT' ? rand_usdt_amount.call : rand_btc_amount.call
-        res = local_exchange.deposit(user_id: user, asset: asset, amount: amount)
+        res = local_exchange.add_funds(user_id: user, asset: asset, amount: amount)
         puts "#{prefix} #{c('DEPOSIT', :green)} user=#{user} asset=#{asset} amount=#{format_asset_amount(asset, amount)} => #{JSON.pretty_generate(res)}"
         
-      when :withdraw
+      when :sub_funds
         asset = %w[USDT BTC].sample
         amount = asset == 'USDT' ? rand_usdt_amount.call : rand_btc_amount.call
-        res = local_exchange.withdraw(user_id: user, asset: asset, amount: amount)
+        res = local_exchange.sub_funds(user_id: user, asset: asset, amount: amount)
         puts "#{prefix} #{c('WITHDRAW', :magenta)} user=#{user} asset=#{asset} amount=#{format_asset_amount(asset, amount)} => #{JSON.pretty_generate(res)}"
         
       when :cancel_one
@@ -553,6 +736,9 @@ if options[:audit]
   rescue => e
     puts "#{c('❌', :red)} Audit failed: #{e.message}"
   end
+
+  puts
+  run_balance_conservation_audit(redis_main, exchange_main, options[:symbol], initial_balances_by_asset, ASSET_SCALES.keys, initial_ledger_id)
 end
 
 puts c('[DONE]', :green)

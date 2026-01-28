@@ -118,6 +118,21 @@ RSpec.describe RedisExchange::Maintenance do
         expect(balances[:'BTC:reserved']).to eq(0) # 50 - 50
         expect(balances[:'BTC:available']).to eq(50)
       end
+
+      it 'uses standardized biz_id for ledger entries' do
+        exchange.set_balance(user_id: user_id, asset: 'USDT', available: 0, reserved: 1000)
+        inject_order(order_id, 'BUY', 1000, 1, 1000)
+
+        exchange.maintenance.force_cancel_order(order_id: order_id, mode: :best_effort_unlock)
+
+        entries = redis.xrevrange('account_ledger', '+', '-', count: 2)
+        expect(entries.size).to eq(2)
+        
+        entries.each do |_, fields|
+          fields = fields.is_a?(Hash) ? fields : Hash[*fields]
+          expect(fields['biz_id']).to match(/^order_cancel:\d+:order-1$/)
+        end
+      end
     end
   end
 end

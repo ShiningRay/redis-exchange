@@ -34,7 +34,7 @@ RSpec.describe 'Maintenance Mode', :maintenance do
   it 'rejects balance changes when maintenance mode is active' do
     exchange.maintenance.enable
     
-    result = exchange.deposit(user_id: 'u1', asset: 'BTC', amount: 100)
+    result = exchange.add_funds(user_id: 'u1', asset: 'BTC', amount: 100)
     expect(result[:error]).to eq('SYSTEM_MAINTENANCE')
   end
 
@@ -50,8 +50,8 @@ RSpec.describe 'Maintenance Mode', :maintenance do
   end
   
   it 'rejects cancel all orders when maintenance mode is active' do
-     exchange.maintenance.enable
-     result = exchange.cancel_all_orders('u1')
-     expect(result[:error]).to eq('SYSTEM_MAINTENANCE')
+    exchange.maintenance.enable
+    result = exchange.cancel_all_orders('u1')
+    expect(result[:error]).to eq('SYSTEM_MAINTENANCE')
   end
 end
