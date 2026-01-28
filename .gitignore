@@ -10,4 +10,4 @@
 .env
 .DS_Store
 *.rdb
-bin/rdb-cli
+bin/rdb-cliGemfile.lock
