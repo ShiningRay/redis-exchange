@@ -45,15 +45,16 @@ RSpec.describe 'Export RDB Data Script' do
     
     redis_url = ENV['SPEC_REDIS_URL'] || 'redis://127.0.0.1:6379/15'
     
-    # We switch to tmp_dir so the output files are created there
-    cmd = "cd #{tmp_dir} && RDB_CLI_CMD='#{rdb_cli_path}' #{script_path} -u '#{redis_url}'"
+    # Run from project root so the script writes to tmp/ relative to root,
+    # which matches our tmp_dir expectation.
+    cmd = "RDB_CLI_CMD='#{rdb_cli_path}' #{script_path} -u '#{redis_url}'"
     stdout_str, stderr_str, status = Open3.capture3(cmd)
     
     unless status.success?
       puts "STDOUT:\n#{stdout_str}"
       puts "STDERR:\n#{stderr_str}"
     end
-
+    
     expect(status.success?).to be(true), "Script failed: #{stderr_str}"
 
     # 3. Verify Snapshot ID

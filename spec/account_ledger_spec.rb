@@ -119,8 +119,13 @@ RSpec.describe 'Account Ledger and Balance Changes' do
   end
 
   it 'records a LOCK entry when an order is placed' do
+    exchange.seed_asset(asset: 'BTC', balance_scale: 100_000_000)
+    exchange.seed_asset(asset: 'USDT', balance_scale: 100)
+    exchange.seed_market(symbol: 'BTC_USDT', base_asset: 'BTC', quote_asset: 'USDT', price_scale: 100, quantity_scale: 100_000_000, maker_fee_bps: 5, taker_fee_bps: 5)
+    exchange.add_funds(user_id: 'u1', asset: 'USDT', amount: 1_000_000_000)
+
       # 1. Place a limit buy order
-      exchange.place_limit_order(
+      result = exchange.place_limit_order(
         symbol: 'BTC_USDT',
         side: 'BUY',
         order_id: 'order-1',
@@ -128,6 +133,8 @@ RSpec.describe 'Account Ledger and Balance Changes' do
         price: 3_000_000,
         quantity: 10_000_000
       )
+      expect(result[:error]).to be_nil, "Expected no error but got #{result[:error]} details: #{result[:details]}"
+       expect(result[:status]).to eq('OPEN').or eq('FILLED')
 
       # 2. Verify account ledger
       entries = redis.xrevrange('account_ledger', '+', '-', count: 1)
