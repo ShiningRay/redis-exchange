@@ -74,6 +74,17 @@ module RedisExchange
       @redis.xpending(stream_key, group)
     end
 
+    # Get the consumer group lag (number of messages not yet delivered to the group).
+    # Returns Integer (lag) or nil if lag cannot be determined.
+    def lag
+      groups = @redis.xinfo(:groups, stream_key)
+      group_info = groups.find { |g| g['name'] == group }
+      return nil unless group_info
+
+      # Redis returns 'lag' field; if nil, it means calculation is pending or not applicable
+      group_info['lag']
+    end
+
     # Claim idle pending entries older than min_idle_ms for this consumer.
     # Returns claimed Entry objects.
     def claim_idle(min_idle_ms: 60_000, count: 10)

@@ -17,6 +17,8 @@
 # - Keep values < 9e15 to stay within Lua double precision.
 
 require 'json'
+require 'bigdecimal'
+require 'bigdecimal/util'
 require 'redis' unless defined?(Redis)
 require 'time'
 require 'securerandom'
@@ -349,8 +351,8 @@ module RedisExchange
 
       if auto_scale
         scale = asset_config(asset)[:balance_scale] || 1
-        available = available.to_f / scale
-        reserved = reserved.to_f / scale
+        available = available.to_d / scale
+        reserved = reserved.to_d / scale
       end
 
       { available: available, reserved: reserved }
@@ -657,6 +659,32 @@ module RedisExchange
       return [] if ids.empty?
 
       ids.map { |id| order(id) }.select { |o| !o.empty? && o[:remaining].positive? && (o[:status] == RedisExchange::ORDER_STATUS_OPEN || o[:status] == RedisExchange::ORDER_STATUS_PARTIALLY_FILLED) }
+    end
+
+    # Fetch all active orders for a market (scanning the order book).
+    # WARNING: This can be expensive on large order books as it scans all price levels and queues.
+    # @param symbol [String]
+    # @return [Array<Hash>] list of order hashes
+    def market_active_orders(symbol:)
+      orders = []
+      [RedisExchange::SIDE_BUY, RedisExchange::SIDE_SELL].each do |side|
+        # 1. Get all price levels from the book
+        book_key = "book:#{symbol}:#{side}"
+        prices = @redis.zrange(book_key, 0, -1)
+        
+        prices.each do |price|
+          # 2. Get all order IDs at this price level
+          queue_key = "queue:#{symbol}:#{side}:#{price}"
+          order_ids = @redis.lrange(queue_key, 0, -1)
+          
+          order_ids.each do |oid|
+             # 3. Fetch order details
+             o = order(oid)
+             orders << o unless o.empty?
+          end
+        end
+      end
+      orders
     end
 
     # Build a TradeStreamConsumer for a market symbol.
