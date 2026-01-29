@@ -85,6 +85,13 @@ module RedisExchange
       group_info['lag']
     end
 
+    # Reset the consumer group offset to a specific ID (default '0' for beginning).
+    # This forces the consumer group to re-process messages starting after the given ID.
+    # @param id [String] new last delivered ID (e.g., '0', '$', or specific timestamp)
+    def reset_offset(id: '0')
+      @redis.xgroup(:setid, stream_key, group, id)
+    end
+
     # Claim idle pending entries older than min_idle_ms for this consumer.
     # Returns claimed Entry objects.
     def claim_idle(min_idle_ms: 60_000, count: 10)
