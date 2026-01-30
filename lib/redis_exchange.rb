@@ -687,6 +687,92 @@ module RedisExchange
       orders
     end
 
+    # Monitor order book changes via Redis Keyspace Notifications.
+    # Yields events to the block.
+    # Note: This method blocks while listening for events.
+    #
+    # @param symbol [String] market symbol
+    # @param redis_config [Hash] optional Redis configuration for the subscriber connection
+    # @yield [type, side]
+    #   @yieldparam type [String] event type (e.g. 'zadd', 'zrem')
+    #   @yieldparam side [String] 'BUY' or 'SELL'
+    def monitor_order_book(symbol:, redis_config: nil, &block)
+      raise ArgumentError, 'block required' unless block_given?
+
+      # Ensure Keyspace notifications are enabled for Generic (keys) and Sorted Sets
+      # K: Keyspace events, E: Keyevent events, z: Sorted sets
+      # We need Kz or Ez. We'll use Kz to subscribe to specific keys.
+      begin
+        config = @redis.config('GET', 'notify-keyspace-events')
+        current_policy = if config.is_a?(Hash)
+                           config['notify-keyspace-events']
+                         elsif config.is_a?(Array)
+                           Hash[*config]['notify-keyspace-events']
+                         else
+                           ''
+                         end.to_s
+
+        unless current_policy.include?('K') && current_policy.include?('z')
+           new_policy = (current_policy.chars + ['K', 'z']).uniq.join
+           @redis.config('SET', 'notify-keyspace-events', new_policy)
+        end
+      rescue Redis::CommandError => e
+        # If CONFIG command is restricted (e.g. managed Redis), we warn but proceed
+        # assuming the user might have configured it externally.
+        warn "Warning: Failed to set notify-keyspace-events: #{e.message}"
+      end
+
+      # Get current DB
+      # Use CLIENT INFO to reliably get the current database index
+      db = begin
+             info = @redis.call('CLIENT', 'INFO')
+             info[/db=(\d+)/, 1] || 0
+           rescue StandardError
+             0
+           end
+      
+      # Channels
+      buy_channel = "__keyspace@#{db}__:book:#{symbol}:#{RedisExchange::SIDE_BUY}"
+      sell_channel = "__keyspace@#{db}__:book:#{symbol}:#{RedisExchange::SIDE_SELL}"
+
+      # Use a new connection for subscription to avoid blocking the main client
+      # If redis_config is not provided, try to extract from current client
+      sub_redis = if redis_config
+                    Redis.new(redis_config)
+                  else
+                    # Clone connection options
+                    opts = if @redis.respond_to?(:_client)
+                             @redis._client.instance_variable_get(:@options)
+                           else
+                             # Fallback: try to access options via instance var if _client missing
+                             @redis.instance_variable_get(:@options)
+                           end
+                    
+                    if opts
+                      Redis.new(opts)
+                    else
+                      # Last resort: try default or ENV
+                      Redis.new(url: ENV['REDIS_URL'])
+                    end
+                  end
+
+      begin
+        sub_redis.subscribe(buy_channel, sell_channel) do |on|
+          on.message do |channel, message|
+            side = if channel.end_with?(RedisExchange::SIDE_BUY)
+                     RedisExchange::SIDE_BUY
+                   else
+                     RedisExchange::SIDE_SELL
+                   end
+            
+            block.call(message, side)
+          end
+        end
+      ensure
+        sub_redis.close
+      end
+    end
+
     # Build a TradeStreamConsumer for a market symbol.
     # Usage: consumer = exchange.trade_consumer(symbol: 'BTCUSDT', group: 'trades-consumers', consumer: 'worker-1')
     def trade_consumer(symbol:, group:, consumer:)

@@ -95,6 +95,14 @@ p exchange.ticker('BTCUSDT')
 
 # Retrieve an order snapshot by id with typed fields
 pp exchange.order('sell-1')
+
+# Monitor real-time order book changes
+# Note: This method blocks execution. Run in a separate thread.
+exchange.monitor_order_book(symbol: 'BTCUSDT') do |event, side|
+  # event: 'zadd' (new order/price level), 'zrem' (level removed), etc.
+  # side: 'BUY' or 'SELL'
+  puts "Book update: #{side} #{event}"
+end
 ```
 
 ### Auto-connect without providing `redis`
