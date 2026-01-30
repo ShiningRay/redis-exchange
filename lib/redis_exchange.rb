@@ -227,6 +227,10 @@ module RedisExchange
       @redis.hset(key, mapping)
     end
 
+    def market_exist?(symbol)
+      @redis.exists("market:#{symbol}")
+    end
+
     def set_market_status(symbol:, status:)
       key = "market:#{symbol}"
       return { error: 'UNKNOWN_MARKET' } unless @redis.exists?(key)

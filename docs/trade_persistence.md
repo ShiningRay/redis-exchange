@@ -10,9 +10,13 @@
 - 记录字段为：
   - `symbol`
   - `taker_order_id`
+  - `taker_user_id`
   - `maker_order_id`
+  - `maker_user_id`
   - `buy_order_id`（买方订单 id，便于查询）
+  - `buy_user_id`
   - `sell_order_id`（卖方订单 id，便于查询）
+  - `sell_user_id`
 - `taker_side`（`BUY` | `SELL`）
   - `price`（成交价，整数，已缩放）
   - `quantity`（成交基础数量，整数，已缩放）
@@ -56,9 +60,13 @@
     - `maker_fee`（bigint）
     - `taker_fee`（bigint）
     - `maker_order_id`（string）
+    - `maker_user_id`（string）
     - `taker_order_id`（string）
+    - `taker_user_id`（string）
     - `buy_order_id`（string，可选）
+    - `buy_user_id`（string，可选）
     - `sell_order_id`（string，可选）
+    - `sell_user_id`（string，可选）
     - `executed_ts_ms`（bigint）
   - 索引：
     - 唯一索引：`stream_entry_id`
@@ -120,9 +128,13 @@ loop do
       maker_fee: fields['maker_fee'].to_i,
       taker_fee: fields['taker_fee'].to_i,
       maker_order_id: fields['maker_order_id'],
+      maker_user_id: fields['maker_user_id'],
       taker_order_id: fields['taker_order_id'],
+      taker_user_id: fields['taker_user_id'],
       buy_order_id: fields['buy_order_id'],
+      buy_user_id: fields['buy_user_id'],
       sell_order_id: fields['sell_order_id'],
+      sell_user_id: fields['sell_user_id'],
       executed_ts_ms: fields['ts'].to_i
     }
 

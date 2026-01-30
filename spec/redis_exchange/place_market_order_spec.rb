@@ -79,9 +79,13 @@ RSpec.describe RedisExchange::Client do
         entry_id, fields = stream_entries.first
         fields_hash = fields.is_a?(Hash) ? fields : Hash[*fields]
         expect(fields_hash['taker_order_id']).to eq('taker-1')
+        expect(fields_hash['taker_user_id']).to eq('alice')
         expect(fields_hash['maker_order_id']).to eq('maker-1')
+        expect(fields_hash['maker_user_id']).to eq('bob')
         expect(fields_hash['buy_order_id']).to eq('taker-1')
+        expect(fields_hash['buy_user_id']).to eq('alice')
         expect(fields_hash['sell_order_id']).to eq('maker-1')
+        expect(fields_hash['sell_user_id']).to eq('bob')
         expect(fields_hash['taker_side']).to eq('BUY')
         expect(fields_hash['price']).to eq('3000000')
         expect(fields_hash['quantity']).to eq('50000000')
@@ -218,9 +222,13 @@ RSpec.describe RedisExchange::Client do
         _, fields = stream_entries.first
         fields_hash = fields.is_a?(Hash) ? fields : Hash[*fields]
         expect(fields_hash['taker_order_id']).to eq('market-full-taker-1')
+        expect(fields_hash['taker_user_id']).to eq('alice')
         expect(fields_hash['maker_order_id']).to eq('market-full-maker-1')
+        expect(fields_hash['maker_user_id']).to eq('bob')
         expect(fields_hash['buy_order_id']).to eq('market-full-taker-1')
+        expect(fields_hash['buy_user_id']).to eq('alice')
         expect(fields_hash['sell_order_id']).to eq('market-full-maker-1')
+        expect(fields_hash['sell_user_id']).to eq('bob')
         expect(fields_hash['taker_side']).to eq('BUY')
         expect(fields_hash['price']).to eq('3000000')
         expect(fields_hash['quantity']).to eq('100000000')

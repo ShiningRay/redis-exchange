@@ -779,9 +779,13 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
     -- Use MAXLEN ~ for amortized trimming; length threshold sourced from market config.
     redis.call('XADD', trades_key, 'MAXLEN', '~', trades_maxlen, '*',
       'taker_order_id', order_id,
+      'taker_user_id', user_id,
       'maker_order_id', maker_order_id,
+      'maker_user_id', maker_user_id,
       'buy_order_id', is_buy and order_id or maker_order_id,
+      'buy_user_id', is_buy and user_id or maker_user_id,
       'sell_order_id', is_buy and maker_order_id or order_id,
+      'sell_user_id', is_buy and maker_user_id or user_id,
       'taker_side', is_buy and 'BUY' or 'SELL',
       'price', tostring(trade_price),
       'quantity', tostring(trade_qty),
@@ -887,8 +891,6 @@ redis.call('HMSET', order_key,
 local taker_index_key = 'user_orders:' .. user_id .. ':' .. symbol
 if order_type == 'LIMIT' and remaining > 0 and (order_status == 'OPEN' or order_status == 'PARTIALLY_FILLED') then
   redis.call('ZADD', taker_index_key, market_seq, order_id)
-else
-  redis.call('ZREM', taker_index_key, order_id)
 end
 
 update_ticker_state(trades)

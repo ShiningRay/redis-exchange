@@ -166,9 +166,13 @@ trades:{symbol}
 **Entry Fields**:
 - `symbol`: Market symbol (e.g., BTCUSDT).
 - `taker_order_id`: ID of the incoming order.
+- `taker_user_id`: Taker's user ID.
 - `maker_order_id`: ID of the resting order.
+- `maker_user_id`: Maker's user ID.
 - `buy_order_id`: Normalized ID for the buyer.
+- `buy_user_id`: Buyer's user ID.
 - `sell_order_id`: Normalized ID for the seller.
+- `sell_user_id`: Seller's user ID.
 - `taker_side`: `BUY` or `SELL`.
 - `price`: Executed price (scaled integer).
 - `quantity`: Executed base quantity (scaled integer).
