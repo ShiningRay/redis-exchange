@@ -33,7 +33,7 @@ local function as_number(value)
   return tonumber(value) or 0
 end
 
-local function append_ledger(user_id, asset, bucket, delta, reason, ts, biz_id)
+local function append_ledger(user_id, asset, bucket, delta, new_available, new_reserved, reason, ts, biz_id)
   if delta == 0 then return end
   local now_ts = ts
   if not now_ts or now_ts <= 0 then
@@ -49,7 +49,9 @@ local function append_ledger(user_id, asset, bucket, delta, reason, ts, biz_id)
     'user_id', user_id,
     'asset', asset,
     'bucket', bucket,
-    'delta', tostring(delta),
+    'amount', tostring(delta),
+    'new_available', tostring(new_available),
+    'new_reserved', tostring(new_reserved),
     'reason', reason or 'FORCE_CANCEL',
     'ts', tostring(now_ts),
     'sequence', tostring(seq),
@@ -166,11 +168,15 @@ if mode == 'BEST_EFFORT_UNLOCK' and remaining > 0 and user_id then
       end
 
       if final_unlock > 0 then
-        redis.call('HINCRBY', balance_key, asset_to_unlock .. ':reserved', -final_unlock)
-        append_ledger(user_id, asset_to_unlock, 'reserved', -final_unlock, 'FORCE_CANCEL_RELEASE', nil,
+        local new_reserved = redis.call('HINCRBY', balance_key, asset_to_unlock .. ':reserved', -final_unlock)
+        local current_available = as_number(redis.call('HGET', balance_key, asset_to_unlock .. ':available'))
+        append_ledger(user_id, asset_to_unlock, 'reserved', -final_unlock, current_available, new_reserved,
+          'FORCE_CANCEL_RELEASE', nil,
           'order_cancel:' .. sequence .. ':' .. order_id)
-        redis.call('HINCRBY', balance_key, asset_to_unlock .. ':available', final_unlock)
-        append_ledger(user_id, asset_to_unlock, 'available', final_unlock, 'FORCE_CANCEL_REFUND', nil,
+
+        local new_available = redis.call('HINCRBY', balance_key, asset_to_unlock .. ':available', final_unlock)
+        append_ledger(user_id, asset_to_unlock, 'available', final_unlock, new_available, new_reserved,
+          'FORCE_CANCEL_REFUND', nil,
           'order_cancel:' .. sequence .. ':' .. order_id)
       end
     end

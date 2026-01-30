@@ -68,7 +68,6 @@ if action == 'LOCK' then
   new_reserved = reserved_bal + amount
   redis.call('HINCRBY', balance_key, avail_field, -amount)
   redis.call('HINCRBY', balance_key, reserved_field, amount)
-
 elseif action == 'UNLOCK' then
   if reserved_bal < amount then
     return cjson.encode({ error = 'INSUFFICIENT_FUNDS', asset = asset, bucket = 'reserved' })
@@ -77,29 +76,24 @@ elseif action == 'UNLOCK' then
   new_avail = avail_bal + amount
   redis.call('HINCRBY', balance_key, reserved_field, -amount)
   redis.call('HINCRBY', balance_key, avail_field, amount)
-
 elseif action == 'ADD' then
   new_avail = avail_bal + amount
   redis.call('HINCRBY', balance_key, avail_field, amount)
-
 elseif action == 'SUB' then
   if avail_bal < amount then
     return cjson.encode({ error = 'INSUFFICIENT_FUNDS', asset = asset, bucket = 'available' })
   end
   new_avail = avail_bal - amount
   redis.call('HINCRBY', balance_key, avail_field, -amount)
-
 elseif action == 'SUB_LOCKED' then
   if reserved_bal < amount then
     return cjson.encode({ error = 'INSUFFICIENT_FUNDS', asset = asset, bucket = 'reserved' })
   end
   new_reserved = reserved_bal - amount
   redis.call('HINCRBY', balance_key, reserved_field, -amount)
-
 elseif action == 'ADD_LOCKED' then
   new_reserved = reserved_bal + amount
   redis.call('HINCRBY', balance_key, reserved_field, amount)
-
 else
   return cjson.encode({ error = 'INVALID_ACTION' })
 end
@@ -124,6 +118,8 @@ redis.call('XADD', 'account_ledger', 'MAXLEN', '~', 1000000, '*',
   'asset', asset,
   'action', action,
   'amount', tostring(amount),
+  'new_available', tostring(new_avail),
+  'new_reserved', tostring(new_reserved),
   'reason', reason,
   'ts', tostring(ts),
   'sequence', tostring(seq),

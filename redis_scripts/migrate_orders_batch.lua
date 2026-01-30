@@ -55,7 +55,7 @@ local function append_ledger(user_id, asset, bucket, delta, reason, ts)
     'user_id', user_id,
     'asset', asset,
     'bucket', bucket,
-    'delta', tostring(delta),
+    'amount', tostring(delta),
     'reason', reason,
     'ts', tostring(ts),
     'sequence', tostring(seq),
@@ -104,27 +104,27 @@ for i = 6, #ARGV do
   local old_price_member = ARGV[i]
   local old_price = as_number(old_price_member)
   local old_queue_key = 'queue:' .. symbol .. ':' .. side .. ':' .. old_price_member
-  
+
   -- Calculate New Price
   local new_price = math.floor(old_price * new_price_scale / old_price_scale)
   local new_price_member = tostring(new_price)
   local new_queue_key_tmp = 'queue:' .. symbol .. ':' .. side .. ':' .. new_price_member .. ':TMP'
-  
+
   local orders = redis.call('LRANGE', old_queue_key, 0, -1)
-  -- Note: We do NOT delete the old queue here. 
-  -- We leave old data intact until finalize step to be safe, 
+  -- Note: We do NOT delete the old queue here.
+  -- We leave old data intact until finalize step to be safe,
   -- OR we can delete it now to save space?
   -- Safety first: If script fails midway, we want to be able to retry.
   -- But if we don't delete, re-running this batch will duplicate data in TMP.
   -- Assumption: The caller handles idempotency or we clear TMP before starting.
-  -- Actually, let's delete the old queue key as we process it. 
+  -- Actually, let's delete the old queue key as we process it.
   -- If we crash, we are in a halfway state anyway (Maintenance Mode).
   redis.call('DEL', old_queue_key)
-  
+
   for _, order_id in ipairs(orders) do
     local order_key = 'order:' .. order_id
     local order = to_map(redis.call('HGETALL', order_key))
-    
+
     if next(order) then
       processed_orders_count = processed_orders_count + 1
       local old_qty = as_number(order['quantity'])
@@ -132,13 +132,13 @@ for i = 6, #ARGV do
       local old_reserved_base = as_number(order['reserved_base'])
       local old_reserved_quote = as_number(order['reserved_quote'])
       local user_id = order['user_id']
-      
+
       local new_qty = math.floor(old_qty * new_quantity_scale / old_quantity_scale)
       local new_rem = math.floor(old_rem * new_quantity_scale / old_quantity_scale)
-      
+
       local new_reserved_base = 0
       local new_reserved_quote = 0
-      
+
       if side == 'SELL' then
         new_reserved_base = new_rem * new_base_factor
       else
@@ -147,10 +147,10 @@ for i = 6, #ARGV do
         local total_quote = quote_val + fee
         new_reserved_quote = total_quote * new_quote_factor
       end
-      
+
       local refund_base = old_reserved_base - new_reserved_base
       local refund_quote = old_reserved_quote - new_reserved_quote
-      
+
       if refund_base > 0 then
         local bal_key = 'balance:' .. user_id
         redis.call('HINCRBY', bal_key, base_asset .. ':reserved', -refund_base)
@@ -158,7 +158,7 @@ for i = 6, #ARGV do
         append_ledger(user_id, base_asset, 'available', refund_base, 'DUST_REFUND', timestamp)
         append_ledger(user_id, base_asset, 'reserved', -refund_base, 'DUST_RELEASE', timestamp)
       end
-      
+
       if refund_quote > 0 then
         local bal_key = 'balance:' .. user_id
         redis.call('HINCRBY', bal_key, quote_asset .. ':reserved', -refund_quote)
@@ -166,7 +166,7 @@ for i = 6, #ARGV do
         append_ledger(user_id, quote_asset, 'available', refund_quote, 'DUST_REFUND', timestamp)
         append_ledger(user_id, quote_asset, 'reserved', -refund_quote, 'DUST_RELEASE', timestamp)
       end
-      
+
       if new_rem > 0 then
         redis.call('HMSET', order_key,
           'price', new_price_member,
@@ -176,10 +176,10 @@ for i = 6, #ARGV do
           'reserved_quote', tostring(new_reserved_quote)
         )
         redis.call('RPUSH', new_queue_key_tmp, order_id)
-        
+
         -- Accumulate Volume in TMP
         redis.call('HINCRBY', volume_tmp_key, new_price_member, new_rem)
-        
+
         -- Add to TMP Book
         local score = is_buy and -new_price or new_price
         redis.call('ZADD', book_tmp_key, score, new_price_member)

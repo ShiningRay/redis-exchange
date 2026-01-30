@@ -65,7 +65,7 @@ local function append_ledger(user_id, asset, bucket, delta, reason, ts)
     'user_id', user_id,
     'asset', asset,
     'bucket', bucket,
-    'delta', tostring(delta),
+    'amount', tostring(delta),
     'reason', reason,
     'ts', tostring(ts),
     'sequence', tostring(seq),
@@ -111,47 +111,47 @@ redis.call('HSET', market_key, 'price_scale', new_price_scale, 'quantity_scale',
 
 local updated_count = 0
 local sides = { 'BUY', 'SELL' }
-local queues_to_rename = {} -- { {old_key, new_key, is_tmp} } 
+local queues_to_rename = {} -- { {old_key, new_key, is_tmp} }
 -- Actually we use TMP keys for new queues
 
 local function process_side(side)
   local is_buy = (side == 'BUY')
   local book_key = is_buy and book_buy_key or book_sell_key
   local volume_key = is_buy and volume_buy_key or volume_sell_key
-  
+
   -- Read all levels
   local levels = redis.call('ZRANGE', book_key, 0, -1, 'WITHSCORES')
-  
+
   -- Clear old book and volume
   redis.call('DEL', book_key)
   redis.call('DEL', volume_key)
-  
+
   -- We will rebuild book/volume in memory then write
-  local new_book = {} -- price -> score
+  local new_book = {}   -- price -> score
   local new_volume = {} -- price -> volume
-  
+
   for i = 1, #levels, 2 do
     local old_price_member = levels[i]
     local old_price = as_number(old_price_member) -- This is the price string/member
     -- Note: Score is also available but we use member as source of truth for price value
-    
+
     local old_queue_key = 'queue:' .. symbol .. ':' .. side .. ':' .. old_price_member
-    
+
     -- Calculate New Price
     -- Logic: new_p = floor(old_p * new_scale / old_scale)
     local new_price = math.floor(old_price * new_price_scale / old_price_scale)
     local new_price_member = tostring(new_price)
-    
+
     -- Iterate Orders
     local orders = redis.call('LRANGE', old_queue_key, 0, -1)
     redis.call('DEL', old_queue_key) -- Delete old queue
-    
+
     local new_queue_key_tmp = 'queue:' .. symbol .. ':' .. side .. ':' .. new_price_member .. ':TMP'
-    
+
     for _, order_id in ipairs(orders) do
       local order_key = 'order:' .. order_id
       local order = to_map(redis.call('HGETALL', order_key))
-      
+
       if next(order) then
         updated_count = updated_count + 1
         local old_qty = as_number(order['quantity'])
@@ -159,15 +159,15 @@ local function process_side(side)
         local old_reserved_base = as_number(order['reserved_base'])
         local old_reserved_quote = as_number(order['reserved_quote'])
         local user_id = order['user_id']
-        
+
         -- Calculate New Qty/Rem
         local new_qty = math.floor(old_qty * new_quantity_scale / old_quantity_scale)
         local new_rem = math.floor(old_rem * new_quantity_scale / old_quantity_scale)
-        
+
         -- Calculate New Reserved
         local new_reserved_base = 0
         local new_reserved_quote = 0
-        
+
         if side == 'SELL' then
           -- SELL: Reserve Base = rem * base_factor
           new_reserved_base = new_rem * new_base_factor
@@ -179,11 +179,11 @@ local function process_side(side)
           local total_quote = quote_val + fee
           new_reserved_quote = total_quote * new_quote_factor
         end
-        
+
         -- Refunds
         local refund_base = old_reserved_base - new_reserved_base
         local refund_quote = old_reserved_quote - new_reserved_quote
-        
+
         if refund_base > 0 then
           local bal_key = 'balance:' .. user_id
           redis.call('HINCRBY', bal_key, base_asset .. ':reserved', -refund_base)
@@ -191,7 +191,7 @@ local function process_side(side)
           append_ledger(user_id, base_asset, 'available', refund_base, 'DUST_REFUND', timestamp)
           append_ledger(user_id, base_asset, 'reserved', -refund_base, 'DUST_RELEASE', timestamp)
         end
-        
+
         if refund_quote > 0 then
           local bal_key = 'balance:' .. user_id
           redis.call('HINCRBY', bal_key, quote_asset .. ':reserved', -refund_quote)
@@ -199,7 +199,7 @@ local function process_side(side)
           append_ledger(user_id, quote_asset, 'available', refund_quote, 'DUST_REFUND', timestamp)
           append_ledger(user_id, quote_asset, 'reserved', -refund_quote, 'DUST_RELEASE', timestamp)
         end
-        
+
         -- Update Order
         if new_rem > 0 then
           redis.call('HMSET', order_key,
@@ -211,10 +211,10 @@ local function process_side(side)
           )
           -- Push to new queue (TMP)
           redis.call('RPUSH', new_queue_key_tmp, order_id)
-          
+
           -- Accumulate Volume
           new_volume[new_price_member] = (new_volume[new_price_member] or 0) + new_rem
-          
+
           -- Mark this TMP key for renaming later (deduplicate)
           queues_to_rename[new_queue_key_tmp] = 'queue:' .. symbol .. ':' .. side .. ':' .. new_price_member
         else
@@ -237,7 +237,7 @@ local function process_side(side)
       end
     end
   end
-  
+
   -- Write Book and Volume
   for price_str, vol in pairs(new_volume) do
     if vol > 0 then

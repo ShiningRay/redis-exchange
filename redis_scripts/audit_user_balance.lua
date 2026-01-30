@@ -30,7 +30,7 @@ local function as_number(value)
   return tonumber(value) or 0
 end
 
-local function append_ledger(uid, asset, action, amount, reason, timestamp)
+local function append_ledger(uid, asset, action, amount, new_available, new_reserved, reason, timestamp)
   if amount == 0 then return end
   local now_ts = timestamp
   if not now_ts or tonumber(now_ts) <= 0 then
@@ -44,6 +44,8 @@ local function append_ledger(uid, asset, action, amount, reason, timestamp)
     'asset', asset,
     'action', action,
     'amount', tostring(amount),
+    'new_available', tostring(new_available),
+    'new_reserved', tostring(new_reserved),
     'reason', reason,
     'ts', tostring(now_ts),
     'sequence', tostring(seq),
@@ -121,9 +123,9 @@ for asset, _ in pairs(all_assets) do
     end
 
     if fix_mode and to_lock > 0 then
-      redis.call('HINCRBY', balance_key, asset .. ':available', -to_lock)
-      redis.call('HINCRBY', balance_key, asset .. ':reserved', to_lock)
-      append_ledger(user_id, asset, 'LOCK', to_lock, 'AUDIT_FIX_LOCK', ts)
+      local new_available = redis.call('HINCRBY', balance_key, asset .. ':available', -to_lock)
+      local new_reserved = redis.call('HINCRBY', balance_key, asset .. ':reserved', to_lock)
+      append_ledger(user_id, asset, 'LOCK', to_lock, new_available, new_reserved, 'AUDIT_FIX_LOCK', ts)
 
       table.insert(fixes, { asset = asset, action = 'LOCK', amount = to_lock })
     end
@@ -136,9 +138,9 @@ for asset, _ in pairs(all_assets) do
     -- Surplus: Locked too much. Release to available.
     local to_release = -diff
     if fix_mode then
-      redis.call('HINCRBY', balance_key, asset .. ':reserved', -to_release)
-      redis.call('HINCRBY', balance_key, asset .. ':available', to_release)
-      append_ledger(user_id, asset, 'UNLOCK', to_release, 'AUDIT_FIX_RELEASE', ts)
+      local new_reserved = redis.call('HINCRBY', balance_key, asset .. ':reserved', -to_release)
+      local new_available = redis.call('HINCRBY', balance_key, asset .. ':available', to_release)
+      append_ledger(user_id, asset, 'UNLOCK', to_release, new_available, new_reserved, 'AUDIT_FIX_RELEASE', ts)
 
       table.insert(fixes, { asset = asset, action = 'RELEASE', amount = to_release })
     end

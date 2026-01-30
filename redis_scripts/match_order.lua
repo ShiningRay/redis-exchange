@@ -62,13 +62,14 @@ end
 -- Perform HINCRBY only when the delta is non-zero to avoid redundant writes.
 local function hincrby(key, field, delta)
   if delta ~= 0 then
-    redis.call('HINCRBY', key, field, delta)
+    return redis.call('HINCRBY', key, field, delta)
   end
+  return tonumber(redis.call('HGET', key, field)) or 0
 end
 
 -- Append an account ledger entry for a balance change.
 -- Uses per-user-asset sequence `ledger_seq:{user_id}:{asset}` and global stream `account_ledger`.
-local function append_ledger(user_id, asset, action, amount, reason, ts, biz_id)
+local function append_ledger(user_id, asset, action, amount, new_available, new_reserved, reason, ts, biz_id)
   if amount == 0 then return end
   local now_ts = ts
   if not now_ts or now_ts <= 0 then
@@ -85,6 +86,8 @@ local function append_ledger(user_id, asset, action, amount, reason, ts, biz_id)
     'asset', asset,
     'action', action,
     'amount', tostring(amount),
+    'new_available', tostring(new_available),
+    'new_reserved', tostring(new_reserved),
     'reason', reason or 'MATCH',
     'ts', tostring(now_ts),
     'sequence', tostring(seq),
@@ -106,34 +109,37 @@ end
 -- Balance Primitives
 local function op_lock(user_id, asset, amount, reason, ts, biz_id)
   if amount <= 0 then return end
-  hincrby('balance:' .. user_id, asset .. ':available', -amount)
-  hincrby('balance:' .. user_id, asset .. ':reserved', amount)
-  append_ledger(user_id, asset, 'LOCK', amount, reason, ts, biz_id)
+  local new_avail = hincrby('balance:' .. user_id, asset .. ':available', -amount)
+  local new_res = hincrby('balance:' .. user_id, asset .. ':reserved', amount)
+  append_ledger(user_id, asset, 'LOCK', amount, new_avail, new_res, reason, ts, biz_id)
 end
 
 local function op_unlock(user_id, asset, amount, reason, ts, biz_id)
   if amount <= 0 then return end
-  hincrby('balance:' .. user_id, asset .. ':reserved', -amount)
-  hincrby('balance:' .. user_id, asset .. ':available', amount)
-  append_ledger(user_id, asset, 'UNLOCK', amount, reason, ts, biz_id)
+  local new_res = hincrby('balance:' .. user_id, asset .. ':reserved', -amount)
+  local new_avail = hincrby('balance:' .. user_id, asset .. ':available', amount)
+  append_ledger(user_id, asset, 'UNLOCK', amount, new_avail, new_res, reason, ts, biz_id)
 end
 
 local function op_add(user_id, asset, amount, reason, ts, biz_id)
   if amount <= 0 then return end
-  hincrby('balance:' .. user_id, asset .. ':available', amount)
-  append_ledger(user_id, asset, 'ADD', amount, reason, ts, biz_id)
+  local new_avail = hincrby('balance:' .. user_id, asset .. ':available', amount)
+  local new_res = tonumber(redis.call('HGET', 'balance:' .. user_id, asset .. ':reserved')) or 0
+  append_ledger(user_id, asset, 'ADD', amount, new_avail, new_res, reason, ts, biz_id)
 end
 
 local function op_sub(user_id, asset, amount, reason, ts, biz_id)
   if amount <= 0 then return end
-  hincrby('balance:' .. user_id, asset .. ':available', -amount)
-  append_ledger(user_id, asset, 'SUB', amount, reason, ts, biz_id)
+  local new_avail = hincrby('balance:' .. user_id, asset .. ':available', -amount)
+  local new_res = tonumber(redis.call('HGET', 'balance:' .. user_id, asset .. ':reserved')) or 0
+  append_ledger(user_id, asset, 'SUB', amount, new_avail, new_res, reason, ts, biz_id)
 end
 
 local function op_sub_locked(user_id, asset, amount, reason, ts, biz_id)
   if amount <= 0 then return end
-  hincrby('balance:' .. user_id, asset .. ':reserved', -amount)
-  append_ledger(user_id, asset, 'SUB_LOCKED', amount, reason, ts, biz_id)
+  local new_res = hincrby('balance:' .. user_id, asset .. ':reserved', -amount)
+  local new_avail = tonumber(redis.call('HGET', 'balance:' .. user_id, asset .. ':available')) or 0
+  append_ledger(user_id, asset, 'SUB_LOCKED', amount, new_avail, new_res, reason, ts, biz_id)
 end
 
 local function publish_depth_update(symbol, side, price, delta, final_volume, ts)
