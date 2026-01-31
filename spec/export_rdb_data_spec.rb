@@ -12,7 +12,7 @@ RSpec.describe 'Export RDB Data Script' do
   let(:tmp_dir) { File.expand_path('../../tmp', __FILE__) }
 
   before do
-    redis.flushall
+    redis.flushdb
     FileUtils.mkdir_p(tmp_dir)
     # Ensure no leftover files
     Dir.glob("#{tmp_dir}/*.csv").each { |f| File.delete(f) }
@@ -20,7 +20,7 @@ RSpec.describe 'Export RDB Data Script' do
   end
 
   after do
-    redis.flushall
+    redis.flushdb
     FileUtils.rm_rf(tmp_dir)
   end
 

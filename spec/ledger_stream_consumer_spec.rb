@@ -73,6 +73,9 @@ RSpec.describe RedisExchange::LedgerStreamConsumer do
     summary = consumer.pending_summary
     expect(summary).to be_a(Array).or be_a(Hash)
 
+    # Ensure message is idle for at least 1ms
+    sleep 0.005
+
     # Claim idle (set tiny idle to allow immediate claim)
     claimed = consumer.claim_idle(min_idle_ms: 1, count: 10)
     expect(claimed).to be_a(Array)
