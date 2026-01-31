@@ -40,4 +40,27 @@ RSpec.describe RedisExchange::Client do
     expect(asc_page1.map { |o| o[:order_id] }).to eq(%w[a1 a2])
   end
 
+  it 'supports auto_scale option to return decimal values' do
+    # Price 100.50 (scale 100) -> 10050
+    # Quantity 1.23456789 (scale 100_000_000) -> 123456789
+
+    exchange.set_balance(user_id: 'bob', asset: 'BTC', available: 200_000_000)
+
+    exchange.place_limit_order(
+      symbol: symbol,
+      side: 'SELL',
+      order_id: 'auto_scale_test',
+      user_id: 'bob',
+      price: 10050,
+      quantity: 123456789
+    )
+
+    orders = exchange.active_orders(user_id: 'bob', symbol: symbol, auto_scale: true)
+    order = orders.first
+
+    expect(order[:price]).to eq(100.5)
+    expect(order[:quantity]).to eq(1.23456789)
+    expect(order[:remaining]).to eq(1.23456789)
+  end
+
 end

@@ -647,8 +647,9 @@ module RedisExchange
     # @param page [Integer] 从 1 开始的页码
     # @param per_page [Integer] 每页条数，默认 50
     # @param direction [Symbol] :asc 或 :desc（根据序列顺序）
+    # @param auto_scale [Boolean] if true, unscales price/quantity using market config
     # @return [Array<Hash>] 订单快照数组
-    def active_orders(user_id:, symbol:, page: 1, per_page: 50, direction: :desc)
+    def active_orders(user_id:, symbol:, page: 1, per_page: 50, direction: :desc, auto_scale: false)
       page = page.to_i
       per_page = per_page.to_i
       page = 1 if page <= 0
@@ -662,7 +663,21 @@ module RedisExchange
       ids = Array(@redis.public_send(range_method, index_key, start, stop))
       return [] if ids.empty?
 
-      ids.map { |id| order(id) }.select { |o| !o.empty? && o[:remaining].positive? && (o[:status] == RedisExchange::ORDER_STATUS_OPEN || o[:status] == RedisExchange::ORDER_STATUS_PARTIALLY_FILLED) }
+      orders = ids.map { |id| order(id) }.select { |o| !o.empty? && o[:remaining].positive? && (o[:status] == RedisExchange::ORDER_STATUS_OPEN || o[:status] == RedisExchange::ORDER_STATUS_PARTIALLY_FILLED) }
+
+      if auto_scale && !orders.empty?
+        cfg = market_config(symbol)
+        p_scale = (cfg[:price_scale] || 1).to_d
+        q_scale = (cfg[:quantity_scale] || 1).to_d
+
+        orders.each do |o|
+          o[:price] = o[:price] / p_scale
+          o[:quantity] = o[:quantity] / q_scale
+          o[:remaining] = o[:remaining] / q_scale
+        end
+      end
+
+      orders
     end
 
     # Fetch all active orders for a market (scanning the order book).
