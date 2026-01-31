@@ -389,7 +389,7 @@ module RedisExchange
 
     # Cancel a resting order and release any reserved balances.
     # Returns a status hash mirroring Lua responses.
-    def cancel_order(order_id)
+    def cancel_order(id=nil, order_id: nil)
       # We need symbol to determine seq key.
       # However, cancel_order.lua currently only takes order_key as KEYS[1].
       # To provide seq key as KEYS[2], we need to know the symbol beforehand.
@@ -397,7 +397,8 @@ module RedisExchange
       # Option 1: Look up symbol from order hash first (requires extra RTT).
       # Option 2: Change Lua script to accept symbol as ARGV and construct seq key? No, dynamic keys are bad for cluster.
       # But seq key is {seq:{symbol}}, so we need symbol in KEYS for cluster compatibility.
-      
+      order_id ||= id
+      raise ArgumentError, 'order_id or id must be provided' unless order_id
       # Let's read the order first to get the symbol.
       # This adds a round trip, but ensures correctness for cluster/key slots.
       symbol = @redis.hget("order:#{order_id}", "symbol")
