@@ -59,10 +59,16 @@ local function as_number(value)
   return tonumber(value) or 0
 end
 
+-- Format number as integer string to avoid scientific notation (e.g. "1e+15")
+-- which causes "ERR value is not an integer" in HINCRBY.
+local function format_int(n)
+  return string.format("%.0f", n)
+end
+
 -- Perform HINCRBY only when the delta is non-zero to avoid redundant writes.
 local function hincrby(key, field, delta)
   if delta ~= 0 then
-    return redis.call('HINCRBY', key, field, delta)
+    return redis.call('HINCRBY', key, field, format_int(delta))
   end
   return tonumber(redis.call('HGET', key, field)) or 0
 end
@@ -390,7 +396,7 @@ local function add_fee(asset, amount)
   if amount <= 0 then
     return
   end
-  redis.call('HINCRBY', 'fees:' .. asset, 'total', amount)
+  redis.call('HINCRBY', 'fees:' .. asset, 'total', format_int(amount))
 end
 
 -- Load an order hash into a Lua table for easier access.
@@ -622,7 +628,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
         op_sub_locked(maker_user_id, base_asset, trade_qty_balance_maker, 'MAKER_RELEASE', timestamp,
           'MAKER_RELEASE:' .. market_seq .. '_' .. trade_seq .. ':' .. maker_order_id)
         if redis.call('HEXISTS', maker_order_key, 'reserved_base') == 1 then
-          redis.call('HINCRBY', maker_order_key, 'reserved_base', -trade_qty_balance_maker)
+          redis.call('HINCRBY', maker_order_key, 'reserved_base', format_int(-trade_qty_balance_maker))
         end
 
         op_add(maker_user_id, quote_asset, credit_balance_maker, 'MAKER_RECEIVE', timestamp,
@@ -690,7 +696,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       op_sub_locked(maker_user_id, quote_asset, debit_balance_maker, 'MAKER_RELEASE', timestamp,
         'MAKER_RELEASE:' .. market_seq .. '_' .. trade_seq .. ':' .. maker_order_id)
       if redis.call('HEXISTS', maker_order_key, 'reserved_quote') == 1 then
-        redis.call('HINCRBY', maker_order_key, 'reserved_quote', -debit_balance_maker)
+        redis.call('HINCRBY', maker_order_key, 'reserved_quote', format_int(-debit_balance_maker))
       end
 
       op_add(maker_user_id, base_asset, trade_qty_balance_maker, 'MAKER_RECEIVE', timestamp,
@@ -704,7 +710,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
     redis.call('HSET', maker_order_key, 'remaining', maker_remaining)
 
     -- Update volume first before any cleanup
-    local new_maker_vol = redis.call('HINCRBY', opposite_volume_key, price_member, -trade_qty)
+    local new_maker_vol = redis.call('HINCRBY', opposite_volume_key, price_member, format_int(-trade_qty))
     publish_depth_update(symbol, (is_buy and 'SELL' or 'BUY'), price_member, -trade_qty, new_maker_vol, timestamp)
 
     if maker_remaining == 0 then
@@ -787,11 +793,11 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       'sell_order_id', is_buy and maker_order_id or order_id,
       'sell_user_id', is_buy and maker_user_id or user_id,
       'taker_side', is_buy and 'BUY' or 'SELL',
-      'price', tostring(trade_price),
-      'quantity', tostring(trade_qty),
-      'quote', tostring(trade_quote),
-      'taker_fee', tostring(taker_fee),
-      'maker_fee', tostring(maker_fee),
+      'price', format_int(trade_price),
+      'quantity', format_int(trade_qty),
+      'quote', format_int(trade_quote),
+      'taker_fee', format_int(taker_fee),
+      'maker_fee', format_int(maker_fee),
       'symbol', symbol,
       'ts', tostring(timestamp)
     )
@@ -853,7 +859,7 @@ else
         end
       end
 
-      local price_member = tostring(price_limit)
+      local price_member = format_int(price_limit)
       local queue_key = 'queue:' .. symbol .. ':' .. side .. ':' .. price_member
       redis.call('RPUSH', queue_key, order_id)
 
@@ -863,7 +869,7 @@ else
         redis.call('ZADD', own_book_key, price_limit, price_member)
       end
 
-      redis.call('HINCRBY', own_volume_key, price_member, remaining)
+      redis.call('HINCRBY', own_volume_key, price_member, format_int(remaining))
       publish_depth_update(symbol, side, price_member, remaining, redis.call('HGET', own_volume_key, price_member),
         timestamp)
     end
@@ -876,11 +882,11 @@ redis.call('HMSET', order_key,
   'symbol', symbol,
   'side', side,
   'type', order_type,
-  'price', tostring(price_limit),
-  'quantity', tostring(quantity),
-  'remaining', tostring(remaining),
-  'reserved_base', tostring(reserved_base_for_order),
-  'reserved_quote', tostring(reserved_quote_for_order),
+  'price', format_int(price_limit),
+  'quantity', format_int(quantity),
+  'remaining', format_int(remaining),
+  'reserved_base', format_int(reserved_base_for_order),
+  'reserved_quote', format_int(reserved_quote_for_order),
   'status', order_status,
   'created_at', tostring(timestamp),
   'sequence', tostring(market_seq)
@@ -903,9 +909,9 @@ redis.call('XADD', orders_key, 'MAXLEN', '~', orders_maxlen, '*',
   'side', side,
   'type', order_type,
   'status', order_status,
-  'price', tostring(price_limit),
-  'quantity', tostring(quantity),
-  'remaining', tostring(remaining),
+  'price', format_int(price_limit),
+  'quantity', format_int(quantity),
+  'remaining', format_int(remaining),
   'ts', tostring(timestamp),
   'sequence', tostring(market_seq)
 )
