@@ -36,6 +36,15 @@ RSpec.describe RedisExchange::Client do
     expect(ids).to include('m-full')
     expect(ids).to include('m-partial')
     expect(ids).to include('taker-x-1')
+
+    # Check executed_quote for taker order
+    taker_event = recent_orders.find { |(_, f)| (f.is_a?(Hash) ? f : Hash[*f])['order_id'] == 'taker-x-1' }
+    fields = taker_event[1].is_a?(Hash) ? taker_event[1] : Hash[*taker_event[1]]
+    
+    # Taker quantity 150_000_000 (1.5 BTC) matched at 3,000,000 (30,000.00 USDT)
+    # Executed Quote = 3,000,000 * 150,000,000 / 100,000,000 = 4,500,000
+    expect(fields).to have_key('executed_quote')
+    expect(fields['executed_quote']).to eq('4500000')
   end
 
   end

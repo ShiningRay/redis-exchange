@@ -199,6 +199,7 @@ orders:{symbol}
 - `price`: Limit price (scaled).
 - `quantity`: Original quantity (scaled).
 - `remaining`: Remaining quantity (scaled).
+- `executed_quote`: Total executed quote amount (scaled).
 - `ts`: Timestamp in ms.
 - `sequence`: Market-wide sequence number.
 

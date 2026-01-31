@@ -384,6 +384,7 @@ end
 local trades = {}
 local remaining = quantity
 local executed_quantity = 0
+local executed_quote = 0
 local taker_quote_spent = 0
 local taker_quote_received = 0
 local taker_base_received = 0
@@ -706,6 +707,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
     maker_remaining = maker_remaining - trade_qty
     remaining = remaining - trade_qty
     executed_quantity = executed_quantity + trade_qty
+    executed_quote = executed_quote + trade_quote
 
     redis.call('HSET', maker_order_key, 'remaining', maker_remaining)
 
@@ -912,6 +914,7 @@ redis.call('XADD', orders_key, 'MAXLEN', '~', orders_maxlen, '*',
   'price', format_int(price_limit),
   'quantity', format_int(quantity),
   'remaining', format_int(remaining),
+  'executed_quote', format_int(executed_quote),
   'ts', tostring(timestamp),
   'sequence', tostring(market_seq)
 )
