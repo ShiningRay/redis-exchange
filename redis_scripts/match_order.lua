@@ -710,6 +710,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
     executed_quote = executed_quote + trade_quote
 
     redis.call('HSET', maker_order_key, 'remaining', maker_remaining)
+    local maker_executed_quote = redis.call('HINCRBY', maker_order_key, 'executed_quote', format_int(trade_quote))
 
     -- Update volume first before any cleanup
     local new_maker_vol = redis.call('HINCRBY', opposite_volume_key, price_member, format_int(-trade_qty))
@@ -745,6 +746,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
         'price', price_member,
         'quantity', redis.call('HGET', maker_order_key, 'quantity') or '0',
         'remaining', '0',
+        'executed_quote', format_int(maker_executed_quote),
         'ts', tostring(timestamp),
         'sequence', tostring(redis.call('HGET', maker_order_key, 'sequence') or '')
       )
@@ -763,6 +765,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
         'price', price_member,
         'quantity', redis.call('HGET', maker_order_key, 'quantity') or '0',
         'remaining', tostring(maker_remaining),
+        'executed_quote', format_int(maker_executed_quote),
         'ts', tostring(timestamp),
         'sequence', tostring(redis.call('HGET', maker_order_key, 'sequence') or '')
       )
@@ -889,6 +892,7 @@ redis.call('HMSET', order_key,
   'remaining', format_int(remaining),
   'reserved_base', format_int(reserved_base_for_order),
   'reserved_quote', format_int(reserved_quote_for_order),
+  'executed_quote', format_int(executed_quote),
   'status', order_status,
   'created_at', tostring(timestamp),
   'sequence', tostring(market_seq)
