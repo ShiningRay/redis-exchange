@@ -91,9 +91,9 @@ local function append_ledger(user_id, asset, action, amount, new_available, new_
     'user_id', user_id,
     'asset', asset,
     'action', action,
-    'amount', tostring(amount),
-    'new_available', tostring(new_available),
-    'new_reserved', tostring(new_reserved),
+    'amount', format_int(amount),
+    'new_available', format_int(new_available),
+    'new_reserved', format_int(new_reserved),
     'reason', reason or 'MATCH',
     'ts', tostring(now_ts),
     'sequence', tostring(seq),
@@ -152,9 +152,9 @@ local function publish_depth_update(symbol, side, price, delta, final_volume, ts
   redis.call('XADD', 'depth:' .. symbol, 'MAXLEN', '~', 100000, '*',
     'e', 'u',
     's', side,
-    'p', tostring(price),
-    'd', tostring(delta),
-    'v', tostring(final_volume),
+    'p', format_int(price),
+    'd', format_int(delta),
+    'v', format_int(final_volume),
     'ts', tostring(ts),
     'seq', tostring(seq)
   )
@@ -308,7 +308,7 @@ end
 local function overflow_error(context, a, b)
   return cjson.encode({
     error = 'PRECISION_OVERFLOW',
-    details = context .. ': ' .. tostring(a) .. ' * ' .. tostring(b)
+    details = context .. ': ' .. format_int(a) .. ' * ' .. format_int(b)
   })
 end
 
@@ -455,9 +455,9 @@ local function update_ticker_state(trade_list)
   if #trade_list > 0 then
     local last_trade = trade_list[#trade_list]
     redis.call('HSET', ticker_key,
-      'last_price', tostring(last_trade.price),
-      'last_quantity', tostring(last_trade.quantity),
-      'last_quote', tostring(last_trade.quote),
+      'last_price', format_int(last_trade.price),
+      'last_quantity', format_int(last_trade.quantity),
+      'last_quote', format_int(last_trade.quote),
       'last_timestamp', tostring(last_trade.timestamp)
     )
   end
@@ -468,7 +468,7 @@ local function update_ticker_state(trade_list)
     local bid_volume = redis.call('HGET', volume_buy_key, bid_price) or '0'
     redis.call('HSET', ticker_key,
       'best_bid_price', bid_price,
-      'best_bid_volume', tostring(bid_volume)
+      'best_bid_volume', format_int(bid_volume)
     )
   else
     redis.call('HSET', ticker_key,
@@ -483,7 +483,7 @@ local function update_ticker_state(trade_list)
     local ask_volume = redis.call('HGET', volume_sell_key, ask_price) or '0'
     redis.call('HSET', ticker_key,
       'best_ask_price', ask_price,
-      'best_ask_volume', tostring(ask_volume)
+      'best_ask_volume', format_int(ask_volume)
     )
   else
     redis.call('HSET', ticker_key,
@@ -712,10 +712,12 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
 
     redis.call('HSET', maker_order_key, 'remaining', maker_remaining)
     local maker_executed_quote = redis.call('HINCRBY', maker_order_key, 'executed_quote', format_int(trade_quote))
+    local maker_trade_count = redis.call('HINCRBY', maker_order_key, 'trade_count', 1)
 
     -- Update volume first before any cleanup
     local new_maker_vol = redis.call('HINCRBY', opposite_volume_key, price_member, format_int(-trade_qty))
-    publish_depth_update(symbol, (is_buy and 'SELL' or 'BUY'), price_member, -trade_qty, new_maker_vol, timestamp, market_seq)
+    publish_depth_update(symbol, (is_buy and 'SELL' or 'BUY'), price_member, -trade_qty, new_maker_vol, timestamp,
+      market_seq)
 
     if maker_remaining == 0 then
       -- Cleanup any residual reserved amounts (dust from rounding)
@@ -748,6 +750,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
         'quantity', redis.call('HGET', maker_order_key, 'quantity') or '0',
         'remaining', '0',
         'executed_quote', format_int(maker_executed_quote),
+        'trade_count', format_int(maker_trade_count),
         'ts', tostring(timestamp),
         'sequence', tostring(redis.call('HGET', maker_order_key, 'sequence') or '')
       )
@@ -765,8 +768,9 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
         'status', 'PARTIALLY_FILLED',
         'price', price_member,
         'quantity', redis.call('HGET', maker_order_key, 'quantity') or '0',
-        'remaining', tostring(maker_remaining),
+        'remaining', format_int(maker_remaining),
         'executed_quote', format_int(maker_executed_quote),
+        'trade_count', format_int(maker_trade_count),
         'ts', tostring(timestamp),
         'sequence', tostring(redis.call('HGET', maker_order_key, 'sequence') or '')
       )
@@ -896,6 +900,7 @@ redis.call('HMSET', order_key,
   'reserved_base', format_int(reserved_base_for_order),
   'reserved_quote', format_int(reserved_quote_for_order),
   'executed_quote', format_int(executed_quote),
+  'trade_count', format_int(#trades),
   'status', order_status,
   'created_at', tostring(timestamp),
   'sequence', tostring(market_seq)
@@ -922,6 +927,7 @@ redis.call('XADD', orders_key, 'MAXLEN', '~', orders_maxlen, '*',
   'quantity', format_int(quantity),
   'remaining', format_int(remaining),
   'executed_quote', format_int(executed_quote),
+  'trade_count', format_int(#trades),
   'ts', tostring(timestamp),
   'sequence', tostring(market_seq)
 )

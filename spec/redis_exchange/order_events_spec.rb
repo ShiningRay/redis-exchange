@@ -42,6 +42,7 @@ RSpec.describe RedisExchange::Client do
     maker_full_event = recent_orders.find { |(_, f)| (f.is_a?(Hash) ? f : Hash[*f])['order_id'] == 'm-full' }
     m_fields = maker_full_event[1].is_a?(Hash) ? maker_full_event[1] : Hash[*maker_full_event[1]]
     expect(m_fields['executed_quote']).to eq('3000000')
+    expect(m_fields['trade_count']).to eq('1')
 
     # Check executed_quote for maker partial fill
     # m-partial: remaining 0.5 BTC filled (1.5 total taker - 1.0 from m-full)
@@ -49,6 +50,7 @@ RSpec.describe RedisExchange::Client do
     maker_partial_event = recent_orders.find { |(_, f)| (f.is_a?(Hash) ? f : Hash[*f])['order_id'] == 'm-partial' }
     mp_fields = maker_partial_event[1].is_a?(Hash) ? maker_partial_event[1] : Hash[*maker_partial_event[1]]
     expect(mp_fields['executed_quote']).to eq('1500000')
+    expect(mp_fields['trade_count']).to eq('1')
 
     # Check executed_quote for taker order
     taker_event = recent_orders.find { |(_, f)| (f.is_a?(Hash) ? f : Hash[*f])['order_id'] == 'taker-x-1' }
@@ -58,6 +60,7 @@ RSpec.describe RedisExchange::Client do
     # Executed Quote = 3,000,000 * 150,000,000 / 100,000,000 = 4,500,000
     expect(fields).to have_key('executed_quote')
     expect(fields['executed_quote']).to eq('4500000')
+    expect(fields['trade_count']).to eq('2')
   end
 
   end

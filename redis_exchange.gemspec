@@ -19,7 +19,10 @@ Gem::Specification.new do |spec|
   spec.files = Dir.chdir(File.expand_path(__dir__)) do
     Dir['lib/**/*.rb'] + Dir['redis_scripts/*.lua'] + [
       'README.md',
-      'docs/architecture.md'
+      'docs/architecture.md',
+      'script/maintenance/adjust_precision.rb',
+      'script/export_snapshot.rb',
+      'script/export_rdb_data.sh'
     ]
   end
   spec.bindir        = 'exe'

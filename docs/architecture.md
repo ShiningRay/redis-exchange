@@ -201,6 +201,7 @@ orders:{symbol}
 - `quantity`: Original quantity (scaled).
 - `remaining`: Remaining quantity (scaled).
 - `executed_quote`: Total executed quote amount (scaled).
+- `trade_count`: Number of trades executed for this order.
 - `ts`: Timestamp in ms.
 - `sequence`: Market-wide sequence number.
 
