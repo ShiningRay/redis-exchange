@@ -228,7 +228,7 @@ module RedisExchange
     end
 
     def market_exist?(symbol)
-      @redis.exists("market:#{symbol}")
+      @redis.exists?("market:#{symbol}")
     end
 
     def set_market_status(symbol:, status:)
