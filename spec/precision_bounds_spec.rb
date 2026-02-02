@@ -156,6 +156,7 @@ RSpec.describe 'Numeric precision bounds', :precision_bounds do
     # The error from Lua is: overflow_error(required_quote_market, quote_factor)
     # required_quote_market = 2
     # quote_factor = 9e15
-    expect(result[:details]).to match(/required_quote \* quote_factor: 2(\.0)? \* 9\.?0*e\+?15/)
+    # Since we updated Lua to use format_int, it now returns full integer string, not scientific notation
+    expect(result[:details]).to match(/required_quote \* quote_factor: 2 \* 9000000000000000/)
   end
 end
