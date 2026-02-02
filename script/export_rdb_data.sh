@@ -79,6 +79,15 @@ elif [ "$USE_REMOTE" = true ]; then
 
   if [ -n "$REDIS_URL" ]; then
     echo "Dumping data from Redis URL to ${RDB_FILE}..."
+    
+    # Check if URL contains password but empty username (e.g. redis://:password@host...)
+    # This causes redis-cli to fail with "invalid uri scheme" or similar errors depending on version
+    # If detected, inject 'default' as username
+    if [[ "$REDIS_URL" =~ redis://:[^@]+@ ]]; then
+      echo "  Detected empty username with password in REDIS_URL. Injecting 'default' username..."
+      REDIS_URL="${REDIS_URL/redis:\/\/:/redis:\/\/default:}"
+    fi
+
     CMD="redis-cli -u $REDIS_URL --rdb $RDB_FILE"
   else
     echo "Dumping data from ${REDIS_HOST}:${REDIS_PORT} to ${RDB_FILE}..."
