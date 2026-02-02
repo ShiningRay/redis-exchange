@@ -94,6 +94,15 @@ RSpec.describe 'Atomic Order Matching', :atomic_match do
       expect(response[:status]).to eq('PARTIALLY_FILLED')
       expect(response[:executed_quantity]).to eq(5)
       expect(response[:remaining_quantity]).to eq(5)
+
+      # 2.1 Check Trade Stream
+      trades = redis.xrange("trades:#{symbol}", '-', '+')
+      expect(trades.size).to eq(1)
+      
+      _, fields = trades.first
+      trade = fields.is_a?(Hash) ? fields : Hash[*fields]
+      expect(trade).to have_key('sequence')
+      expect(trade['sequence'].to_i).to be > 0
       
       # 3. Verify Balances (The Acid Test)
       

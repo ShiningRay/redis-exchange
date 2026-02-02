@@ -180,6 +180,7 @@ trades:{symbol}
 - `taker_fee`: Fee charged to taker (scaled integer).
 - `maker_fee`: Fee charged to maker (scaled integer).
 - `ts`: Unix timestamp in milliseconds.
+- `trade_seq`: Global trade sequence number (per-market).
 
 ### Orders Stream (Private Events)
 

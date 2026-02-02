@@ -148,14 +148,15 @@ local function op_sub_locked(user_id, asset, amount, reason, ts, biz_id)
   append_ledger(user_id, asset, 'SUB_LOCKED', amount, new_avail, new_res, reason, ts, biz_id)
 end
 
-local function publish_depth_update(symbol, side, price, delta, final_volume, ts)
+local function publish_depth_update(symbol, side, price, delta, final_volume, ts, seq)
   redis.call('XADD', 'depth:' .. symbol, 'MAXLEN', '~', 100000, '*',
     'e', 'u',
     's', side,
     'p', tostring(price),
     'd', tostring(delta),
     'v', tostring(final_volume),
-    'ts', tostring(ts)
+    'ts', tostring(ts),
+    'seq', tostring(seq)
   )
 end
 
@@ -714,7 +715,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
 
     -- Update volume first before any cleanup
     local new_maker_vol = redis.call('HINCRBY', opposite_volume_key, price_member, format_int(-trade_qty))
-    publish_depth_update(symbol, (is_buy and 'SELL' or 'BUY'), price_member, -trade_qty, new_maker_vol, timestamp)
+    publish_depth_update(symbol, (is_buy and 'SELL' or 'BUY'), price_member, -trade_qty, new_maker_vol, timestamp, market_seq)
 
     if maker_remaining == 0 then
       -- Cleanup any residual reserved amounts (dust from rounding)
@@ -783,7 +784,8 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       quote = trade_quote,
       taker_fee = taker_fee,
       maker_fee = maker_fee,
-      timestamp = timestamp
+      timestamp = timestamp,
+      trade_seq = trade_seq
     }
     append_trade(trades, trade_payload)
     -- Stream entry with near-length trimming to avoid unbounded growth
@@ -804,7 +806,8 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       'taker_fee', format_int(taker_fee),
       'maker_fee', format_int(maker_fee),
       'symbol', symbol,
-      'ts', tostring(timestamp)
+      'ts', tostring(timestamp),
+      'sequence', tostring(trade_seq)
     )
   until true
 end
@@ -876,7 +879,7 @@ else
 
       redis.call('HINCRBY', own_volume_key, price_member, format_int(remaining))
       publish_depth_update(symbol, side, price_member, remaining, redis.call('HGET', own_volume_key, price_member),
-        timestamp)
+        timestamp, market_seq)
     end
   end
 end
