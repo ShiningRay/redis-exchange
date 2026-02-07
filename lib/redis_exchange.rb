@@ -856,7 +856,7 @@ module RedisExchange
     def order_book(symbol, limit: nil)
       limit = limit&.to_i
       {
-        bids: fetch_book_side(symbol, RedisExchange::SIDE_BUY, descending: true, limit: limit),
+        bids: fetch_book_side(symbol, RedisExchange::SIDE_BUY, descending: false, limit: limit),
         asks: fetch_book_side(symbol, RedisExchange::SIDE_SELL, descending: false, limit: limit)
       }
     end
