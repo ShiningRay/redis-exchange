@@ -856,7 +856,7 @@ module RedisExchange
     def order_book(symbol, limit: nil)
       limit = limit&.to_i
       {
-        bids: fetch_book_side(symbol, RedisExchange::SIDE_BUY, descending: false, limit: limit),
+        bids: fetch_book_side(symbol, RedisExchange::SIDE_BUY, descending: true, limit: limit),
         asks: fetch_book_side(symbol, RedisExchange::SIDE_SELL, descending: false, limit: limit)
       }
     end
@@ -1153,7 +1153,17 @@ module RedisExchange
       book_key = "book:#{symbol}:#{side}"
       volume_key = "volume:#{symbol}:#{side}"
 
-      range_method = descending ? :zrevrange : :zrange
+      # For BUY side, scores are negative (e.g. Price 100 -> Score -100).
+      # - descending=true (Price Descending 100->90) => Score Ascending (-100->-90) => zrange
+      # - descending=false (Price Ascending 90->100) => Score Descending (-90->-100) => zrevrange
+      # For SELL side, scores are positive.
+      # - descending=true (Price Descending 100->90) => Score Descending (100->90) => zrevrange
+      # - descending=false (Price Ascending 90->100) => Score Ascending (90->100) => zrange
+      
+      range_method_flag = descending
+      range_method_flag = !range_method_flag if side == RedisExchange::SIDE_BUY
+      range_method = range_method_flag ? :zrevrange : :zrange
+
       stop = limit ? limit - 1 : -1
       raw = @redis.public_send(range_method, book_key, 0, stop, with_scores: true)
       pairs = if raw.is_a?(Array) && raw.first.is_a?(Array)
