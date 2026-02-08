@@ -308,11 +308,15 @@ If this compatibility is violated, the engine should reject seeding or order pla
 
 ## Fees Deduction Policy
 
-- Fees (both taker and maker) are deducted only after a trade is executed.
-- Resting limit BUY orders reserve only the nominal quote amount: `floor(price_limit * remaining / quantity_scale)`; fees are not reserved.
-- Resting limit SELL orders reserve only the base quantity.
-- Market BUY orders may temporarily debit an estimated maximum quote (including fees) to ensure atomic matching, but any unused portion is refunded immediately within the same call.
-- Order cancellations release only the nominal reserved amounts (no fees), returning them from `reserved` back to `available`.
+- **Receive-Side Deduction**: Fees are always deducted from the asset received by the user.
+  - **Buyer (Taker or Maker)**: Receives Base Asset (e.g., BTC). Fee is deducted from the received Base Asset quantity.
+  - **Seller (Taker or Maker)**: Receives Quote Asset (e.g., USDT). Fee is deducted from the received Quote Asset amount.
+- **No Fee Reservation**:
+  - Resting Limit BUY orders reserve only the nominal quote amount (`price * quantity`); no extra buffer for fees is reserved because fees will be paid in Base Asset upon execution.
+  - Resting Limit SELL orders reserve only the base quantity.
+- **Market Orders**:
+  - Market BUY orders check for sufficient Quote balance to cover the trade notional. Since fees are paid in Base, no Quote fee buffer is needed.
+- **Cancellations**: Release the nominal reserved amounts back to `available`.
 
 ## Invariants
 

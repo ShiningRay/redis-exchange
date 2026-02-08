@@ -220,14 +220,34 @@ def run_balance_conservation_audit(redis, exchange, symbol, initial_balances, as
   # Get quote asset from market config
   market_config = redis.hgetall("market:#{symbol}")
   quote_asset = market_config['quote_asset'] || 'USDT'
+  base_asset = market_config['base_asset'] || 'BTC'
   
   trade_entries.each do |entry_id, fields|
     taker_fee = fields['taker_fee'].to_i
     maker_fee = fields['maker_fee'].to_i
-    total_fee = taker_fee + maker_fee
     
-    fees_collected[quote_asset] ||= 0
-    fees_collected[quote_asset] += total_fee
+    # Check taker side to determine fee asset
+    # Taker BUY: Pays fee in Base Asset (e.g. BTC)
+    # Taker SELL: Pays fee in Quote Asset (e.g. USDT)
+    taker_side = fields['taker_side']
+    
+    if taker_side == 'BUY'
+      # Taker bought Base, paid fee in Base
+      fees_collected[base_asset] ||= 0
+      fees_collected[base_asset] += taker_fee
+      
+      # Maker was SELL, received Quote, paid fee in Quote
+      fees_collected[quote_asset] ||= 0
+      fees_collected[quote_asset] += maker_fee
+    else # Taker SELL
+      # Taker sold Base, received Quote, paid fee in Quote
+      fees_collected[quote_asset] ||= 0
+      fees_collected[quote_asset] += taker_fee
+      
+      # Maker was BUY, received Base, paid fee in Base
+      fees_collected[base_asset] ||= 0
+      fees_collected[base_asset] += maker_fee
+    end
   end
   
   # 3. Collect ONLY external deposits and withdrawals from ledger (ADD/SUB only)

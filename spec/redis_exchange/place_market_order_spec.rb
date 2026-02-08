@@ -35,16 +35,17 @@ RSpec.describe RedisExchange::Client do
         expect(result[:executed_quantity]).to eq(50_000_000) # 0.500000000 BTC
 
         alice_balances = redis.hgetall('balance:alice')
-        expect(alice_balances['BTC:available'].to_i).to eq(50_000_000) # 0.500000000 BTC
-        # USDT 可用余额精确校验：trade_quote=1_500_000, taker_fee=1_500 → debit=1_501_500 → 5_000_000-1_501_500=3_498_500
-        expect(alice_balances['USDT:available'].to_i).to eq(3_498_500) # 34985.00 USDT
+        expect(alice_balances['BTC:available'].to_i).to eq(50_000_000 - 50_000) # 0.500000000 BTC - 50_000 fee
+        # USDT 可用余额精确校验：trade_quote=1_500_000, debit=1_500_000 (fee taken from BTC)
+        # 5_000_000 - 1_500_000 = 3_500_000
+        expect(alice_balances['USDT:available'].to_i).to eq(3_500_000) # 35000.00 USDT
         expect(alice_balances['USDT:reserved'].to_i).to eq(0)
 
         bob_balances = redis.hgetall('balance:bob')
         # BTC 预留余额减少 50_000_000，剩余 50_000_000；可用余额保持 100_000_000
         expect(bob_balances['BTC:reserved'].to_i).to eq(50_000_000) # 50.00000000 BTC
         expect(bob_balances['BTC:available'].to_i).to eq(100_000_000)
-        # USDT 可用余额精确校验：maker_fee=750 → credit=1_500_000-750=1_499_250
+        # USDT 可用余额精确校验：maker_fee=750 → credit=1_500_000-750=1_499_250 (fee taken from USDT)
         expect(bob_balances['USDT:available'].to_i).to eq(1_499_250) 
 
         ticker = exchange.ticker(symbol)
@@ -124,8 +125,28 @@ RSpec.describe RedisExchange::Client do
 
         maker_after = redis.hgetall('balance:maker-buyer')
         expect(maker_after['USDT:reserved'].to_i).to eq(0)
-        expect(maker_after['BTC:available'].to_i).to eq(100_000_000)
-        expect(maker_after['USDT:available'].to_i).to eq(5_000_000 - 3_001_500)
+        # Maker receives 100_000_000 BTC. Maker fee is default 5bps.
+        # Fee = floor(100_000_000 * 5 / 10000) = 50_000
+        # Received = 100_000_000 - 50_000 = 99_950_000
+        expect(maker_after['BTC:available'].to_i).to eq(100_000_000 - 50_000)
+        # Maker received BTC, paid fee in BTC.
+        # Maker spent USDT (Quote). 
+        # Previously logic: Maker pre-reserved Quote + Maker Fee?
+        # Let's check `place_limit_order` logic. If `place_limit_order` still reserves Quote + Fee, but execution only consumes Quote, we have a mismatch.
+        # However, here we are checking *available* after match.
+        # Initial: 5_000_000. 
+        # Limit Order: Price 3_000_000 * Qty 1 = 3_000_000 Notional.
+        # Did it reserve fee? The setup says `expect(maker_before['USDT:reserved'].to_i).to eq(3_001_500)`. 
+        # This implies `place_limit_order` reserves 1_500 fee (5bps).
+        # Match happens: 
+        # Maker is BUY. Taker is SELL.
+        # Maker (BUY) pays Quote. 
+        # Under new logic, Maker (BUY) receives Base (BTC) and pays Fee in Base.
+        # So Maker should ONLY pay Quote for the trade amount (3_000_000).
+        # The extra 1_500 reserved for fee should be returned to available?
+        # Yes.
+        # 5_000_000 - 3_000_000 (spent) = 2_000_000.
+        expect(maker_after['USDT:available'].to_i).to eq(5_000_000 - 3_000_000)
 
         expect(exchange.order('maker-bid-1')).to eq({})
       end
@@ -175,17 +196,17 @@ RSpec.describe RedisExchange::Client do
         expect(exchange.order('market-full-maker-1')).to eq({})
         expect(exchange.order('market-full-taker-1')).to eq({})
 
-        # 买方余额：获得 1.00000000 BTC；USDT 可用扣除名义金额与吃单手续费
+        # 买方余额：获得 1.00000000 BTC - taker_fee；USDT 可用扣除名义金额
         # trade_quote = floor(3_000_000 * 100_000_000 / 100_000_000) = 3_000_000
-        # taker_fee(10bps) = floor(3_000_000 * 10 / 10000) = 3_000
-        # debit = 3_000_000 + 3_000 = 3_003_000
+        # taker_fee(10bps) on BTC = floor(100_000_000 * 10 / 10000) = 100_000
+        # debit = 3_000_000
         alice_balances = redis.hgetall('balance:alice')
-        expect(alice_balances['BTC:available'].to_i).to eq(100_000_000)
+        expect(alice_balances['BTC:available'].to_i).to eq(100_000_000 - 100_000)
         expect(alice_balances['USDT:reserved'].to_i).to eq(0)
-        expect(alice_balances['USDT:available'].to_i).to eq(5_000_000 - 3_003_000)
+        expect(alice_balances['USDT:available'].to_i).to eq(5_000_000 - 3_000_000)
 
         # 卖方余额：释放全部 BTC 预留，USDT 入账（扣除 maker_fee）
-        # maker_fee(5bps) = floor(3_000_000 * 5 / 10000) = 1_500
+        # maker_fee(5bps) on USDT = floor(3_000_000 * 5 / 10000) = 1_500
         # credit = 3_000_000 - 1_500 = 2_998_500
         bob_balances = redis.hgetall('balance:bob')
         expect(bob_balances['BTC:reserved'].to_i).to eq(0)

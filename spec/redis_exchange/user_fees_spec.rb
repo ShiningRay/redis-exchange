@@ -169,16 +169,19 @@ RSpec.describe RedisExchange::Client do
         expect(result[:executed_quantity]).to eq(100_000_000)
 
         # trade_quote = 3_000_000
-        # taker_fee with user rate (4bps) = floor(3_000_000 * 4 / 10000) = 1_200
-        expect(result[:taker_fee_paid]).to eq(1_200)
+        # trade_qty = 100_000_000
+        # taker_fee with user rate (4bps) on Base Asset (BTC) = floor(100_000_000 * 4 / 10000) = 40_000
+        expect(result[:taker_fee_paid]).to eq(40_000)
 
-        # maker fee uses market default (5bps) = floor(3_000_000 * 5 / 10000) = 1_500
+        # maker fee uses market default (5bps) on Quote Asset (USDT) = floor(3_000_000 * 5 / 10000) = 1_500
         expect(result[:maker_fee_charged]).to eq(1_500)
 
-        # Check taker balance: debited trade_quote + user_taker_fee
+        # Check taker balance: 
+        # - USDT (Quote): Spent exactly trade_quote (3_000_000). No fee deduction from Quote.
+        # - BTC (Base): Received trade_qty (100_000_000) - taker_fee (40_000) = 99_960_000
         balances = redis.hgetall('balance:vip_taker')
-        expect(balances['USDT:available'].to_i).to eq(10_000_000 - 3_001_200)
-        expect(balances['BTC:available'].to_i).to eq(100_000_000)
+        expect(balances['USDT:available'].to_i).to eq(10_000_000 - 3_000_000)
+        expect(balances['BTC:available'].to_i).to eq(100_000_000 - 40_000)
       end
     end
 
@@ -214,15 +217,22 @@ RSpec.describe RedisExchange::Client do
 
         expect(result[:status]).to eq('FILLED')
 
-        # taker fee uses market default (10bps) = floor(3_000_000 * 10 / 10000) = 3_000
-        expect(result[:taker_fee_paid]).to eq(3_000)
+        # taker (BUY) pays fee in Base Asset (BTC)
+        # taker fee uses market default (10bps) = floor(100_000_000 * 10 / 10000) = 100_000
+        expect(result[:taker_fee_paid]).to eq(100_000)
 
+        # maker (SELL) pays fee in Quote Asset (USDT)
         # maker fee with user rate (1bps) = floor(3_000_000 * 1 / 10000) = 300
         expect(result[:maker_fee_charged]).to eq(300)
 
         # Check VIP maker balance: credited trade_quote - user_maker_fee
         balances = redis.hgetall('balance:vip_maker')
+        # Maker sold 100_000_000 BTC, so reserved should drop by that amount.
+        # Initial available 200_000_000. Sell order locks 200_000_000. 
+        # Matched 100_000_000. Remaining reserved 100_000_000.
         expect(balances['BTC:reserved'].to_i).to eq(100_000_000)
+        
+        # Maker received 3_000_000 USDT minus 300 fee
         expect(balances['USDT:available'].to_i).to eq(3_000_000 - 300)
       end
     end
@@ -253,10 +263,10 @@ RSpec.describe RedisExchange::Client do
 
         expect(result[:status]).to eq('FILLED')
 
-        # taker_fee market default (10bps) = floor(3_000_000 * 10 / 10000) = 3_000
-        expect(result[:taker_fee_paid]).to eq(3_000)
+        # taker_fee market default (10bps) on Base Asset (BTC) = floor(100_000_000 * 10 / 10000) = 100_000
+        expect(result[:taker_fee_paid]).to eq(100_000)
 
-        # maker_fee market default (5bps) = floor(3_000_000 * 5 / 10000) = 1_500
+        # maker_fee market default (5bps) on Quote Asset (USDT) = floor(3_000_000 * 5 / 10000) = 1_500
         expect(result[:maker_fee_charged]).to eq(1_500)
       end
     end
@@ -297,7 +307,10 @@ RSpec.describe RedisExchange::Client do
 
         # Check taker balance: debited only trade_quote, no fee
         balances = redis.hgetall('balance:zero_fee_user')
+        # Taker spent exactly trade_quote (3_000_000). 
         expect(balances['USDT:available'].to_i).to eq(10_000_000 - 3_000_000)
+        # Taker received full trade_qty (100_000_000) as fee is 0
+        expect(balances['BTC:available'].to_i).to eq(100_000_000)
       end
     end
   end

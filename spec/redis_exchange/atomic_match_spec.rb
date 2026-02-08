@@ -103,6 +103,8 @@ RSpec.describe 'Atomic Order Matching', :atomic_match do
       trade = fields.is_a?(Hash) ? fields : Hash[*fields]
       expect(trade).to have_key('sequence')
       expect(trade['sequence'].to_i).to be > 0
+      expect(trade['price'].to_f).to eq(100.0)
+      expect(trade['quantity'].to_f).to eq(5.0)
       
       # 3. Verify Balances (The Acid Test)
       
@@ -111,6 +113,8 @@ RSpec.describe 'Atomic Order Matching', :atomic_match do
       # - Logic: 10 BTC start - 5 sold = 5 remaining.
       alice_usdt = redis.hget("balance:#{alice_id}", 'USDT:available').to_i
       alice_btc = redis.hget("balance:#{alice_id}", 'BTC:available').to_i 
+      # Received 500 USDT, but paid maker fee (if any, default 0 here)
+      # Assuming default 0 fee from setup:
       expect(alice_usdt).to eq(500)
       expect(alice_btc).to eq(5)
       
@@ -120,6 +124,8 @@ RSpec.describe 'Atomic Order Matching', :atomic_match do
       # - Must NOT have spent any extra for the failed Charlie match.
       bob_btc = redis.hget("balance:#{bob_id}", 'BTC:available').to_i
       bob_usdt = redis.hget("balance:#{bob_id}", 'USDT:available').to_i
+      # Bought 5 BTC, but paid taker fee (if any, default 0 here)
+      # Assuming default 0 fee from setup:
       expect(bob_btc).to eq(5)
       expect(bob_usdt).to eq(200)
 

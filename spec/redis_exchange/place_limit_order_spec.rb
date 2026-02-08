@@ -59,12 +59,12 @@ RSpec.describe RedisExchange::Client do
           queue = redis.lrange('queue:BTCUSDT:BUY:3000000', 0, -1)
           expect(queue).to eq(['order-buy-1'])
 
-          # 预留金额为名义金额与 maker_fee：
+          # 预留金额仅为名义金额（不包含 maker_fee，因为 maker 是买方，收到 Base 扣 Base）
           # reserve_quote = floor(3_000_000 * 100_000_000 / 100_000_000) = 3_000_000
-          # maker_fee(5bps) = floor(3_000_000 * 5 / 10000) = 1_500
+          # maker_fee (5bps) will be deducted from received BTC, not pre-reserved in USDT.
           balances = redis.hgetall('balance:buyer')
-          expect(balances['USDT:available'].to_i).to eq(5_000_000 - 3_001_500)
-          expect(balances['USDT:reserved'].to_i).to eq(3_001_500)
+          expect(balances['USDT:available'].to_i).to eq(5_000_000 - 3_000_000)
+          expect(balances['USDT:reserved'].to_i).to eq(3_000_000)
           expect(balances.fetch('BTC:available', '0').to_i).to eq(0)
           expect(balances.fetch('BTC:reserved', '0').to_i).to eq(0)
 
@@ -109,15 +109,20 @@ RSpec.describe RedisExchange::Client do
           expect(result[:status]).to eq('PARTIALLY_FILLED')
           expect(result[:remaining_quantity]).to eq(50_000_000)
 
-          # 成交 1.0 BTC，买方获得 1.0 BTC；剩余 0.5 BTC 以 3_100_000 挂单并预留名义金额与 maker 手续费
+          # 成交 1.0 BTC，买方获得 1.0 BTC - taker_fee；剩余 0.5 BTC 以 3_100_000 挂单并预留名义金额
           balances = redis.hgetall('balance:buyer')
           # 交易报价：floor(3_000_000 * 100_000_000 / 100_000_000) = 3_000_000
-          # 买方手续费 10bps：floor(3_000_000 * 10 / 10000) = 3_000
+          # 买方作为 Taker (BUY)，支付 Base (BTC) 手续费，不额外支付 Quote
+          # taker_fee 10bps on 100_000_000 BTC = 100_000
+          # 买方获得 BTC: 100_000_000 - 100_000 = 99_900_000
+          
           # 挂单预留报价：floor(3_100_000 * 50_000_000 / 100_000_000) = 1_550_000
-          # maker_fee(5bps)：floor(1_550_000 * 5 / 10000) = 775
-          expect(balances.fetch('BTC:available', '0').to_i).to eq(100_000_000)
-          expect(balances['USDT:reserved'].to_i).to eq(1_550_775)
-          expect(balances['USDT:available'].to_i).to eq(5_000_000 - 3_000_000 - 3_000 - 1_550_775)
+          # 买方作为 Maker (BUY)，未来成交时将收到 Base (BTC)，手续费从 Base 扣。
+          # 所以预留 USDT 仅需 1_550_000 (不含 Fee)
+          
+          expect(balances.fetch('BTC:available', '0').to_i).to eq(99_900_000)
+          expect(balances['USDT:reserved'].to_i).to eq(1_550_000)
+          expect(balances['USDT:available'].to_i).to eq(5_000_000 - 3_000_000 - 1_550_000)
 
           # 买方剩余以 3_100_000 价格挂单
           buy_queue = redis.lrange('queue:BTCUSDT:BUY:3100000', 0, -1)
@@ -155,9 +160,9 @@ RSpec.describe RedisExchange::Client do
 
           balances = redis.hgetall('balance:buyer2')
           # 预留报价：floor(2_900_000 * 100_000_000 / 100_000_000) = 2_900_000
-          # maker_fee(5bps)：floor(2_900_000 * 5 / 10000) = 1_450
-          expect(balances['USDT:available'].to_i).to eq(5_000_000 - 2_901_450)
-          expect(balances['USDT:reserved'].to_i).to eq(2_901_450)
+          # maker_fee (5bps) deducted from received Base, so no USDT reservation needed for fee.
+          expect(balances['USDT:available'].to_i).to eq(5_000_000 - 2_900_000)
+          expect(balances['USDT:reserved'].to_i).to eq(2_900_000)
           expect(balances.fetch('BTC:available', '0').to_i).to eq(0)
           expect(balances.fetch('BTC:reserved', '0').to_i).to eq(0)
 
