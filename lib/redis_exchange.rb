@@ -242,6 +242,19 @@ module RedisExchange
       market_config(symbol)
     end
 
+    def set_market_fees(symbol:, maker_fee_bps:, taker_fee_bps:)
+      key = "market:#{symbol}"
+      return { error: 'UNKNOWN_MARKET' } unless @redis.exists?(key)
+
+      maker_fee_bps = maker_fee_bps.to_i
+      taker_fee_bps = taker_fee_bps.to_i
+      raise ArgumentError, 'maker_fee_bps must be between 0 and 10000' unless (0..10000).include?(maker_fee_bps)
+      raise ArgumentError, 'taker_fee_bps must be between 0 and 10000' unless (0..10000).include?(taker_fee_bps)
+
+      @redis.hset(key, 'maker_fee_bps', maker_fee_bps, 'taker_fee_bps', taker_fee_bps)
+      { ok: true, symbol: symbol, maker_fee_bps: maker_fee_bps, taker_fee_bps: taker_fee_bps }
+    end
+
     # Seed or update an asset's balance scale and status.
     # Balances and ledger entries MUST use this scale; matching converts market deltas into asset units.
     # @param asset [String] asset code (e.g., 'BTC')
