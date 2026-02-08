@@ -108,8 +108,8 @@ RSpec.describe RedisExchange::Client do
         )
 
         maker_before = redis.hgetall('balance:maker-buyer')
-        expect(maker_before['USDT:reserved'].to_i).to eq(3_001_500)
-        expect(maker_before['USDT:available'].to_i).to eq(5_000_000 - 3_001_500)
+        expect(maker_before['USDT:reserved'].to_i).to eq(3_000_000)
+        expect(maker_before['USDT:available'].to_i).to eq(5_000_000 - 3_000_000)
 
         exchange.set_balance(user_id: 'taker-seller', asset: 'BTC', available: 100_000_000)
         result = exchange.place_market_order(

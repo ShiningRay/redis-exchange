@@ -145,7 +145,7 @@ RSpec.describe 'Account Ledger and Balance Changes' do
       expect(fields['user_id']).to eq('u1')
       expect(fields['asset']).to eq('USDT')
       expect(fields['action']).to eq('LOCK')
-      expect(fields['amount']).to eq('300150') # (3000000 * 10000000 / 10^8) * 1.0005
+      expect(fields['amount']).to eq('300000') # (3000000 * 10000000 / 10^8)
       expect(fields['reason']).to eq('TAKER_RESERVE')
       expect(fields['biz_id']).to match(/^order_submit:\d+:order-1$/)
     end

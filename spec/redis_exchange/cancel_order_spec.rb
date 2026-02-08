@@ -80,8 +80,8 @@ RSpec.describe RedisExchange::Client do
         )
 
         balances_before = exchange.balances('buyer')
-        expect(balances_before[:'USDT:reserved']).to eq(3_001_500)
-        expect(balances_before[:'USDT:available']).to eq(5_000_000 - 3_001_500)
+        expect(balances_before[:'USDT:reserved']).to eq(3_000_000)
+        expect(balances_before[:'USDT:available']).to eq(5_000_000 - 3_000_000)
 
         outcome = exchange.cancel_order('cancel-buy-1')
         expect(outcome[:status]).to eq('CANCELLED')

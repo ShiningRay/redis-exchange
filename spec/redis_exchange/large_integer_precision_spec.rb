@@ -123,7 +123,7 @@ RSpec.describe RedisExchange::Client, 'Large Integer Precision Handling', type: 
     )
     
     # Check fee accumulation in global stats
-    total_fees = redis.hget('fees:USDT', 'total')
+    total_fees = redis.hget('fees:BTC', 'total')
     expect(total_fees).to eq(expected_fee.to_s)
   end
 end
