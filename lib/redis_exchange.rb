@@ -641,6 +641,20 @@ module RedisExchange
       { ok: true }
     end
 
+    def fees_total(asset:, auto_scale: false)
+      raise ArgumentError, 'asset is required' if asset.nil? || asset.to_s.empty?
+
+      total = @redis.hget("fees:#{asset}", 'total').to_i
+      return total unless auto_scale
+
+      scale = asset_config(asset)[:balance_scale] || 1
+      total.to_d / scale
+    end
+
+    def fees(asset:, auto_scale: false)
+      { total: fees_total(asset: asset, auto_scale: auto_scale) }
+    end
+
     # 分页查询用户在某交易对的活跃订单（OPEN/PARTIALLY_FILLED 且 remaining>0）。
     # 依赖 Lua 维护的 ZSET 索引：`user_orders:{user_id}:{symbol}`，score 使用撮合序列。
     # @param user_id [String]

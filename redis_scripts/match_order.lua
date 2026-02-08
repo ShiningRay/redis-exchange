@@ -402,6 +402,18 @@ local function add_fee(asset, amount)
   redis.call('HINCRBY', 'fees:' .. asset, 'total', format_int(amount))
 end
 
+local function compute_fee_from_balance(amount_balance, fee_bps)
+  if amount_balance <= 0 or not fee_bps or fee_bps <= 0 then
+    return 0
+  end
+  local q = math.floor(amount_balance / 10000)
+  local r = amount_balance - (q * 10000)
+  if would_overflow_mul(q, fee_bps) then
+    return nil, overflow_error('fee_q * bps', q, fee_bps)
+  end
+  return (q * fee_bps) + math.floor((r * fee_bps) / 10000)
+end
+
 -- Load an order hash into a Lua table for easier access.
 local function load_order_map(order_key)
   return to_map(redis.call('HGETALL', order_key))
@@ -563,6 +575,11 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
     local maker_user_id = maker_order['user_id']
     local maker_balance_key = 'balance:' .. maker_user_id
 
+    if would_overflow_mul(trade_quote, quote_factor) then
+      return overflow_error('trade_quote * quote_factor', trade_quote, quote_factor)
+    end
+    local trade_quote_balance = trade_quote * quote_factor
+
     -- Standard trade_seq for trades
     local trade_seq = redis.call('INCR', seq_key)
 
@@ -608,50 +625,38 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       -- Maker checks (SELL)
       local maker_balance_key = 'balance:' .. maker_user_id
       if maker_side == 'SELL' then
-        if would_overflow_mul(trade_qty, base_factor) then
-          return overflow_error('trade_qty * base_factor', trade_qty, base_factor)
+        local trade_qty_balance_maker = trade_qty_balance
+        local taker_fee_base_balance, fee_err = compute_fee_from_balance(trade_qty_balance, taker_fee_bps)
+        if fee_err then
+          return fee_err
         end
-        local trade_qty_balance_maker = trade_qty * base_factor
-
-        local credit_market_maker = trade_quote - maker_fee_quote
-        if would_overflow_mul(credit_market_maker, quote_factor) then
-          return overflow_error('credit_market_maker * quote_factor', credit_market_maker, quote_factor)
+        local maker_fee_quote_balance, fee_err2 = compute_fee_from_balance(trade_quote_balance, actual_maker_fee_bps)
+        if fee_err2 then
+          return fee_err2
         end
-        local credit_balance_maker = credit_market_maker * quote_factor
+        local credit_balance_maker = trade_quote_balance - maker_fee_quote_balance
 
         -- Fee Accumulation
         taker_fees_collected = taker_fees_collected + taker_fee_base
         maker_fees_collected = maker_fees_collected + maker_fee_quote
 
         -- Add fees to system accounts
-        -- Taker paid fee in Base Asset
-        if would_overflow_mul(taker_fee_base, base_factor) then
-          return overflow_error('taker_fee_base * base_factor', taker_fee_base, base_factor)
-        end
-        add_fee(base_asset, taker_fee_base * base_factor)
+        add_fee(base_asset, taker_fee_base_balance)
 
         -- Maker paid fee in Quote Asset
-        if would_overflow_mul(maker_fee_quote, quote_factor) then
-          return overflow_error('maker_fee_quote * quote_factor', maker_fee_quote, quote_factor)
-        end
-        add_fee(quote_asset, maker_fee_quote * quote_factor)
+        add_fee(quote_asset, maker_fee_quote_balance)
 
         -- EXECUTE Taker (BUY)
         taker_available_quote_after = taker_available_quote_after - debit_balance
         op_sub(user_id, quote_asset, debit_balance, 'TAKER_SPEND', timestamp,
           'TAKER_SPEND:' .. market_seq .. '_' .. trade_seq .. ':' .. order_id)
 
-        -- Taker receives net quantity (trade_qty - fee)
-        local taker_receive_qty = trade_qty - taker_fee_base
-        if would_overflow_mul(taker_receive_qty, base_factor) then
-          return overflow_error('taker_receive_qty * base_factor', taker_receive_qty, base_factor)
-        end
-        local taker_receive_balance = taker_receive_qty * base_factor
+        local taker_receive_balance = trade_qty_balance - taker_fee_base_balance
         op_add(user_id, base_asset, taker_receive_balance, 'TAKER_RECEIVE', timestamp,
           'TAKER_RECEIVE:' .. market_seq .. '_' .. trade_seq .. ':' .. order_id)
 
         taker_quote_spent = taker_quote_spent + debit_market
-        taker_base_received = taker_base_received + taker_receive_qty
+        taker_base_received = taker_base_received + (trade_qty - taker_fee_base)
 
         -- EXECUTE Maker (SELL)
         -- Maker locked full trade_qty, release it all
@@ -703,34 +708,33 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       end
       local debit_balance_maker = debit_market_maker * quote_factor
 
-      if would_overflow_mul(trade_qty, base_factor) then
-        return overflow_error('trade_qty * base_factor', trade_qty, base_factor)
+      local trade_qty_balance_maker = trade_qty_balance
+      local taker_fee_quote_balance, fee_err = compute_fee_from_balance(trade_quote_balance, taker_fee_bps)
+      if fee_err then
+        return fee_err
       end
-      local trade_qty_balance_maker = trade_qty * base_factor
+      local maker_fee_base_balance, fee_err2 = compute_fee_from_balance(trade_qty_balance_maker, actual_maker_fee_bps)
+      if fee_err2 then
+        return fee_err2
+      end
 
       -- Fee Accumulation
       taker_fees_collected = taker_fees_collected + taker_fee_quote
       maker_fees_collected = maker_fees_collected + maker_fee_base
 
       -- Add fees to system accounts
-      -- Taker paid fee in Quote Asset
-      if would_overflow_mul(taker_fee_quote, quote_factor) then
-        return overflow_error('taker_fee_quote * quote_factor', taker_fee_quote, quote_factor)
-      end
-      add_fee(quote_asset, taker_fee_quote * quote_factor)
+      add_fee(quote_asset, taker_fee_quote_balance)
 
       -- Maker paid fee in Base Asset
-      if would_overflow_mul(maker_fee_base, base_factor) then
-        return overflow_error('maker_fee_base * base_factor', maker_fee_base, base_factor)
-      end
-      add_fee(base_asset, maker_fee_base * base_factor)
+      add_fee(base_asset, maker_fee_base_balance)
 
       -- EXECUTE Taker (SELL)
       taker_available_base_after = taker_available_base_after - trade_qty_balance
       op_sub(user_id, base_asset, trade_qty_balance, 'TAKER_SPEND', timestamp,
         'TAKER_SPEND:' .. market_seq .. '_' .. trade_seq .. ':' .. order_id)
 
-      op_add(user_id, quote_asset, credit_balance, 'TAKER_RECEIVE', timestamp,
+      local credit_balance_precise = trade_quote_balance - taker_fee_quote_balance
+      op_add(user_id, quote_asset, credit_balance_precise, 'TAKER_RECEIVE', timestamp,
         'TAKER_RECEIVE:' .. market_seq .. '_' .. trade_seq .. ':' .. order_id)
 
       taker_quote_received = taker_quote_received + credit_market
@@ -743,12 +747,7 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
         redis.call('HINCRBY', maker_order_key, 'reserved_quote', format_int(-debit_balance_maker))
       end
 
-      -- Maker receives net quantity (trade_qty - fee)
-      local maker_receive_qty = trade_qty - maker_fee_base
-      if would_overflow_mul(maker_receive_qty, base_factor) then
-        return overflow_error('maker_receive_qty * base_factor', maker_receive_qty, base_factor)
-      end
-      local maker_receive_balance = maker_receive_qty * base_factor
+      local maker_receive_balance = trade_qty_balance_maker - maker_fee_base_balance
 
       op_add(maker_user_id, base_asset, maker_receive_balance, 'MAKER_RECEIVE', timestamp,
         'MAKER_RECEIVE:' .. market_seq .. '_' .. trade_seq .. ':' .. maker_order_id)
