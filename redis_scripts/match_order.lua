@@ -579,6 +579,10 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       return overflow_error('trade_quote * quote_factor', trade_quote, quote_factor)
     end
     local trade_quote_balance = trade_quote * quote_factor
+    local stream_taker_fee_asset
+    local stream_taker_fee_balance = 0
+    local stream_maker_fee_asset
+    local stream_maker_fee_balance = 0
 
     -- Standard trade_seq for trades
     local trade_seq = redis.call('INCR', seq_key)
@@ -635,6 +639,10 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
           return fee_err2
         end
         local credit_balance_maker = trade_quote_balance - maker_fee_quote_balance
+        stream_taker_fee_asset = base_asset
+        stream_taker_fee_balance = taker_fee_base_balance
+        stream_maker_fee_asset = quote_asset
+        stream_maker_fee_balance = maker_fee_quote_balance
 
         -- Fee Accumulation
         taker_fees_collected = taker_fees_collected + taker_fee_base
@@ -717,6 +725,10 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       if fee_err2 then
         return fee_err2
       end
+      stream_taker_fee_asset = quote_asset
+      stream_taker_fee_balance = taker_fee_quote_balance
+      stream_maker_fee_asset = base_asset
+      stream_maker_fee_balance = maker_fee_base_balance
 
       -- Fee Accumulation
       taker_fees_collected = taker_fees_collected + taker_fee_quote
@@ -855,8 +867,10 @@ while (not insufficient_liquidity_precheck) and remaining > 0 do
       'price', format_int(trade_price),
       'quantity', format_int(trade_qty),
       'quote', format_int(trade_quote),
-      'taker_fee', format_int(is_buy and taker_fee_base or taker_fee_quote),
-      'maker_fee', format_int(is_buy and maker_fee_quote or maker_fee_base),
+      'taker_fee', format_int(stream_taker_fee_balance),
+      'maker_fee', format_int(stream_maker_fee_balance),
+      'taker_fee_asset', stream_taker_fee_asset or '',
+      'maker_fee_asset', stream_maker_fee_asset or '',
       'symbol', symbol,
       'ts', tostring(timestamp),
       'sequence', tostring(trade_seq)

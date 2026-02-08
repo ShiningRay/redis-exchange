@@ -21,20 +21,22 @@
   - `price`（成交价，整数，已缩放）
   - `quantity`（成交基础数量，整数，已缩放）
   - `quote`（成交报价金额，整数，已缩放）
-  - `taker_fee`（成交扣除的吃单方手续费，整数）
-  - `maker_fee`（成交扣除的挂单方手续费，整数）
+  - `taker_fee`（成交扣除的吃单方手续费，整数，按手续费币种 balance_scale）
+  - `maker_fee`（成交扣除的挂单方手续费，整数，按手续费币种 balance_scale）
+  - `taker_fee_asset`（吃单手续费币种）
+  - `maker_fee_asset`（挂单手续费币种）
   - `ts`（毫秒时间戳）
 - 数值字段均为整型（已按 `price_scale` 与 `quantity_scale` 缩放）。
 
 ## 单位与刻度（重要）
-- Stream 字段的数值（`price`/`quantity`/`quote`/`taker_fee`/`maker_fee`）采用市场撮合刻度（market units）：
+- Stream 字段的数值（`price`/`quantity`/`quote`）采用市场撮合刻度（market units）：
   - `price` 使用市场的 `price_scale`。
   - `quantity` 使用市场的 `quantity_scale`。
-  - `quote`、`taker_fee`、`maker_fee` 也基于市场刻度计算并广播，便于统一行情/成交分析。
+- Stream 字段 `taker_fee`/`maker_fee` 采用手续费币种的余额刻度（asset balance units），手续费币种通过 `taker_fee_asset/maker_fee_asset` 给出。
 - 账本与余额采用资产余额刻度（asset balance units）：
   - 撮合脚本内部在更新 `balance:{user}` 的 `available`/`reserved` 以及写入 `append_ledger(...)` 时，所有金额以资产的 `asset:{asset}.balance_scale` 为单位（参见 `docs/architecture.md`）。
   - 费用聚合键 `fees:{asset}` 也以资产余额刻度累计。
-- 这意味着：事件（Stream/响应）与账本（HSET/HINCRBY/fees）使用不同刻度。需要在消费或展示层明确单位来源，避免混淆。
+- 这意味着：事件中 `price/quantity/quote` 使用 market units，但 `taker_fee/maker_fee` 使用 asset balance units。需要在消费或展示层明确单位来源，避免混淆。
 
 ## 消费者封装（GEM 内）
 - 类：`RedisExchange::TradeStreamConsumer`

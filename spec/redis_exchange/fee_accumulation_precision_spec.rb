@@ -103,6 +103,24 @@ RSpec.describe RedisExchange::Client, 'Fee accumulation across markets with diff
 
     expect(exchange.fees_total(asset: 'USDT', auto_scale: true)).to eq(expected_total_usdt_fee.to_d / 1_000_000)
 
+    btc_trades = redis.xrange('trades:BTCUSDT', '-', '+')
+    expect(btc_trades.size).to eq(1)
+    btc_trade_fields = btc_trades.first[1]
+    btc_trade_fields = btc_trade_fields.is_a?(Hash) ? btc_trade_fields : Hash[*btc_trade_fields]
+    expect(btc_trade_fields['taker_fee_asset']).to eq('BTC')
+    expect(btc_trade_fields['taker_fee']).to eq(expected_btc_taker_fee.to_i.to_s)
+    expect(btc_trade_fields['maker_fee_asset']).to eq('USDT')
+    expect(btc_trade_fields['maker_fee']).to eq(expected_btc_usdt_fee.to_i.to_s)
+
+    trx_trades = redis.xrange('trades:TRXUSDT', '-', '+')
+    expect(trx_trades.size).to eq(1)
+    trx_trade_fields = trx_trades.first[1]
+    trx_trade_fields = trx_trade_fields.is_a?(Hash) ? trx_trade_fields : Hash[*trx_trade_fields]
+    expect(trx_trade_fields['taker_fee_asset']).to eq('TRX')
+    expect(trx_trade_fields['taker_fee']).to eq(expected_trx_taker_fee.to_i.to_s)
+    expect(trx_trade_fields['maker_fee_asset']).to eq('USDT')
+    expect(trx_trade_fields['maker_fee']).to eq(expected_trx_usdt_fee.to_i.to_s)
+
     taker_balances = redis.hgetall('balance:taker_usdt')
     expect(taker_balances.fetch('BTC:available', '0').to_i).to eq(10_000_000 - expected_btc_taker_fee)
     expect(taker_balances.fetch('TRX:available', '0').to_i).to eq(10_000_000 - expected_trx_taker_fee)
