@@ -286,7 +286,7 @@ module RedisExchange
 
     # Read market configuration.
     # @param symbol [String]
-    # @return [Hash] { base_asset:, quote_asset:, price_scale:, quantity_scale:, status: } or {}
+    # @return [Hash] { base_asset:, quote_asset:, price_scale:, quantity_scale:, maker_fee_bps:, taker_fee_bps:, status: } or {}
     def market_config(symbol)
       raw = @redis.hgetall("market:#{symbol}")
       return {} if raw.empty?
@@ -295,6 +295,8 @@ module RedisExchange
         quote_asset: raw.fetch('quote_asset', nil),
         price_scale: raw.fetch('price_scale', '1').to_i,
         quantity_scale: raw.fetch('quantity_scale', '1').to_i,
+        maker_fee_bps: raw.fetch('maker_fee_bps', '0').to_i,
+        taker_fee_bps: raw.fetch('taker_fee_bps', '0').to_i,
         status: raw.fetch('status', RedisExchange::MARKET_STATUS_OPEN)
       }
     end
