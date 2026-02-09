@@ -996,7 +996,7 @@ redis.call('XADD', orders_key, 'MAXLEN', '~', orders_maxlen, '*',
 )
 
 -- Delete terminal taker orders to keep memory bounded
-if order_status == 'FILLED' or order_status == 'NO_LIQUIDITY' then
+if order_type == 'MARKET' or order_status == 'FILLED' or order_status == 'NO_LIQUIDITY' then
   mark_tombstone(order_id, order_status)
   redis.call('DEL', order_key)
 end

@@ -325,6 +325,47 @@ RSpec.describe RedisExchange::Client do
       stream_entries = redis.xrevrange('trades:BTCUSDT', '+', '-', count: 1)
       expect(stream_entries).to be_empty
     end
+
+    it '当市价单资金不足导致部分成交时，订单应终态删除且不可撤单' do
+      exchange.set_balance(user_id: 'bob', asset: 'BTC', available: 200_000_000)
+      exchange.set_balance(user_id: 'carol', asset: 'BTC', available: 200_000_000)
+      exchange.place_limit_order(
+        symbol: symbol,
+        side: 'SELL',
+        order_id: 'maker-liq-1',
+        user_id: 'bob',
+        price: 3_000_000,
+        quantity: 50_000_000
+      )
+      exchange.place_limit_order(
+        symbol: symbol,
+        side: 'SELL',
+        order_id: 'maker-liq-2',
+        user_id: 'carol',
+        price: 3_000_000,
+        quantity: 50_000_000
+      )
+
+      exchange.set_balance(user_id: 'alice', asset: 'USDT', available: 1_500_000)
+
+      result = exchange.place_market_order(
+        symbol: symbol,
+        side: 'BUY',
+        order_id: 'market-insufficient-funds-1',
+        user_id: 'alice',
+        quantity: 100_000_000
+      )
+
+      expect(result[:status]).to eq('PARTIALLY_FILLED')
+      expect(result[:executed_quantity]).to eq(50_000_000)
+      expect(result[:remaining_quantity]).to eq(50_000_000)
+
+      expect(exchange.order('market-insufficient-funds-1')).to eq({})
+      expect(exchange.cancel_order('market-insufficient-funds-1')).to eq({ status: 'NOT_FOUND', order_id: 'market-insufficient-funds-1' })
+
+      trades = redis.xrevrange("trades:#{symbol}", '+', '-', count: 10)
+      expect(trades.size).to eq(1)
+    end
   # 价格选择相关的市价单测试
   context 'price selection for market orders' do
     it '市价买单在存在多个不同价格的卖单时，按最低的限价卖单价格成交（只吃掉一个）' do
