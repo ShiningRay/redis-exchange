@@ -61,7 +61,12 @@ end
 
 -- Format number as integer string to avoid scientific notation (e.g. "1e+15")
 -- which causes "ERR value is not an integer" in HINCRBY.
+-- Also handles -0 case which Redis rejects.
 local function format_int(n)
+  -- Handle -0 case: string.format("%.0f", -0) returns "-0" which Redis rejects
+  if n == 0 then
+    return "0"
+  end
   return string.format("%.0f", n)
 end
 

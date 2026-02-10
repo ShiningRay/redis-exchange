@@ -297,6 +297,8 @@ module RedisExchange
         quantity_scale: raw.fetch('quantity_scale', '1').to_i,
         maker_fee_bps: raw.fetch('maker_fee_bps', '0').to_i,
         taker_fee_bps: raw.fetch('taker_fee_bps', '0').to_i,
+        min_qty: raw.fetch('min_qty', '1').to_i,
+        min_notional: raw.fetch('min_notional', '1').to_i,
         status: raw.fetch('status', RedisExchange::MARKET_STATUS_OPEN)
       }
     end
