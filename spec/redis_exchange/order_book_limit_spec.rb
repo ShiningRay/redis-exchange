@@ -44,4 +44,60 @@ RSpec.describe RedisExchange::Client, "Order Book Limit" do
     expect(limit_book_2[:bids].map { |x| x[:price] }).to eq([100, 90])
     expect(limit_book_2[:asks].map { |x| x[:price] }).to eq([110, 120])
   end
+
+  describe '#price_level_count' do
+    it 'returns correct count for price levels' do
+      count = exchange.price_level_count(symbol: symbol)
+      expect(count[:total]).to eq(6)
+      expect(count[:bids]).to eq(3)
+      expect(count[:asks]).to eq(3)
+    end
+
+    it 'returns 0 for empty book' do
+      exchange.clear_books(symbol)
+      count = exchange.price_level_count(symbol: symbol)
+      expect(count[:total]).to eq(0)
+      expect(count[:bids]).to eq(0)
+      expect(count[:asks]).to eq(0)
+    end
+
+    it 'updates when orders are matched' do
+      # Add a taker order that matches with existing orders
+      exchange.set_balance(user_id: 'taker', asset: 'BTC', available: 1_000_000_000)
+      exchange.set_balance(user_id: 'taker', asset: 'USDT', available: 10_000_000_000)
+
+      exchange.place_limit_order(symbol: symbol, side: 'BUY', order_id: 'taker_buy', user_id: 'taker', price: 120, quantity: 1)
+
+      # Should match with s2 (price 120)
+      count = exchange.price_level_count(symbol: symbol)
+      expect(count[:total]).to be < 6
+    end
+
+    it 'updates when orders are cancelled' do
+      count_before = exchange.price_level_count(symbol: symbol)
+      expect(count_before[:total]).to eq(6)
+
+      exchange.cancel_order(order_id: 'b1')
+      count_after = exchange.price_level_count(symbol: symbol)
+      expect(count_after[:total]).to eq(5)
+      expect(count_after[:bids]).to eq(2)
+
+      exchange.cancel_order(order_id: 's1')
+      count_final = exchange.price_level_count(symbol: symbol)
+      expect(count_final[:total]).to eq(4)
+      expect(count_final[:asks]).to eq(2)
+    end
+
+    it 'counts multiple orders at same price level as one price level' do
+      # Add another order at existing price level
+      exchange.place_limit_order(symbol: symbol, side: 'BUY', order_id: 'b4', user_id: 'maker', price: 100, quantity: 2)
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 's4', user_id: 'maker', price: 110, quantity: 2)
+
+      count = exchange.price_level_count(symbol: symbol)
+      # Still 3 bid levels (100, 90, 80) and 3 ask levels (110, 120, 130)
+      expect(count[:bids]).to eq(3)
+      expect(count[:asks]).to eq(3)
+      expect(count[:total]).to eq(6)
+    end
+  end
 end

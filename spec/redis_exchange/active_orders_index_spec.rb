@@ -63,4 +63,64 @@ RSpec.describe RedisExchange::Client do
     expect(order[:remaining]).to eq(1.23456789)
   end
 
+  it 'returns active order count for a user in a specific market' do
+    exchange.set_balance(user_id: 'alice', asset: 'BTC', available: 600_000_000)
+
+    3.times do |i|
+      exchange.place_limit_order(
+        symbol: symbol,
+        side: 'SELL',
+        order_id: "count_#{i}",
+        user_id: 'alice',
+        price: 3_000_000 + (i * 10_000),
+        quantity: 100_000_000
+      )
+    end
+
+    expect(exchange.active_order_count(user_id: 'alice', symbol: symbol)).to eq(3)
+  end
+
+  it 'returns active order count for a user across all markets' do
+    exchange.seed_asset(asset: 'ETH', balance_scale: 100_000_000)
+    exchange.seed_market(symbol: 'ETHUSDT', base_asset: 'ETH', quote_asset: 'USDT', price_scale: 100, quantity_scale: 100_000_000)
+
+    exchange.set_balance(user_id: 'alice', asset: 'BTC', available: 600_000_000)
+    exchange.set_balance(user_id: 'alice', asset: 'ETH', available: 500_000_000)
+
+    exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'btc_order', user_id: 'alice', price: 3_000_000, quantity: 100_000_000)
+    exchange.place_limit_order(symbol: 'ETHUSDT', side: 'SELL', order_id: 'eth_order', user_id: 'alice', price: 2_000, quantity: 200_000_000)
+
+    expect(exchange.active_order_count(user_id: 'alice', symbol: symbol)).to eq(1)
+    expect(exchange.active_order_count(user_id: 'alice', symbol: 'ETHUSDT')).to eq(1)
+    expect(exchange.active_order_count(user_id: 'alice')).to eq(2)
+  end
+
+  it 'returns 0 when user has no active orders' do
+    expect(exchange.active_order_count(user_id: 'alice', symbol: symbol)).to eq(0)
+    expect(exchange.active_order_count(user_id: 'alice')).to eq(0)
+  end
+
+  it 'updates count when orders are cancelled' do
+    exchange.set_balance(user_id: 'alice', asset: 'BTC', available: 600_000_000)
+
+    2.times do |i|
+      exchange.place_limit_order(
+        symbol: symbol,
+        side: 'SELL',
+        order_id: "cancel_#{i}",
+        user_id: 'alice',
+        price: 3_000_000 + (i * 10_000),
+        quantity: 100_000_000
+      )
+    end
+
+    expect(exchange.active_order_count(user_id: 'alice', symbol: symbol)).to eq(2)
+
+    exchange.cancel_order(order_id: 'cancel_0')
+    expect(exchange.active_order_count(user_id: 'alice', symbol: symbol)).to eq(1)
+
+    exchange.cancel_order(order_id: 'cancel_1')
+    expect(exchange.active_order_count(user_id: 'alice', symbol: symbol)).to eq(0)
+  end
+
 end

@@ -712,6 +712,25 @@ module RedisExchange
       orders
     end
 
+    # Get active order count for a user in a specific market.
+    # @param user_id [String]
+    # @param symbol [String] if nil, counts across all markets
+    # @return [Integer] number of active orders
+    def active_order_count(user_id:, symbol: nil)
+      if symbol
+        @redis.zcard("user_orders:#{user_id}:#{symbol}")
+      else
+        total = 0
+        cursor = '0'
+        loop do
+          cursor, keys = @redis.scan(cursor, match: "user_orders:#{user_id}:*", count: 100)
+          total += keys.sum { |key| @redis.zcard(key) }
+          break if cursor == '0'
+        end
+        total
+      end
+    end
+
     # Fetch all active orders for a market (scanning the order book).
     # WARNING: This can be expensive on large order books as it scans all price levels and queues.
     # @param symbol [String]
@@ -736,6 +755,35 @@ module RedisExchange
         end
       end
       orders
+    end
+
+    # Get active order count for a market.
+    # @param symbol [String] market symbol
+    # @return [Hash] { total: Integer, buy: Integer, sell: Integer }
+    def market_order_count(symbol:)
+      total = 0
+      buy_count = 0
+      sell_count = 0
+
+      [RedisExchange::SIDE_BUY, RedisExchange::SIDE_SELL].each do |side|
+        book_key = "book:#{symbol}:#{side}"
+        prices = @redis.zrange(book_key, 0, -1)
+
+        side_count = 0
+        prices.each do |price|
+          queue_key = "queue:#{symbol}:#{side}:#{price}"
+          side_count += @redis.llen(queue_key)
+        end
+
+        if side == RedisExchange::SIDE_BUY
+          buy_count = side_count
+        else
+          sell_count = side_count
+        end
+        total += side_count
+      end
+
+      { total: total, buy: buy_count, sell: sell_count }
     end
 
     # Monitor order book changes via Redis Keyspace Notifications.
@@ -890,6 +938,15 @@ module RedisExchange
         bids: fetch_book_side(symbol, RedisExchange::SIDE_BUY, descending: true, limit: limit),
         asks: fetch_book_side(symbol, RedisExchange::SIDE_SELL, descending: false, limit: limit)
       }
+    end
+
+    # Get the number of price levels for a market.
+    # @param symbol [String] market symbol
+    # @return [Hash] { total: Integer, bids: Integer, asks: Integer }
+    def price_level_count(symbol:)
+      bids_count = @redis.zcard("book:#{symbol}:#{RedisExchange::SIDE_BUY}")
+      asks_count = @redis.zcard("book:#{symbol}:#{RedisExchange::SIDE_SELL}")
+      { total: bids_count + asks_count, bids: bids_count, asks: asks_count }
     end
 
     # Merge depth levels by aggregating volumes within price ranges.

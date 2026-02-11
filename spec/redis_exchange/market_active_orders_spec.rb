@@ -70,4 +70,62 @@ RSpec.describe 'Market Active Orders' do
     orders = exchange.market_active_orders(symbol: symbol)
     expect(orders).to be_empty
   end
+
+  describe '#market_order_count' do
+    it 'returns correct count for an empty book' do
+      count = exchange.market_order_count(symbol: symbol)
+      expect(count[:total]).to eq(0)
+      expect(count[:buy]).to eq(0)
+      expect(count[:sell]).to eq(0)
+    end
+
+    it 'returns correct count with buy and sell orders' do
+      exchange.place_limit_order(symbol: symbol, side: 'BUY', order_id: 'buy-1', user_id: 'u1', price: 100, quantity: 10)
+      exchange.place_limit_order(symbol: symbol, side: 'BUY', order_id: 'buy-2', user_id: 'u1', price: 99, quantity: 10)
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'sell-1', user_id: 'u2', price: 110, quantity: 5)
+
+      count = exchange.market_order_count(symbol: symbol)
+      expect(count[:total]).to eq(3)
+      expect(count[:buy]).to eq(2)
+      expect(count[:sell]).to eq(1)
+    end
+
+    it 'updates count when orders are matched' do
+      exchange.place_limit_order(symbol: symbol, side: 'BUY', order_id: 'buy-1', user_id: 'u1', price: 100, quantity: 10)
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'sell-1', user_id: 'u2', price: 100, quantity: 5)
+
+      count = exchange.market_order_count(symbol: symbol)
+      expect(count[:total]).to eq(1)
+      expect(count[:buy]).to eq(1)
+      expect(count[:sell]).to eq(0)
+    end
+
+    it 'updates count when orders are cancelled' do
+      exchange.place_limit_order(symbol: symbol, side: 'BUY', order_id: 'buy-1', user_id: 'u1', price: 100, quantity: 10)
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'sell-1', user_id: 'u2', price: 110, quantity: 5)
+
+      count = exchange.market_order_count(symbol: symbol)
+      expect(count[:total]).to eq(2)
+
+      exchange.cancel_order(order_id: 'buy-1')
+      count = exchange.market_order_count(symbol: symbol)
+      expect(count[:total]).to eq(1)
+      expect(count[:buy]).to eq(0)
+      expect(count[:sell]).to eq(1)
+
+      exchange.cancel_order(order_id: 'sell-1')
+      count = exchange.market_order_count(symbol: symbol)
+      expect(count[:total]).to eq(0)
+    end
+
+    it 'counts multiple orders at same price level' do
+      exchange.place_limit_order(symbol: symbol, side: 'BUY', order_id: 'buy-1', user_id: 'u1', price: 100, quantity: 10)
+      exchange.place_limit_order(symbol: symbol, side: 'BUY', order_id: 'buy-2', user_id: 'u1', price: 100, quantity: 10)
+      exchange.place_limit_order(symbol: symbol, side: 'BUY', order_id: 'buy-3', user_id: 'u1', price: 100, quantity: 10)
+
+      count = exchange.market_order_count(symbol: symbol)
+      expect(count[:total]).to eq(3)
+      expect(count[:buy]).to eq(3)
+    end
+  end
 end
