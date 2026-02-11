@@ -87,6 +87,46 @@ RSpec.describe RedisExchange::Client do
       expect(ask_entry).not_to be_nil
       expect(ask_entry[:volume]).to eq(100_000_000)
     end
+
+    it 'returns cancellation results when return_results is true (default)' do
+      exchange.set_balance(user_id: 'maker', asset: 'BTC', available: 200_000_000)
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'result-1', user_id: 'maker', price: 3_000_000, quantity: 100_000_000)
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'result-2', user_id: 'maker', price: 3_100_000, quantity: 100_000_000)
+
+      result = exchange.cancel_all_orders('maker', return_results: true)
+
+      expect(result).to be_an(Array)
+      expect(result.size).to eq(2)
+      expect(result.map { |r| r[:order_id] }).to contain_exactly('result-1', 'result-2')
+      result.each do |r|
+        expect(r[:status]).to eq('CANCELLED')
+      end
+    end
+
+    it 'returns nil when return_results is false' do
+      exchange.set_balance(user_id: 'maker', asset: 'BTC', available: 200_000_000)
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'no-result-1', user_id: 'maker', price: 3_000_000, quantity: 100_000_000)
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'no-result-2', user_id: 'maker', price: 3_100_000, quantity: 100_000_000)
+
+      result = exchange.cancel_all_orders('maker', return_results: false)
+
+      expect(result).to be_nil
+
+      expect(redis.lrange('queue:BTCUSDT:SELL:3000000', 0, -1)).to be_empty
+      expect(redis.lrange('queue:BTCUSDT:SELL:3100000', 0, -1)).to be_empty
+    end
+
+    it 'still cancels orders when return_results is false' do
+      exchange.set_balance(user_id: 'maker', asset: 'BTC', available: 200_000_000)
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'verify-cancel-1', user_id: 'maker', price: 3_000_000, quantity: 100_000_000)
+
+      result = exchange.cancel_all_orders('maker', return_results: false)
+
+      expect(result).to be_nil
+
+      order = exchange.order('verify-cancel-1')
+      expect(order).to eq({})
+    end
   end
 
-  end
+end

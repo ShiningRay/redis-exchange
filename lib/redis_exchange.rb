@@ -434,41 +434,42 @@ module RedisExchange
 
     # Cancel all resting orders for a user across all markets.
     # Implemented in Ruby to avoid Lua script timeouts on large data sets.
-    def cancel_all_orders(user_id)
+    # @param user_id [String]
+    # @param return_results [Boolean] if true, returns cancellation results; if false, returns nil
+    # @return [Array<Hash>, nil] cancellation results if return_results is true, otherwise nil
+    def cancel_all_orders(user_id, return_results: true)
       if maintenance.enabled?
         return { error: 'SYSTEM_MAINTENANCE' }
       end
 
       results = []
-      touched_symbols = Set.new
       cursor = '0'
       loop do
         # 1. Scan user's order indexes
         cursor, keys = @redis.scan(cursor, match: "user_orders:#{user_id}:*", count: 100)
-        
+
         keys.each do |index_key|
           # index_key format: user_orders:{user_id}:{symbol}
           symbol = index_key.split(':').last
-          
+
           # 2. Get all order IDs for this symbol
           order_ids = @redis.zrange(index_key, 0, -1)
-          
+
           order_ids.each do |oid|
             # 3. Cancel each order individually
             # This calls cancel_order.lua which handles status checks, balance release, etc.
             # It returns a Hash with :status, :order_id, :symbol etc. or :error
             res = cancel_order(oid)
-            
+
             # 4. Collect successful cancellations
-      if res[:status] == RedisExchange::ORDER_STATUS_CANCELLED
-        results << res
-        touched_symbols.add(symbol)
-      elsif res[:error] == 'MARKET_MAINTENANCE'
-        # Capture error but continue processing other orders (which might be in different markets)
-        results << { order_id: oid, error: 'MARKET_MAINTENANCE' }
-      elsif res[:status] == RedisExchange::ORDER_STATUS_NOT_FOUND || res[:status] == RedisExchange::ORDER_STATUS_UNKNOWN
-         # Order might be already gone or finished, clean up index just in case?
-         # cancel_order.lua doesn't clean up index if order not found in hash.
+            if res[:status] == RedisExchange::ORDER_STATUS_CANCELLED
+              results << res
+            elsif res[:error] == 'MARKET_MAINTENANCE'
+              # Capture error but continue processing other orders (which might be in different markets)
+              results << { order_id: oid, error: 'MARKET_MAINTENANCE' }
+            elsif res[:status] == RedisExchange::ORDER_STATUS_NOT_FOUND || res[:status] == RedisExchange::ORDER_STATUS_UNKNOWN
+               # Order might be already gone or finished, clean up index just in case?
+               # cancel_order.lua doesn't clean up index if order not found in hash.
                # But if it's not found, we should probably remove it from ZSET to avoid stuck keys.
                # However, standard cancel_order doesn't know about user_id if order hash is gone.
                # Here we know the index_key, so we can clean it.
@@ -476,12 +477,12 @@ module RedisExchange
             end
           end
         end
-        
+
         break if cursor == '0'
       end
-      
-      # 5. Return results
-      results
+
+      # 5. Return results (or nil if return_results is false)
+      return_results ? results : nil
     end
 
     # Generic atomic balance operation.
@@ -731,6 +732,62 @@ module RedisExchange
       end
     end
 
+    # Iterate over all orders for a user across all markets.
+    # Yields each order hash to the block.
+    # @param user_id [String]
+    # @yield [Hash] order hash with keys: order_id, user_id, symbol, side, type, status, price, quantity, remaining, etc.
+    # @return [Array<Hash>] all orders if block not given, otherwise nil
+    def all_orders(user_id:)
+      orders = []
+      cursor = '0'
+      loop do
+        cursor, keys = @redis.scan(cursor, match: "user_orders:#{user_id}:*", count: 100)
+
+        keys.each do |index_key|
+          symbol = index_key.split(':').last
+          order_ids = @redis.zrange(index_key, 0, -1)
+
+          order_ids.each do |oid|
+            o = order(oid)
+            next if o.empty?
+            if block_given?
+              yield o
+            else
+              orders << o
+            end
+          end
+        end
+
+        break if cursor == '0'
+      end
+
+      orders unless block_given?
+    end
+
+    # Iterate over all orders for a user in a specific market.
+    # Yields each order hash to the block.
+    # @param user_id [String]
+    # @param symbol [String] market symbol
+    # @yield [Hash] order hash with keys: order_id, user_id, symbol, side, type, status, price, quantity, remaining, etc.
+    # @return [Array<Hash>] all orders if block not given, otherwise nil
+    def all_orders_for_market(user_id:, symbol:)
+      orders = []
+      index_key = "user_orders:#{user_id}:#{symbol}"
+      order_ids = @redis.zrange(index_key, 0, -1)
+
+      order_ids.each do |oid|
+        o = order(oid)
+        next if o.empty?
+        if block_given?
+          yield o
+        else
+          orders << o
+        end
+      end
+
+      orders unless block_given?
+    end
+
     # Fetch all active orders for a market (scanning the order book).
     # WARNING: This can be expensive on large order books as it scans all price levels and queues.
     # @param symbol [String]
@@ -755,6 +812,37 @@ module RedisExchange
         end
       end
       orders
+    end
+
+    # Iterate over all orders for a market.
+    # Yields each order hash to the block.
+    # WARNING: This can be expensive on large order books as it scans all price levels and queues.
+    # @param symbol [String] market symbol
+    # @yield [Hash] order hash with keys: order_id, user_id, symbol, side, type, status, price, quantity, remaining, etc.
+    # @return [Array<Hash>] all orders if block not given, otherwise nil
+    def all_market_orders(symbol:)
+      orders = []
+      [RedisExchange::SIDE_BUY, RedisExchange::SIDE_SELL].each do |side|
+        book_key = "book:#{symbol}:#{side}"
+        prices = @redis.zrange(book_key, 0, -1)
+
+        prices.each do |price|
+          queue_key = "queue:#{symbol}:#{side}:#{price}"
+          order_ids = @redis.lrange(queue_key, 0, -1)
+
+          order_ids.each do |oid|
+            o = order(oid)
+            next if o.empty?
+            if block_given?
+              yield o
+            else
+              orders << o
+            end
+          end
+        end
+      end
+
+      orders unless block_given?
     end
 
     # Get active order count for a market.

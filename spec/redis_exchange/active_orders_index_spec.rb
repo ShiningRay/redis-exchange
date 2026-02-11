@@ -123,4 +123,130 @@ RSpec.describe RedisExchange::Client do
     expect(exchange.active_order_count(user_id: 'alice', symbol: symbol)).to eq(0)
   end
 
+  describe '#all_orders' do
+    it 'returns all orders for a user across all markets when no block given' do
+      exchange.seed_asset(asset: 'ETH', balance_scale: 100_000_000)
+      exchange.seed_market(symbol: 'ETHUSDT', base_asset: 'ETH', quote_asset: 'USDT', price_scale: 100, quantity_scale: 100_000_000)
+
+      exchange.set_balance(user_id: 'alice', asset: 'BTC', available: 600_000_000)
+      exchange.set_balance(user_id: 'alice', asset: 'ETH', available: 500_000_000)
+
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'btc_order_1', user_id: 'alice', price: 3_000_000, quantity: 100_000_000)
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'btc_order_2', user_id: 'alice', price: 3_100_000, quantity: 100_000_000)
+      exchange.place_limit_order(symbol: 'ETHUSDT', side: 'SELL', order_id: 'eth_order', user_id: 'alice', price: 2_000, quantity: 200_000_000)
+
+      orders = exchange.all_orders(user_id: 'alice')
+      expect(orders.size).to eq(3)
+      expect(orders.map { |o| o[:order_id] }).to contain_exactly('btc_order_1', 'btc_order_2', 'eth_order')
+    end
+
+    it 'yields each order to the block when block is given' do
+      exchange.set_balance(user_id: 'alice', asset: 'BTC', available: 600_000_000)
+
+      3.times do |i|
+        exchange.place_limit_order(
+          symbol: symbol,
+          side: 'SELL',
+          order_id: "yield_test_#{i}",
+          user_id: 'alice',
+          price: 3_000_000 + (i * 10_000),
+          quantity: 100_000_000
+        )
+      end
+
+      yielded_orders = []
+      exchange.all_orders(user_id: 'alice') { |o| yielded_orders << o }
+
+      expect(yielded_orders.size).to eq(3)
+      expect(yielded_orders.map { |o| o[:order_id] }).to contain_exactly('yield_test_0', 'yield_test_1', 'yield_test_2')
+    end
+
+    it 'returns empty array when user has no orders' do
+      orders = exchange.all_orders(user_id: 'alice')
+      expect(orders).to eq([])
+    end
+
+    it 'excludes orders that are no longer in Redis' do
+      exchange.set_balance(user_id: 'alice', asset: 'BTC', available: 600_000_000)
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'test_order', user_id: 'alice', price: 3_000_000, quantity: 100_000_000)
+
+      orders = exchange.all_orders(user_id: 'alice')
+      expect(orders.size).to eq(1)
+
+      exchange.cancel_order(order_id: 'test_order')
+      orders_after = exchange.all_orders(user_id: 'alice')
+      expect(orders_after).to eq([])
+    end
+  end
+
+  describe '#all_orders_for_market' do
+    it 'returns all orders for a user in a specific market when no block given' do
+      exchange.set_balance(user_id: 'alice', asset: 'BTC', available: 600_000_000)
+
+      3.times do |i|
+        exchange.place_limit_order(
+          symbol: symbol,
+          side: 'SELL',
+          order_id: "market_test_#{i}",
+          user_id: 'alice',
+          price: 3_000_000 + (i * 10_000),
+          quantity: 100_000_000
+        )
+      end
+
+      orders = exchange.all_orders_for_market(user_id: 'alice', symbol: symbol)
+      expect(orders.size).to eq(3)
+      expect(orders.map { |o| o[:order_id] }).to contain_exactly('market_test_0', 'market_test_1', 'market_test_2')
+    end
+
+    it 'yields each order to the block when block is given' do
+      exchange.set_balance(user_id: 'alice', asset: 'BTC', available: 600_000_000)
+
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'market_yield_1', user_id: 'alice', price: 3_000_000, quantity: 100_000_000)
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'market_yield_2', user_id: 'alice', price: 3_100_000, quantity: 100_000_000)
+
+      yielded_orders = []
+      exchange.all_orders_for_market(user_id: 'alice', symbol: symbol) { |o| yielded_orders << o }
+
+      expect(yielded_orders.size).to eq(2)
+      expect(yielded_orders.map { |o| o[:order_id] }).to contain_exactly('market_yield_1', 'market_yield_2')
+    end
+
+    it 'returns empty array when user has no orders in the market' do
+      orders = exchange.all_orders_for_market(user_id: 'alice', symbol: symbol)
+      expect(orders).to eq([])
+    end
+
+    it 'does not return orders from other markets' do
+      exchange.seed_asset(asset: 'ETH', balance_scale: 100_000_000)
+      exchange.seed_market(symbol: 'ETHUSDT', base_asset: 'ETH', quote_asset: 'USDT', price_scale: 100, quantity_scale: 100_000_000)
+
+      exchange.set_balance(user_id: 'alice', asset: 'BTC', available: 600_000_000)
+      exchange.set_balance(user_id: 'alice', asset: 'ETH', available: 500_000_000)
+
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'btc_order', user_id: 'alice', price: 3_000_000, quantity: 100_000_000)
+      exchange.place_limit_order(symbol: 'ETHUSDT', side: 'SELL', order_id: 'eth_order', user_id: 'alice', price: 2_000, quantity: 200_000_000)
+
+      btc_orders = exchange.all_orders_for_market(user_id: 'alice', symbol: symbol)
+      expect(btc_orders.size).to eq(1)
+      expect(btc_orders.first[:order_id]).to eq('btc_order')
+
+      eth_orders = exchange.all_orders_for_market(user_id: 'alice', symbol: 'ETHUSDT')
+      expect(eth_orders.size).to eq(1)
+      expect(eth_orders.first[:order_id]).to eq('eth_order')
+    end
+
+    it 'excludes orders that are no longer in Redis' do
+      exchange.set_balance(user_id: 'alice', asset: 'BTC', available: 600_000_000)
+      exchange.place_limit_order(symbol: symbol, side: 'SELL', order_id: 'market_cancel_test', user_id: 'alice', price: 3_000_000, quantity: 100_000_000)
+
+      orders = exchange.all_orders_for_market(user_id: 'alice', symbol: symbol)
+      expect(orders.size).to eq(1)
+
+      exchange.cancel_order(order_id: 'market_cancel_test')
+      orders_after = exchange.all_orders_for_market(user_id: 'alice', symbol: symbol)
+      expect(orders_after).to eq([])
+    end
+  end
+
 end
