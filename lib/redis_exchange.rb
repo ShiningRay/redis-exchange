@@ -363,20 +363,28 @@ module RedisExchange
     # @param user_id [String]
     # @param asset [String]
     # @param auto_scale [Boolean]
-    # @return [Hash] { available: Integer|Float, reserved: Integer|Float }
-    def balance(user_id:, asset:, auto_scale: false)
+    # @param include_ledger_seq [Boolean] include ledger_seq in result
+    # @return [Hash] { available: Integer|Float, reserved: Integer|Float, ledger_seq: Integer|nil }
+    def balance(user_id:, asset:, auto_scale: false, include_ledger_seq: false)
       key = "balance:#{user_id}"
       vals = @redis.hmget(key, "#{asset}:available", "#{asset}:reserved")
       available = vals[0].to_i
       reserved = vals[1].to_i
 
-      if auto_scale
-        scale = asset_config(asset)[:balance_scale] || 1
-        available = available.to_d / scale
-        reserved = reserved.to_d / scale
+      result = { available: available, reserved: reserved }
+
+      if include_ledger_seq
+        ledger_seq = @redis.get("ledger_seq:#{user_id}:#{asset}")&.to_i || 0
+        result[:ledger_seq] = ledger_seq
       end
 
-      { available: available, reserved: reserved }
+      if auto_scale
+        scale = asset_config(asset)[:balance_scale] || 1
+        result[:available] = available.to_d / scale
+        result[:reserved] = reserved.to_d / scale
+      end
+
+      result
     end
 
     # Retrieve an order snapshot by id with typed fields.

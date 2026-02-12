@@ -201,16 +201,38 @@ RSpec.describe 'Account Ledger and Balance Changes' do
 
     it 'balance: 查询单个币种余额并支持自动缩放' do
       exchange.add_funds(user_id: 'u4', asset: 'BTC', amount: 250_000_000)
-      
-      # Test without auto_scale (default)
+
+      # Test without auto_scale (default, no ledger_seq)
       b_raw = exchange.balance(user_id: 'u4', asset: 'BTC')
       expect(b_raw[:available]).to eq(250_000_000)
       expect(b_raw[:reserved]).to eq(0)
+      expect(b_raw[:ledger_seq]).to be_nil
 
       # Test with auto_scale
       b_scaled = exchange.balance(user_id: 'u4', asset: 'BTC', auto_scale: true)
       expect(b_scaled[:available]).to eq(2.5)
       expect(b_scaled[:reserved]).to eq(0.0)
+      expect(b_scaled[:ledger_seq]).to be_nil
+
+      # Test with include_ledger_seq: true
+      b_with_seq = exchange.balance(user_id: 'u4', asset: 'BTC', include_ledger_seq: true)
+      expect(b_with_seq[:available]).to eq(250_000_000)
+      expect(b_with_seq[:reserved]).to eq(0)
+      expect(b_with_seq[:ledger_seq]).to eq(1)
+    end
+
+    it 'balance: 可以选择不返回 ledger_seq' do
+      exchange.add_funds(user_id: 'u5', asset: 'BTC', amount: 100_000_000)
+
+      b_with_seq = exchange.balance(user_id: 'u5', asset: 'BTC', include_ledger_seq: true)
+      expect(b_with_seq[:available]).to eq(100_000_000)
+      expect(b_with_seq[:reserved]).to eq(0)
+      expect(b_with_seq[:ledger_seq]).to eq(1)
+
+      b_without_seq = exchange.balance(user_id: 'u5', asset: 'BTC', include_ledger_seq: false)
+      expect(b_without_seq[:available]).to eq(100_000_000)
+      expect(b_without_seq[:reserved]).to eq(0)
+      expect(b_without_seq[:ledger_seq]).to be_nil
     end
   end
 end
