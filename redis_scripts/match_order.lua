@@ -92,7 +92,7 @@ local function append_ledger(user_id, asset, action, amount, new_available, new_
   if not ledger_biz_id then
     ledger_biz_id = 'AUTO:' .. user_id .. ':' .. asset .. ':' .. action .. ':' .. tostring(seq)
   end
-  redis.call('XADD', 'account_ledger', 'MAXLEN', '~', 1000000, '*',
+  redis.call('XADD', 'account_ledger', 'MAXLEN', '~', 10000000, '*',
     'user_id', user_id,
     'asset', asset,
     'action', action,
