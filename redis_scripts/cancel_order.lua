@@ -166,13 +166,27 @@ end
 
 local balance_key = 'balance:' .. user_id
 
+-- Check if order was never executed (no trades)
+local quantity = as_number(order['quantity'])
+local trade_count = as_number(order['trade_count'] or '0')
+local is_untouched = (trade_count == 0 and remaining == quantity)
+
+-- Build biz_id with untouched flag if applicable
+local function build_biz_id(base_biz_id)
+  if is_untouched then
+    return base_biz_id .. ':UNT'
+  else
+    return base_biz_id
+  end
+end
+
 if side == 'SELL' then
   local reserved_base = as_number(order['reserved_base'])
   local release_amount = reserved_base
   if release_amount <= 0 then
     release_amount = remaining
   end
-  op_unlock(user_id, base_asset, release_amount, 'CANCEL_REFUND', nil, 'order_cancel:' .. sequence .. ':' .. order_id)
+  op_unlock(user_id, base_asset, release_amount, 'CANCEL_REFUND', nil, build_biz_id('order_cancel:' .. sequence .. ':' .. order_id))
 
   -- If we released the full reserved amount for the order, we should zero it out in the hash too,
   -- although the order is being deleted shortly. But critically, if this was a partial cancel
@@ -195,7 +209,7 @@ else
   end
   if release_amount > 0 then
     op_unlock(user_id, quote_asset, release_amount, 'CANCEL_REFUND', ts_ms,
-      'order_cancel:' .. sequence .. ':' .. order_id)
+      build_biz_id('order_cancel:' .. sequence .. ':' .. order_id))
   end
 end
 

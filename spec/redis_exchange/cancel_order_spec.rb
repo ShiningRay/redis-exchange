@@ -63,8 +63,8 @@ RSpec.describe RedisExchange::Client do
 
         expect(fields['action']).to eq('UNLOCK')
         expect(fields['reason']).to eq('CANCEL_REFUND')
-        # biz_id format: order_cancel:[market_seq]:[order_id]
-        expect(fields['biz_id']).to match(/^order_cancel:\d+:cancel-biz-1$/)
+        # biz_id format: order_cancel:[market_seq]:[order_id][:UNT] (for untouched orders)
+        expect(fields['biz_id']).to match(/^order_cancel:\d+:cancel-biz-1:UNT$/)
       end
 
       it 'cancels a resting BUY order and releases notional and maker fee reserve' do
