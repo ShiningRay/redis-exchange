@@ -404,6 +404,65 @@ res = exchange.place_limit_order(
 # => { error: 'MARKET_HALTED' }
 ```
 
+## Error Codes
+
+All error responses are returned as a Hash with an `error` key:
+
+```ruby
+{ error: 'ERROR_CODE' }
+```
+
+### System/Market Status Errors
+
+| Error Code | Description |
+|-----------|-------------|
+| `SYSTEM_MAINTENANCE` | System-wide maintenance mode enabled |
+| `MARKET_MAINTENANCE` | Market is in maintenance mode |
+| `MARKET_HALTED` | Market is halted (orders rejected, cancellations allowed) |
+| `MARKET_CLOSED` | Market is closed (orders rejected, cancellations allowed) |
+
+### Argument Validation Errors
+
+| Error Code | Description |
+|-----------|-------------|
+| `INVALID_ARGUMENTS` | Invalid number or type of arguments provided |
+| `INVALID_ORDER_TYPE` | Invalid order type (must be LIMIT or MARKET) |
+| `INVALID_SIDE` | Invalid order side (must be BUY or SELL) |
+| `INVALID_PRICE_OR_QUANTITY` | Invalid price or quantity value |
+| `INVALID_AMOUNT` | Invalid amount for balance operation |
+| `INVALID_ACTION` | Invalid balance action type |
+| `INVALID_ORDER` | Invalid order state or data |
+
+### Order Errors
+
+| Error Code | Description |
+|-----------|-------------|
+| `DUPLICATE_ORDER_ID` | Order ID already exists |
+| `UNKNOWN_MARKET` | Market configuration not found |
+
+### Asset Errors
+
+| Error Code | Description |
+|-----------|-------------|
+| `ASSET_NOT_CONFIGURED` | Asset configuration not found |
+| `ASSET_SCALE_MISMATCH` | Asset balance scale incompatible with market configuration |
+| `ASSET_SCALE_MISMATCH_WITH_NEW_CONFIG` | Asset scale mismatch during precision update |
+
+### Trading Rule Errors
+
+| Error Code | Description |
+|-----------|-------------|
+| `MIN_QTY_NOT_SATISFIED` | Order quantity below minimum required |
+| `MIN_NOTIONAL_NOT_SATISFIED` | Order notional value below minimum required |
+| `PRECISION_OVERFLOW` | Precision overflow in calculation |
+
+### Balance Errors
+
+| Error Code | Description | Additional Fields |
+|-----------|-------------|-------------------|
+| `INSUFFICIENT_FUNDS` | Insufficient funds for operation | `asset`, `bucket` |
+| `INSUFFICIENT_FUNDS_TO_REST` | Insufficient funds to place order | `asset` |
+
 ## License
 
 MIT
