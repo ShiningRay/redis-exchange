@@ -22,7 +22,9 @@ Gem::Specification.new do |spec|
       'docs/architecture.md',
       'script/maintenance/adjust_precision.rb',
       'script/export_snapshot.rb',
-      'script/export_rdb_data.sh'
+      'script/export_rdb_data.sh',
+      'script/rename_asset.rb',
+      'script/rename_market.rb'
     ]
   end
   spec.bindir        = 'exe'
