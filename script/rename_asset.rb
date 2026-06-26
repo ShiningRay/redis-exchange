@@ -33,7 +33,8 @@ options = {
   cancel_orders: false,
   skip_ledger_seq: false,
   force: false,
-  count: 1000
+  count: 1000,
+  users_file: nil
 }
 
 OptionParser.new do |opts|
@@ -63,6 +64,9 @@ OptionParser.new do |opts|
   opts.on('--count=N', Integer, 'SCAN count hint for key iteration (default: 1000)') do |v|
     options[:count] = v.positive? ? v : 1000
   end
+  opts.on('--users-file PATH', 'File containing user IDs to process (one per line); skips balance:* scan') do |v|
+    options[:users_file] = v
+  end
   opts.on('-h', '--help', 'Show this help message') do
     puts opts
     exit
@@ -76,6 +80,17 @@ abort '[rename_asset] old and new asset codes must be different' if options[:old
 old_asset = options[:old_asset]
 new_asset = options[:new_asset]
 dry_run = options[:dry_run]
+
+# Load explicit user list if provided.
+explicit_users = nil
+if options[:users_file]
+  abort "[rename_asset] Users file not found: #{options[:users_file]}" unless File.exist?(options[:users_file])
+  explicit_users = File.readlines(options[:users_file])
+                       .map(&:strip)
+                       .reject(&:empty?)
+                       .uniq
+  puts "[rename_asset] Loaded #{explicit_users.size} user(s) from #{options[:users_file]}"
+end
 
 redis = Redis.new(url: options[:redis_url])
 begin
@@ -152,31 +167,54 @@ plan = {
   ledger_seq_keys: []
 }
 
-balance_scanned = 0
-redis.scan_each(match: 'balance:*', count: options[:count]) do |key|
-  balance_scanned += 1
-  if redis.hexists(key, "#{old_asset}:available") || redis.hexists(key, "#{old_asset}:reserved")
-    user_id = key.sub('balance:', '')
-    plan[:balance_users] << user_id
+if explicit_users
+  puts '[rename_asset] Using explicit user list for balance lookup...'
+  explicit_users.each_with_index do |user_id, idx|
+    key = "balance:#{user_id}"
+    if redis.hexists(key, "#{old_asset}:available") || redis.hexists(key, "#{old_asset}:reserved")
+      plan[:balance_users] << user_id
+    end
+    if ((idx + 1) % 10_000).zero?
+      puts "[rename_asset] Checked #{idx + 1}/#{explicit_users.size} user(s), matched #{plan[:balance_users].size}..."
+    end
   end
-  if (balance_scanned % 10_000).zero?
-    puts "[rename_asset] Scanned #{balance_scanned} balance key(s), matched #{plan[:balance_users].size} user(s)..."
+  puts "[rename_asset] Checked #{explicit_users.size} user(s), matched #{plan[:balance_users].size}"
+else
+  balance_scanned = 0
+  redis.scan_each(match: 'balance:*', count: options[:count]) do |key|
+    balance_scanned += 1
+    if redis.hexists(key, "#{old_asset}:available") || redis.hexists(key, "#{old_asset}:reserved")
+      user_id = key.sub('balance:', '')
+      plan[:balance_users] << user_id
+    end
+    if (balance_scanned % 10_000).zero?
+      puts "[rename_asset] Scanned #{balance_scanned} balance key(s), matched #{plan[:balance_users].size} user(s)..."
+    end
   end
+  puts "[rename_asset] Scanned #{balance_scanned} balance key(s), matched #{plan[:balance_users].size} user(s)"
 end
-puts "[rename_asset] Scanned #{balance_scanned} balance key(s), matched #{plan[:balance_users].size} user(s)"
 
 if redis.exists?("fees:#{old_asset}")
   plan[:fee_key][:exists] = true
 end
 
-ledger_scanned = 0
 unless options[:skip_ledger_seq]
-  redis.scan_each(match: "ledger_seq:*:#{old_asset}", count: options[:count]) do |key|
-    ledger_scanned += 1
-    plan[:ledger_seq_keys] << key
+  if explicit_users
+    puts '[rename_asset] Using explicit user list for ledger_seq lookup...'
+    explicit_users.each do |user_id|
+      key = "ledger_seq:#{user_id}:#{old_asset}"
+      plan[:ledger_seq_keys] << key if redis.exists?(key)
+    end
+    puts "[rename_asset] Checked #{explicit_users.size} user(s), matched #{plan[:ledger_seq_keys].size} ledger_seq key(s)"
+  else
+    ledger_scanned = 0
+    redis.scan_each(match: "ledger_seq:*:#{old_asset}", count: options[:count]) do |key|
+      ledger_scanned += 1
+      plan[:ledger_seq_keys] << key
+    end
+    puts "[rename_asset] Scanned #{ledger_scanned} ledger_seq key(s), matched #{plan[:ledger_seq_keys].size}"
   end
 end
-puts "[rename_asset] Scanned #{ledger_scanned} ledger_seq key(s), matched #{plan[:ledger_seq_keys].size}"
 
 puts '[rename_asset] Migration plan:'
 puts "  - Asset config: asset:#{old_asset} -> asset:#{new_asset}"

@@ -3,6 +3,7 @@
 require 'spec_helper'
 require 'open3'
 require 'json'
+require 'tempfile'
 
 RSpec.describe 'script/rename_asset.rb' do
   let(:redis) { SpecRedis.factory.call }
@@ -112,6 +113,43 @@ RSpec.describe 'script/rename_asset.rb' do
 
       expect(client.order('sell-1')).to be_empty
       expect(client.asset_config('XBT')).not_to be_empty
+    end
+  end
+
+  context 'with --users-file' do
+    before do
+      client.seed_asset(asset: 'BTC', balance_scale: 100_000_000)
+      client.seed_asset(asset: 'USDT', balance_scale: 100)
+      client.seed_market(symbol: 'BTCUSDT', base_asset: 'BTC', quote_asset: 'USDT', price_scale: 100, quantity_scale: 100_000_000)
+      client.set_balance(user_id: 'alice', asset: 'BTC', available: 1_000_000, reserved: 100_000)
+      client.set_balance(user_id: 'bob', asset: 'BTC', available: 2_000_000, reserved: 0)
+      client.set_balance(user_id: 'carol', asset: 'BTC', available: 3_000_000, reserved: 0)
+      redis.set('ledger_seq:alice:BTC', 1)
+      redis.set('ledger_seq:bob:BTC', 2)
+    end
+
+    it 'processes only users listed in the file' do
+      Tempfile.create('users.txt') do |file|
+        file.puts('alice')
+        file.puts('bob')
+        file.flush
+
+        stdout, stderr, status = run_script([
+          '--old-asset', 'BTC', '--new-asset', 'XBT', '--execute', '--users-file', file.path
+        ])
+        expect(status).to be_success, "script failed: #{stdout}\n#{stderr}"
+
+        # alice and bob migrated. reserved funds with no active order are released by audit.
+        expect(redis.hget('balance:alice', 'XBT:available').to_i).to eq(1_100_000)
+        expect(redis.hget('balance:alice', 'XBT:reserved').to_i).to eq(0)
+        expect(redis.hget('balance:bob', 'XBT:available').to_i).to eq(2_000_000)
+        expect(redis.exists?('ledger_seq:alice:XBT')).to be true
+        expect(redis.exists?('ledger_seq:bob:XBT')).to be true
+
+        # carol untouched
+        expect(redis.hget('balance:carol', 'BTC:available').to_i).to eq(3_000_000)
+        expect(redis.hget('balance:carol', 'XBT:available')).to be_nil
+      end
     end
   end
 end
