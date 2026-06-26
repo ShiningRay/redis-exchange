@@ -32,7 +32,8 @@ options = {
   dry_run: true,
   cancel_orders: false,
   skip_ledger_seq: false,
-  force: false
+  force: false,
+  count: 1000
 }
 
 OptionParser.new do |opts|
@@ -58,6 +59,9 @@ OptionParser.new do |opts|
   end
   opts.on('--force', 'Allow overwriting an existing new asset config') do
     options[:force] = true
+  end
+  opts.on('--count=N', Integer, 'SCAN count hint for key iteration (default: 1000)') do |v|
+    options[:count] = v.positive? ? v : 1000
   end
   opts.on('-h', '--help', 'Show this help message') do
     puts opts
@@ -97,13 +101,16 @@ end
 
 # 3. Find markets referencing the old asset
 affected_markets = []
-redis.scan_each(match: 'market:*') do |key|
+market_scanned = 0
+redis.scan_each(match: 'market:*', count: options[:count]) do |key|
+  market_scanned += 1
   symbol = key.sub('market:', '')
   cfg = client.market_config(symbol)
   if cfg[:base_asset] == old_asset || cfg[:quote_asset] == old_asset
     affected_markets << symbol
   end
 end
+puts "[rename_asset] Scanned #{market_scanned} market key(s), found #{affected_markets.size} affected"
 
 puts "[rename_asset] Affected markets: #{affected_markets.empty? ? 'none' : affected_markets.join(', ')}"
 
@@ -145,22 +152,31 @@ plan = {
   ledger_seq_keys: []
 }
 
-redis.scan_each(match: 'balance:*') do |key|
+balance_scanned = 0
+redis.scan_each(match: 'balance:*', count: options[:count]) do |key|
+  balance_scanned += 1
   if redis.hexists(key, "#{old_asset}:available") || redis.hexists(key, "#{old_asset}:reserved")
     user_id = key.sub('balance:', '')
     plan[:balance_users] << user_id
   end
+  if (balance_scanned % 10_000).zero?
+    puts "[rename_asset] Scanned #{balance_scanned} balance key(s), matched #{plan[:balance_users].size} user(s)..."
+  end
 end
+puts "[rename_asset] Scanned #{balance_scanned} balance key(s), matched #{plan[:balance_users].size} user(s)"
 
 if redis.exists?("fees:#{old_asset}")
   plan[:fee_key][:exists] = true
 end
 
+ledger_scanned = 0
 unless options[:skip_ledger_seq]
-  redis.scan_each(match: "ledger_seq:*:#{old_asset}") do |key|
+  redis.scan_each(match: "ledger_seq:*:#{old_asset}", count: options[:count]) do |key|
+    ledger_scanned += 1
     plan[:ledger_seq_keys] << key
   end
 end
+puts "[rename_asset] Scanned #{ledger_scanned} ledger_seq key(s), matched #{plan[:ledger_seq_keys].size}"
 
 puts '[rename_asset] Migration plan:'
 puts "  - Asset config: asset:#{old_asset} -> asset:#{new_asset}"
@@ -199,7 +215,7 @@ begin
   # 6.3 Migrate user balances
   unless plan[:balance_users].empty?
     puts '[rename_asset] Migrating user balances...'
-    plan[:balance_users].each do |user_id|
+    plan[:balance_users].each_with_index do |user_id, idx|
       key = "balance:#{user_id}"
       avail = redis.hget(key, "#{old_asset}:available").to_i
       resv = redis.hget(key, "#{old_asset}:reserved").to_i
@@ -208,7 +224,12 @@ begin
         p.hset(key, "#{new_asset}:available", avail, "#{new_asset}:reserved", resv)
         p.hdel(key, "#{old_asset}:available", "#{old_asset}:reserved")
       end
+
+      if ((idx + 1) % 1000).zero?
+        puts "[rename_asset] Migrated #{idx + 1}/#{plan[:balance_users].size} user balances..."
+      end
     end
+    puts "[rename_asset] Migrated #{plan[:balance_users].size} user balance(s)"
   end
 
   # 6.4 Rename fees key
@@ -220,10 +241,14 @@ begin
   # 6.5 Rename ledger_seq keys
   unless options[:skip_ledger_seq] || plan[:ledger_seq_keys].empty?
     puts '[rename_asset] Renaming ledger_seq keys...'
-    plan[:ledger_seq_keys].each do |old_key|
+    plan[:ledger_seq_keys].each_with_index do |old_key, idx|
       new_key = old_key.sub(/:#{old_asset}$/, ":#{new_asset}")
       redis.rename(old_key, new_key)
+      if ((idx + 1) % 1000).zero?
+        puts "[rename_asset] Renamed #{idx + 1}/#{plan[:ledger_seq_keys].size} ledger_seq keys..."
+      end
     end
+    puts "[rename_asset] Renamed #{plan[:ledger_seq_keys].size} ledger_seq key(s)"
   end
 
   puts '[rename_asset] Rename complete.'
@@ -231,12 +256,16 @@ begin
   # 7. Run balance audit for affected users
   unless plan[:balance_users].empty?
     puts '[rename_asset] Running balance audit...'
-    plan[:balance_users].each do |user_id|
+    plan[:balance_users].each_with_index do |user_id, idx|
       reports = client.maintenance.audit_user_balances(user_id: user_id, fix: true)
       reports.each do |r|
         puts "  [audit] user=#{r[:user_id]} deficits=#{r[:deficits].size} fixes=#{r[:fixes].size}"
       end
+      if ((idx + 1) % 100).zero?
+        puts "[rename_asset] Audited #{idx + 1}/#{plan[:balance_users].size} user(s)..."
+      end
     end
+    puts "[rename_asset] Audited #{plan[:balance_users].size} user(s)"
   end
 ensure
   puts '[rename_asset] Disabling system maintenance mode...'

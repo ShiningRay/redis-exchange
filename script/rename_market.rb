@@ -37,7 +37,8 @@ options = {
   dry_run: true,
   cancel_orders: false,
   reset_streams: false,
-  force: false
+  force: false,
+  count: 1000
 }
 
 OptionParser.new do |opts|
@@ -63,6 +64,9 @@ OptionParser.new do |opts|
   end
   opts.on('--force', 'Allow overwriting an existing new market config') do
     options[:force] = true
+  end
+  opts.on('--count=N', Integer, 'SCAN count hint for key iteration (default: 1000)') do |v|
+    options[:count] = v.positive? ? v : 1000
   end
   opts.on('-h', '--help', 'Show this help message') do
     puts opts
@@ -125,9 +129,15 @@ end
 
 # 4. Gather user order indexes
 user_order_indexes = []
-redis.scan_each(match: "user_orders:*:#{old_symbol}") do |key|
+index_scanned = 0
+redis.scan_each(match: "user_orders:*:#{old_symbol}", count: options[:count]) do |key|
   user_order_indexes << key
+  index_scanned += 1
+  if (index_scanned % 10_000).zero?
+    puts "[rename_market] Scanned #{index_scanned} user_order index key(s), matched #{user_order_indexes.size}..."
+  end
 end
+puts "[rename_market] Scanned #{index_scanned} user_order index key(s), matched #{user_order_indexes.size}"
 
 puts "[rename_market] Migration plan:"
 puts "  - Market config: #{old_market_key} -> #{new_market_key}"
@@ -177,16 +187,19 @@ begin
     end
 
     # Clean up any orphan old queues (just in case)
-    redis.scan_each(match: "queue:#{old_symbol}:#{side}:*") do |old_queue|
+    orphan_scanned = 0
+    redis.scan_each(match: "queue:#{old_symbol}:#{side}:*", count: options[:count]) do |old_queue|
+      orphan_scanned += 1
       new_queue = old_queue.sub("queue:#{old_symbol}:#{side}:", "queue:#{new_symbol}:#{side}:")
       puts "[rename_market] Renaming orphan #{old_queue} -> #{new_queue}"
       redis.rename(old_queue, new_queue)
     end
+    puts "[rename_market] Renamed #{orphan_scanned} orphan queue key(s) on #{side}" if orphan_scanned.positive?
   end
 
   # 8. Update symbol field in all order hashes referenced by user order indexes
   migrated_orders = 0
-  user_order_indexes.each do |old_index|
+  user_order_indexes.each_with_index do |old_index, idx|
     order_ids = redis.zrange(old_index, 0, -1)
     order_ids.each do |order_id|
       order_key = "order:#{order_id}"
@@ -199,10 +212,13 @@ begin
     # Rename the index key itself. Format: user_orders:{user_id}:{symbol}
     user_id = old_index.split(':')[1]
     new_index = "user_orders:#{user_id}:#{new_symbol}"
-    puts "[rename_market] Renaming #{old_index} -> #{new_index}"
     redis.rename(old_index, new_index)
+
+    if ((idx + 1) % 1000).zero?
+      puts "[rename_market] Migrated #{idx + 1}/#{user_order_indexes.size} user order indexes..."
+    end
   end
-  puts "[rename_market] Updated #{migrated_orders} order hash(es)"
+  puts "[rename_market] Updated #{migrated_orders} order hash(es) across #{user_order_indexes.size} user index(es)"
 
   # 9. Rename or reset streams
   trades_old = "trades:#{old_symbol}"
@@ -248,12 +264,16 @@ begin
   affected_users = user_order_indexes.map { |k| k.split(':')[1] }.uniq
   unless affected_users.empty?
     puts '[rename_market] Running balance audit for affected users...'
-    affected_users.each do |user_id|
+    affected_users.each_with_index do |user_id, idx|
       reports = client.maintenance.audit_user_balances(user_id: user_id, fix: true)
       reports.each do |r|
         puts "  [audit] user=#{r[:user_id]} deficits=#{r[:deficits].size} fixes=#{r[:fixes].size}"
       end
+      if ((idx + 1) % 100).zero?
+        puts "[rename_market] Audited #{idx + 1}/#{affected_users.size} user(s)..."
+      end
     end
+    puts "[rename_market] Audited #{affected_users.size} user(s)"
   end
 ensure
   # Always try to restore new market to OPEN and old market no longer exists
