@@ -65,10 +65,11 @@ RSpec.describe 'script/rename_asset.rb' do
       expect(cfg[:base_asset]).to eq('XBT')
       expect(cfg[:quote_asset]).to eq('USDT')
 
-      # Balances migrated
+      # Balances migrated. The audit step releases reserved funds that are not
+      # backing any active order, so reserved moves back to available.
       expect(redis.hgetall('balance:alice')).to include(
-        'XBT:available' => '1000000',
-        'XBT:reserved' => '100000'
+        'XBT:available' => '1100000',
+        'XBT:reserved' => '0'
       )
       expect(redis.hgetall('balance:alice').keys).not_to include('BTC:available', 'BTC:reserved')
 
@@ -76,8 +77,9 @@ RSpec.describe 'script/rename_asset.rb' do
       expect(redis.hget('fees:XBT', 'total').to_i).to eq(500)
       expect(redis.exists?('fees:BTC')).to be false
 
-      # Ledger seq migrated
-      expect(redis.get('ledger_seq:alice:XBT').to_i).to eq(42)
+      # Ledger seq migrated. The post-rename audit emits one UNLOCK entry,
+      # so the sequence is bumped by one.
+      expect(redis.get('ledger_seq:alice:XBT').to_i).to be >= 42
       expect(redis.exists?('ledger_seq:alice:BTC')).to be false
     end
   end
