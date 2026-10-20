@@ -1,0 +1,36 @@
+{
+  "name": "redis-exchange",
+  "version": "0.2.16.4",
+  "description": "Redis-backed matching engine client (TypeScript) powered by the same Lua scripts as the redis_exchange Ruby gem",
+  "license": "MIT",
+  "homepage": "https://github.com/ShiningRay/redis-exchange",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "redis_scripts"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
