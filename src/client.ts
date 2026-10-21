@@ -1,6 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { Redis } from 'ioredis';
 import {
+  DepthStreamConsumer,
+  LedgerStreamConsumer,
+  OrderStreamConsumer,
+  TradeStreamConsumer,
+} from './consumers.js';
+import {
   ACTION_ADD,
   ACTION_LOCK,
   ACTION_SUB,
@@ -488,10 +494,10 @@ export class Client {
     });
   }
 
-  async getUserFees(userId: string): Promise<{ maker_fee_bps: number; taker_fee_bps: number } | Record<string, never>> {
+  async getUserFees(userId: string): Promise<{ maker_fee_bps: number; taker_fee_bps: number } | null> {
     if (!userId) throw new TypeError('user_id is required');
     const raw = await this.redis.hgetall(`user_fees:${userId}`);
-    if (!raw || Object.keys(raw).length === 0) return {};
+    if (!raw || Object.keys(raw).length === 0) return null;
     return {
       maker_fee_bps: Number(raw['maker_fee_bps'] ?? '0'),
       taker_fee_bps: Number(raw['taker_fee_bps'] ?? '0'),
@@ -501,6 +507,38 @@ export class Client {
   async deleteUserFees(userId: string): Promise<number> {
     if (!userId) throw new TypeError('user_id is required');
     return this.redis.del(`user_fees:${userId}`);
+  }
+
+  // ------------------------------------------------------------------
+  // Stream consumer factories (mirroring the Ruby client)
+  // ------------------------------------------------------------------
+
+  /** Trade consumer for a market; consumes the full backlog from '0'. */
+  async tradeConsumer(params: { symbol: string; group: string; consumer: string }): Promise<TradeStreamConsumer> {
+    const c = new TradeStreamConsumer({ redis: this.redis, ...params });
+    await c.ensureGroup('0');
+    return c;
+  }
+
+  /** Depth consumer for a market; starts at '$' (new entries only), matching the Ruby client. */
+  async depthConsumer(params: { symbol: string; group: string; consumer: string }): Promise<DepthStreamConsumer> {
+    const c = new DepthStreamConsumer({ redis: this.redis, ...params });
+    await c.ensureGroup('$');
+    return c;
+  }
+
+  /** Order event consumer for a market; consumes the full backlog from '0'. */
+  async orderConsumer(params: { symbol: string; group: string; consumer: string }): Promise<OrderStreamConsumer> {
+    const c = new OrderStreamConsumer({ redis: this.redis, ...params });
+    await c.ensureGroup('0');
+    return c;
+  }
+
+  /** Account ledger consumer; consumes the full backlog from '0'. */
+  async ledgerConsumer(params: { group: string; consumer: string; streamKey?: string }): Promise<LedgerStreamConsumer> {
+    const c = new LedgerStreamConsumer({ redis: this.redis, ...params });
+    await c.ensureGroup('0');
+    return c;
   }
 
   // ------------------------------------------------------------------

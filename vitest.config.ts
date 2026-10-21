@@ -5,5 +5,8 @@ export default defineConfig({
     include: ['spec-js/**/*.spec.ts'],
     testTimeout: 20_000,
     hookTimeout: 20_000,
+    // Specs share one disposable Redis database; run serially to avoid cross-test pollution.
+    pool: 'forks',
+    poolOptions: { forks: { singleFork: true } },
   },
 });
