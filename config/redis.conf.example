@@ -1,0 +1,117 @@
+# redis-exchange recommended Redis configuration
+#
+# Drop-in template for a single-primary matching engine instance.
+# See docs/redis_configuration.md for the full rationale.
+#
+# This config assumes:
+#   - Single primary + replica(s) + Sentinel (no Redis Cluster).
+#   - All exchange state lives in this instance (ledger, order book, streams).
+#   - Idempotency keys (order_tombstone:*, op_biz:*) must live for their
+#     full 24h TTL — eviction policies are NOT a substitute for capacity.
+
+################################## NETWORK #####################################
+
+bind 0.0.0.0
+port 6379
+tcp-backlog 511
+tcp-keepalive 60
+# Matching clients are long-lived; never idle-disconnect them.
+timeout 0
+
+################################# GENERAL ######################################
+
+daemonize no
+supervised auto
+loglevel notice
+databases 1
+
+################################## SECURITY ####################################
+
+# requirepass <strong-password>          # always set in production
+# rename-command FLUSHALL ""             # optional hardening
+# rename-command FLUSHDB ""
+# rename-command CONFIG "CONFIG_<random>"
+
+################################### MEMORY #####################################
+
+# Size to ~4x steady-state usage; order book and queues spike with open orders.
+maxmemory 4gb
+
+# CRITICAL: never evict. All volatile-* policies can only ever delete the two
+# idempotency key families (order_tombstone:*, op_biz:*) — they cannot free
+# memory from the real hogs (book/queue/order/balance, all no-TTL), so they
+# silently break idempotency while still OOMing. allkeys-* will directly
+# delete ledger keys. noeviction makes the failure loud and safe.
+maxmemory-policy noeviction
+
+# Eviction sampling is irrelevant under noeviction; leave default.
+# maxmemory-samples 5
+
+############################### LAZY FREE ######################################
+
+# Move memory reclamation off the main thread. Does NOT change what gets
+# deleted — orthogonal to maxmemory-policy. See docs/redis_configuration.md.
+lazyfree-lazy-eviction yes
+lazyfree-lazy-expire yes
+lazyfree-lazy-server-del yes
+lazyfree-lazy-user-del no
+lazyfree-lazy-user-flush no
+
+############################### PERSISTENCE ####################################
+
+# AOF is the source of truth: matching is multi-key Lua and only AOF
+# preserves write order for point-in-time recovery.
+appendonly yes
+appendfilename "appendonly.aof"
+appenddirname "appendonlydir"
+appendfsync everysec
+no-appendfsync-on-rewrite no
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 512mb
+aof-load-truncated yes
+aof-use-rdb-preamble yes
+aof-timestamp-enabled no
+
+# RDB is a fallback in case AOF is corrupted; never rely on it alone.
+save 900 1
+save 300 10
+save 60 10000
+stop-writes-on-bgsave-error yes
+rdbcompression yes
+rdbchecksum yes
+dbfilename dump.rdb
+
+################################# REPLICATION ##################################
+
+# On replicas:   replicaof <primary-host> <port>
+# On primary:    leave commented. Sentinel manages failover.
+# replicaof
+
+# Let replicas resync incrementally across short network blips.
+repl-backlog-size 256mb
+repl-backlog-ttl 3600
+replica-serve-stale-data yes
+replica-read-only yes
+repl-diskless-sync yes
+repl-diskless-sync-delay 5
+repl-ping-replica-period 10
+repl-timeout 60
+
+################################## LUA SCRIPTING ###############################
+
+# match_order.lua is ~1000 lines and walks the book; deep books on a busy
+# market can exceed the 5s default. Raise to give headroom.
+lua-time-limit 5000
+
+################################## SLOW LOG ####################################
+
+slowlog-log-slower-than 10000
+slowlog-max-len 1024
+
+################################## KERNEL / OS #################################
+# Not redis.conf directives — set on the host:
+#   vm.overcommit_memory = 1
+#   echo never > /sys/kernel/mm/transparent_hugepage/enabled
+#   ulimit -n 100000
+# These prevent fork() failures during BGSAVE/BGREWRITEAOF and reduce latency
+# jitter from THP.
