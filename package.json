@@ -1,0 +1,61 @@
+{
+  "name": "redis-exchange",
+  "version": "0.1.0",
+  "description": "Redis-backed matching engine client (TypeScript) powered by the same Lua scripts as the redis_exchange Ruby gem",
+  "license": "MIT",
+  "author": "ShiningRay",
+  "homepage": "https://github.com/ShiningRay/redis-exchange",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ShiningRay/redis-exchange.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ShiningRay/redis-exchange/issues"
+  },
+  "keywords": [
+    "redis",
+    "exchange",
+    "matching-engine",
+    "order-book",
+    "clob",
+    "trading",
+    "ioredis",
+    "lua"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "redis_scripts"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  }
+}

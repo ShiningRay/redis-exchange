@@ -320,7 +320,7 @@ module RedisExchange
 
     # Read market configuration.
     # @param symbol [String]
-    # @return [Hash] { base_asset:, quote_asset:, price_scale:, quantity_scale:, maker_fee_bps:, taker_fee_bps:, status: } or {}
+    # @return [Hash] full market config or {} if not found
     def market_config(symbol)
       raw = @redis.hgetall("market:#{symbol}")
       return {} if raw.empty?
@@ -333,7 +333,10 @@ module RedisExchange
         taker_fee_bps: raw.fetch('taker_fee_bps', '0').to_i,
         min_qty: raw.fetch('min_qty', '1').to_i,
         min_notional: raw.fetch('min_notional', '1').to_i,
-        status: raw.fetch('status', RedisExchange::MARKET_STATUS_OPEN)
+        status: raw.fetch('status', RedisExchange::MARKET_STATUS_OPEN),
+        trades_maxlen: raw.fetch('trades_maxlen', '1000000').to_i,
+        orders_maxlen: raw.fetch('orders_maxlen', '1000000').to_i,
+        order_tombstone_ttl_sec: raw.fetch('order_tombstone_ttl_sec', '86400').to_i
       }
     end
 

@@ -28,6 +28,49 @@ gem build redis_exchange.gemspec
 gem install redis_exchange-0.1.0.gem
 ```
 
+### TypeScript / Node.js
+
+A TypeScript client (`redis-exchange` on npm, same Lua scripts and Redis key contract) lives in this repository under `src/`:
+
+```bash
+npm install        # install deps at the repo root
+npm run build      # emit dist/
+npm test           # vitest smoke suite against a disposable Redis DB
+```
+
+```ts
+import { Client } from 'redis-exchange';
+
+const client = new Client({ redisUrl: 'redis://127.0.0.1:6379/0' });
+await client.seedMarket({ symbol: 'BTCUSDT', baseAsset: 'BTC', quoteAsset: 'USDT', priceScale: 100, quantityScale: 100_000_000 });
+await client.addFunds({ userId: 'alice', asset: 'USDT', amount: 1_000_000 });
+const result = await client.placeLimitOrder({
+  symbol: 'BTCUSDT',
+  side: 'BUY',
+  orderId: 'ord-1',
+  userId: 'alice',
+  price: 30_000 * 100,
+  quantity: 100_000_000,
+});
+```
+
+Numeric conventions match the Ruby gem exactly: amounts are integer minor units in the asset's `balance_scale`, prices/quantities use the market's `price_scale`/`quantity_scale` multipliers, and all values must stay below 9e15 to fit Lua doubles.
+
+Stream consumers are included as well, mirroring the Ruby gem's `StreamConsumer` base plus the order/trade/depth/ledger specializations:
+
+```ts
+import { Client } from 'redis-exchange';
+
+const client = new Client({ redisUrl: 'redis://127.0.0.1:6379/0' });
+const trades = await client.tradeConsumer({ symbol: 'BTCUSDT', group: 'trades-writer', consumer: `worker-${process.pid}` });
+await trades.each(
+  async (entry) => {
+    console.log(entry.id, entry.fields);
+  },
+  { autoAck: true },
+);
+```
+
 ## Usage
 
 ```ruby
