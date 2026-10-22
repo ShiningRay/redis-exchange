@@ -330,15 +330,32 @@ ruby script/random_bot.rb --concurrency 5 --iterations 1000 --audit
 
 ## Benchmarking
 
-Run the provided script to gauge Lua matching throughput. The script seeds a sell book and executes BUY market orders while reporting runtime and derived orders-per-second metrics. The benchmark requires a real Redis instance; set `--redis-url` (or `BENCH_REDIS_URL`) accordingly. **Warning:** the chosen database is flushed before each run.
+Two scripts are provided. Both need a real Redis instance and **flush the target database** on start; point them at a throwaway instance (`docker run -d -p 6390:6379 redis:8-alpine redis-server --save '' --appendonly no`).
+
+### Full suite — `script/benchmark_suite.rb`
+
+Covers the paths a real deployment exercises: book building across price levels, crossing limit orders, market orders that walk N levels, single and bulk cancellation, balance lock/unlock, book/ticker reads, a realistic mixed workload, and multi-client contention. Every scenario reports p50/p90/p99/max latency, client throughput, error codes, and the Redis command count per operation.
 
 ```bash
-# Against a specific Redis host
+ruby script/benchmark_suite.rb --redis-url=redis://127.0.0.1:6390/0 \
+  --depth=10000 --batch=2000 --levels=100 --sweep-levels=5 --sweep-ops=100 \
+  --duration=30 --clients=4 --json=tmp/bench.json
+```
+
+Run `--only=book_build,concurrent` to select scenarios, or `--help` for all flags. The script also seeds `asset:*` keys — without them every order is rejected with `ASSET_NOT_CONFIGURED` before the Lua matcher runs, and a benchmark would silently measure the rejection path.
+
+Latest measured results and analysis: [`docs/benchmarks/2026-10-23-benchmark-suite.md`](docs/benchmarks/2026-10-23-benchmark-suite.md).
+
+### Single-scenario smoke test — `script/benchmark_matching.rb`
+
+A minimal throughput probe: seeds a sell book at one price and fires BUY market orders at it.
+
+```bash
 BENCH_REDIS_URL=redis://127.0.0.1:6379/15 \
   ruby script/benchmark_matching.rb --resting=10_000 --taker=10_000 --price=3_000_000
 ```
 
-The script prints total time and computed orders/sec. Tune `--price`, `--quantity`, or `--symbol` to match your production scales.
+It prints total time and computed orders/sec, but it does **not** seed `asset:*` and does not check results, so on its own it measures the pre-flight rejection path rather than matching — use the full suite for numbers you intend to quote. Tune `--price`, `--quantity`, or `--symbol` to match your production scales.
 
 ## Numeric Precision
 
