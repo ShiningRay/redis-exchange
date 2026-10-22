@@ -357,6 +357,12 @@ BENCH_REDIS_URL=redis://127.0.0.1:6379/15 \
 
 It prints total time and computed orders/sec, but it does **not** seed `asset:*` and does not check results, so on its own it measures the pre-flight rejection path rather than matching — use the full suite for numbers you intend to quote. Tune `--price`, `--quantity`, or `--symbol` to match your production scales.
 
+### Performance notes
+
+Orders do not re-read market/asset/user-fee configuration on every call: the client caches that bundle for `DEFAULT_CONFIG_CACHE_TTL` seconds (5 by default) and every mutator (`seed_market`, `set_market_status`, `set_market_fees`, `seed_asset`, `set_user_fees`, `delete_user_fees`) invalidates it. Set the TTL to `0` to disable caching, or call `clear_config_cache!` (Ruby) / `clearConfigCache()` (TypeScript) after changing configuration outside the client. Market status is always read by the Lua script, so a `HALTED` market rejects orders immediately regardless of the TTL.
+
+Measured effect: placement +81%, matched takers +69%, `order_book` reads +300% (42 → 4 commands per snapshot). Details and methodology in [`docs/benchmarks/2026-10-23-order-path-optimization.md`](docs/benchmarks/2026-10-23-order-path-optimization.md).
+
 ## Numeric Precision
 
 Redis executes Lua with 64-bit floating point numbers. Keep scaled prices, quantities, and their product (`price * quantity`) below roughly 9e15 to avoid rounding in `math.floor` and fee calculations. Adjust `price_scale` and `quantity_scale` to respect this bound.
