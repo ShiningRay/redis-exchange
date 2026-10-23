@@ -113,6 +113,64 @@ function toInt(value: Numeric): number {
   return Math.floor(value);
 }
 
+interface OrderConfigBundle {
+  market: MarketConfig | null;
+  baseAsset: AssetConfig | null;
+  quoteAsset: AssetConfig | null;
+  userFees: { maker_fee_bps: number; taker_fee_bps: number } | null;
+}
+
+/** Parse an `asset:{code}` hash; null when the asset is not configured. */
+function parseAssetHash(raw: Record<string, string> | null | undefined): AssetConfig | null {
+  if (!raw || Object.keys(raw).length === 0) return null;
+  return {
+    balance_scale: Number(raw['balance_scale'] ?? '0'),
+    status: (raw['status'] ?? ASSET_STATUS_ACTIVE) as AssetStatus,
+  };
+}
+
+/** Parse a `user_fees:{id}` hash; null when the user has no override. */
+function parseUserFeesHash(
+  raw: Record<string, string> | null | undefined,
+): { maker_fee_bps: number; taker_fee_bps: number } | null {
+  if (!raw || Object.keys(raw).length === 0) return null;
+  return {
+    maker_fee_bps: Number(raw['maker_fee_bps'] ?? '0'),
+    taker_fee_bps: Number(raw['taker_fee_bps'] ?? '0'),
+  };
+}
+
+/**
+ * Same validation as Client#validateAssetScalesForMarket but against configs the
+ * caller already fetched, so the order path does not re-read them.
+ */
+function validateAssetScaleConfigs(params: {
+  baseCfg: AssetConfig | null;
+  quoteCfg: AssetConfig | null;
+  priceScale: Numeric;
+  quantityScale: Numeric;
+  baseAsset: string;
+  quoteAsset: string;
+}): { ok: true; base_factor: number; quote_factor: number } | LuaError {
+  const baseBs = params.baseCfg ? params.baseCfg.balance_scale : 0;
+  const quoteBs = params.quoteCfg ? params.quoteCfg.balance_scale : 0;
+  if (!(baseBs > 0 && quoteBs > 0)) {
+    const missing = !(baseBs > 0) ? params.baseAsset : params.quoteAsset;
+    return { error: 'ASSET_NOT_CONFIGURED', asset: missing };
+  }
+  const ps = toInt(params.priceScale);
+  const qs = toInt(params.quantityScale);
+  const baseFactor = Math.floor(baseBs / qs);
+  const quoteFactor = Math.floor(quoteBs / ps);
+  if (baseFactor * qs !== baseBs) {
+    return { error: 'ASSET_SCALE_MISMATCH', asset: params.baseAsset, balance_scale: baseBs, market_scale: qs };
+  }
+  if (quoteFactor * ps !== quoteBs) {
+    return { error: 'ASSET_SCALE_MISMATCH', asset: params.quoteAsset, balance_scale: quoteBs, market_scale: ps };
+  }
+  return { ok: true, base_factor: baseFactor, quote_factor: quoteFactor };
+}
+
 /**
  * TypeScript client for the Redis/Lua matching engine.
  * Mirrors RedisExchange::Client (Ruby): loads the shared redis_scripts/*.lua,
@@ -133,6 +191,60 @@ export class Client {
     this.matchOrderScript = new LuaScript(loadScriptSource('match_order.lua'));
     this.cancelOrderScript = new LuaScript(loadScriptSource('cancel_order.lua'));
     this.balanceOpScript = new LuaScript(loadScriptSource('balance_op.lua'));
+  }
+
+  /**
+   * Milliseconds a cached market/asset/user-fee bundle stays valid. Orders used
+   * to re-read that configuration on every call (four extra round trips); the
+   * hashes only change through the seed/set/delete APIs, which clear the cache
+   * immediately. Set to 0 to disable caching.
+   */
+  configCacheTtlMs = 5_000;
+
+  private readonly configCache = new Map<string, { value: OrderConfigBundle; expiresAt: number }>();
+
+  /** Drop every cached configuration entry. */
+  clearConfigCache(): void {
+    this.configCache.clear();
+  }
+
+  /**
+   * Market/asset/user-fee bundle for the order path. Cache miss costs one
+   * HGETALL for the market plus one pipelined round trip for both assets and the
+   * user's fee rates; a hit costs nothing. Unknown markets are never cached.
+   */
+  private async loadOrderConfig(symbol: string, userId: string): Promise<OrderConfigBundle> {
+    const cacheKey = `${symbol}\u0000${userId}`;
+    const now = Date.now();
+    const cached = this.configCache.get(cacheKey);
+    // A zero TTL disables both storing and serving, so a stale entry left over
+    // from an earlier setting can never be handed out.
+    if (this.configCacheTtlMs > 0 && cached && now < cached.expiresAt) return cached.value;
+
+    const market = await this.marketConfig(symbol);
+    if (!market) return { market: null, baseAsset: null, quoteAsset: null, userFees: null };
+
+    const pipe = this.redis.pipeline();
+    pipe.hgetall(`asset:${market.base_asset}`);
+    pipe.hgetall(`asset:${market.quote_asset}`);
+    pipe.hgetall(`user_fees:${userId}`);
+    const replies = (await pipe.exec()) ?? [];
+    const rawOf = (i: number): Record<string, string> | null => {
+      const entry = replies[i];
+      if (!entry || entry[0]) return null;
+      return (entry[1] as Record<string, string>) ?? null;
+    };
+
+    const value: OrderConfigBundle = {
+      market,
+      baseAsset: parseAssetHash(rawOf(0)),
+      quoteAsset: parseAssetHash(rawOf(1)),
+      userFees: parseUserFeesHash(rawOf(2)),
+    };
+    if (this.configCacheTtlMs > 0) {
+      this.configCache.set(cacheKey, { value, expiresAt: now + this.configCacheTtlMs });
+    }
+    return value;
   }
 
   // ------------------------------------------------------------------
@@ -253,7 +365,9 @@ export class Client {
     };
     if (params.tradesMaxlen !== undefined) mapping['trades_maxlen'] = String(toInt(params.tradesMaxlen));
     if (params.ordersMaxlen !== undefined) mapping['orders_maxlen'] = String(toInt(params.ordersMaxlen));
-    return this.redis.hset(`market:${params.symbol}`, mapping);
+    const written = await this.redis.hset(`market:${params.symbol}`, mapping);
+    this.clearConfigCache();
+    return written;
   }
 
   async marketExists(symbol: string): Promise<boolean> {
@@ -287,6 +401,7 @@ export class Client {
       throw new TypeError('invalid market status');
     }
     await this.redis.hset(key, 'status', stat);
+    this.clearConfigCache();
     const cfg = await this.marketConfig(symbol);
     if (!cfg) return { error: ERR_UNKNOWN_MARKET };
     return cfg;
@@ -304,6 +419,7 @@ export class Client {
     if (maker < 0 || maker > 10000) throw new TypeError('maker_fee_bps must be between 0 and 10000');
     if (taker < 0 || taker > 10000) throw new TypeError('taker_fee_bps must be between 0 and 10000');
     await this.redis.hset(key, 'maker_fee_bps', String(maker), 'taker_fee_bps', String(taker));
+    this.clearConfigCache();
     return { ok: true, symbol, maker_fee_bps: maker, taker_fee_bps: taker };
   }
 
@@ -318,10 +434,12 @@ export class Client {
     if (!(ASSET_STATUSES as readonly string[]).includes(status)) {
       throw new TypeError('invalid status');
     }
-    return this.redis.hset(`asset:${params.asset}`, {
+    const written = await this.redis.hset(`asset:${params.asset}`, {
       balance_scale: String(scale),
       status,
     });
+    this.clearConfigCache();
+    return written;
   }
 
   async assetConfig(asset: string): Promise<AssetConfig | null> {
@@ -488,10 +606,12 @@ export class Client {
     takerFeeBps: Numeric;
   }): Promise<number> {
     if (!params.userId) throw new TypeError('user_id is required');
-    return this.redis.hset(`user_fees:${params.userId}`, {
+    const written = await this.redis.hset(`user_fees:${params.userId}`, {
       maker_fee_bps: String(toInt(params.makerFeeBps)),
       taker_fee_bps: String(toInt(params.takerFeeBps)),
     });
+    this.clearConfigCache();
+    return written;
   }
 
   async getUserFees(userId: string): Promise<{ maker_fee_bps: number; taker_fee_bps: number } | null> {
@@ -506,7 +626,9 @@ export class Client {
 
   async deleteUserFees(userId: string): Promise<number> {
     if (!userId) throw new TypeError('user_id is required');
-    return this.redis.del(`user_fees:${userId}`);
+    const removed = await this.redis.del(`user_fees:${userId}`);
+    this.clearConfigCache();
+    return removed;
   }
 
   // ------------------------------------------------------------------
@@ -610,10 +732,9 @@ export class Client {
       return { error: ERR_SYSTEM_MAINTENANCE };
     }
 
-    // Duplicate order check (client layer optimization), same as the Ruby client.
-    if ((await this.redis.exists(`order:${params.orderId}`, `order_tombstone:${params.orderId}`)) > 0) {
-      return { error: 'DUPLICATE_ORDER_ID' };
-    }
+    // Duplicate ids are detected inside match_order.lua (tombstone + order hash,
+    // returning DUPLICATE_ORDER_ID). Re-checking here only added a round trip to
+    // every order, so it is deliberately not repeated client-side.
 
     const side = params.side.toUpperCase();
     if (!(SIDES as readonly string[]).includes(side)) {
@@ -635,17 +756,22 @@ export class Client {
       }
     }
 
-    const mc = await this.marketConfig(params.symbol);
+    // Market status + asset scales + user fees, served from the config cache:
+    // one pipelined round trip on a miss, zero on a hit.
+    const cfg = await this.loadOrderConfig(params.symbol, params.userId);
+    const mc = cfg.market;
     if (!mc) return { error: ERR_UNKNOWN_MARKET };
 
     const statusCheck = this.checkMarketStatus(mc);
     if (statusCheck) return statusCheck;
 
-    const scaleCheck = await this.validateAssetScalesForMarket({
-      baseAsset: mc.base_asset as string,
-      quoteAsset: mc.quote_asset as string,
+    const scaleCheck = validateAssetScaleConfigs({
+      baseCfg: cfg.baseAsset,
+      quoteCfg: cfg.quoteAsset,
       priceScale: mc.price_scale,
       quantityScale: mc.quantity_scale,
+      baseAsset: mc.base_asset as string,
+      quoteAsset: mc.quote_asset as string,
     });
     if (!('ok' in scaleCheck)) {
       const err: LuaError = { error: scaleCheck.error };
@@ -657,8 +783,7 @@ export class Client {
 
     const ts = toInt(params.timestampMs ?? Date.now());
 
-    const userFees = await this.getUserFees(params.userId);
-    const userTakerFeeBps = userFees ? String(userFees.taker_fee_bps) : '0';
+    const userTakerFeeBps = cfg.userFees ? String(cfg.userFees.taker_fee_bps) : '0';
 
     const keys = [
       `market:${params.symbol}`,

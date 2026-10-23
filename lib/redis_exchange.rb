@@ -142,6 +142,12 @@ module RedisExchange
 
   # Max integer safe for Lua double precision (approx 9e15)
   MAX_SAFE_INTEGER = 9_000_000_000_000_000
+
+  # Orders used to re-read market, asset and user-fee configuration on every
+  # request (four extra round trips per order). Those hashes only change when an
+  # admin mutates them, so the client caches them for this many seconds; every
+  # mutator in this file invalidates the cache immediately.
+  DEFAULT_CONFIG_CACHE_TTL = 5.0
 end
 
 require_relative 'redis_exchange/version'
@@ -162,6 +168,22 @@ module RedisExchange
       @balance_op_script = load_script('balance_op.lua')
       @audit_script = load_script('audit_user_balance.lua')
       @update_precision_script = load_script('update_market_precision.lua')
+
+      # Cache for market/asset/user-fee config used by the order path. Filled by
+      # #order_config, invalidated by every mutator that touches those hashes.
+      @config_cache = {}
+      @config_cache_ttl = RedisExchange::DEFAULT_CONFIG_CACHE_TTL
+    end
+
+    # Seconds a cached market/asset/user-fee entry stays valid. Set to 0 to
+    # disable caching (every order then re-reads configuration from Redis).
+    attr_accessor :config_cache_ttl
+
+    # Drop every cached configuration entry. Called by the seed/set/delete APIs;
+    # call it directly after mutating configuration outside this client.
+    def clear_config_cache!
+      @config_cache.clear
+      nil
     end
 
     # Submit a limit order and return the Redis/Lua response hash.
@@ -259,6 +281,7 @@ module RedisExchange
       mapping['trades_maxlen'] = trades_maxlen.to_i if trades_maxlen
       mapping['orders_maxlen'] = orders_maxlen.to_i if orders_maxlen
       @redis.hset(key, mapping)
+      clear_config_cache!
     end
 
     def market_exist?(symbol)
@@ -273,6 +296,7 @@ module RedisExchange
       raise ArgumentError, 'invalid market status' unless RedisExchange::MARKET_STATUSES.include?(stat)
 
       @redis.hset(key, 'status', stat)
+      clear_config_cache!
       market_config(symbol)
     end
 
@@ -286,6 +310,7 @@ module RedisExchange
       raise ArgumentError, 'taker_fee_bps must be between 0 and 10000' unless (0..10000).include?(taker_fee_bps)
 
       @redis.hset(key, 'maker_fee_bps', maker_fee_bps, 'taker_fee_bps', taker_fee_bps)
+      clear_config_cache!
       { ok: true, symbol: symbol, maker_fee_bps: maker_fee_bps, taker_fee_bps: taker_fee_bps }
     end
 
@@ -304,18 +329,14 @@ module RedisExchange
         'status' => stat
       }
       @redis.hset(key, mapping)
+      clear_config_cache!
     end
 
     # Read asset configuration.
     # @param asset [String]
     # @return [Hash] { balance_scale: Integer, status: String } or {}
     def asset_config(asset)
-      raw = @redis.hgetall("asset:#{asset}")
-      return {} if raw.empty?
-      {
-        balance_scale: raw.fetch('balance_scale', '0').to_i,
-        status: raw.fetch('status', RedisExchange::ASSET_STATUS_ACTIVE)
-      }
+      parse_asset_config(@redis.hgetall("asset:#{asset}"))
     end
 
     # Read market configuration.
@@ -670,6 +691,7 @@ module RedisExchange
 
       key = "user_fees:#{user_id}"
       @redis.hset(key, 'maker_fee_bps', maker_fee_bps.to_i, 'taker_fee_bps', taker_fee_bps.to_i)
+      clear_config_cache!
       { ok: true }
     end
 
@@ -679,14 +701,7 @@ module RedisExchange
     def get_user_fees(user_id:)
       raise ArgumentError, 'user_id is required' if user_id.nil? || user_id.to_s.empty?
 
-      key = "user_fees:#{user_id}"
-      raw = @redis.hgetall(key)
-      return {} if raw.empty?
-
-      {
-        maker_fee_bps: raw.fetch('maker_fee_bps', '0').to_i,
-        taker_fee_bps: raw.fetch('taker_fee_bps', '0').to_i
-      }
+      parse_user_fees(@redis.hgetall("user_fees:#{user_id}"))
     end
 
     # Delete user-specific trading fee rates, reverting to market defaults.
@@ -701,6 +716,7 @@ module RedisExchange
       end
 
       @redis.del(key)
+      clear_config_cache!
       { ok: true }
     end
 
@@ -1166,16 +1182,98 @@ module RedisExchange
       end
     end
 
+    # Market/asset/user-fee bundle for the order path, cached for
+    # #config_cache_ttl seconds. Cache miss costs one HGETALL for the market plus
+    # one pipelined round trip for both assets and the user's fee rates; a hit
+    # costs nothing. Unknown markets are not cached so a freshly created market
+    # is picked up immediately.
+    def order_config(symbol, user_id)
+      cache_key = "#{symbol}\u0000#{user_id}"
+      now = monotonic_seconds
+      cached = @config_cache[cache_key]
+      # A zero TTL disables both storing and serving, so a stale entry left over
+      # from an earlier setting can never be handed out.
+      if @config_cache_ttl.positive? && cached && now < cached[:expires_at]
+        return cached[:value]
+      end
+
+      mc = market_config(symbol)
+      return { market: {}, base_asset: {}, quote_asset: {}, user_fees: {} } if mc.empty?
+
+      base_raw, quote_raw, fees_raw = @redis.pipelined do |pipe|
+        pipe.hgetall("asset:#{mc[:base_asset]}")
+        pipe.hgetall("asset:#{mc[:quote_asset]}")
+        pipe.hgetall("user_fees:#{user_id}")
+      end
+
+      value = {
+        market: mc,
+        base_asset: parse_asset_config(base_raw),
+        quote_asset: parse_asset_config(quote_raw),
+        user_fees: parse_user_fees(fees_raw)
+      }
+      @config_cache[cache_key] = { value: value, expires_at: now + @config_cache_ttl } if @config_cache_ttl.positive?
+      value
+    end
+
+    def parse_asset_config(raw)
+      return {} if raw.nil? || raw.empty?
+
+      {
+        balance_scale: raw.fetch('balance_scale', '0').to_i,
+        status: raw.fetch('status', RedisExchange::ASSET_STATUS_ACTIVE)
+      }
+    end
+
+    def parse_user_fees(raw)
+      return {} if raw.nil? || raw.empty?
+
+      {
+        maker_fee_bps: raw.fetch('maker_fee_bps', '0').to_i,
+        taker_fee_bps: raw.fetch('taker_fee_bps', '0').to_i
+      }
+    end
+
+    # Same validation as #validate_asset_scales_for_market but against configs
+    # that were already fetched, so the order path does not re-read them.
+    def validate_asset_scale_configs(base_cfg:, quote_cfg:, price_scale:, quantity_scale:,
+                                     base_asset:, quote_asset:)
+      base_bs = base_cfg[:balance_scale].to_i
+      quote_bs = quote_cfg[:balance_scale].to_i
+      unless base_bs.positive? && quote_bs.positive?
+        missing = !base_bs.positive? ? base_asset : quote_asset
+        return { ok: false, error: 'ASSET_NOT_CONFIGURED', asset: missing }
+      end
+
+      ps = price_scale.to_i
+      qs = quantity_scale.to_i
+      base_factor = base_bs / qs
+      quote_factor = quote_bs / ps
+      unless (base_factor * qs) == base_bs
+        return { ok: false, error: 'ASSET_SCALE_MISMATCH', asset: base_asset,
+                 balance_scale: base_bs, market_scale: qs }
+      end
+      unless (quote_factor * ps) == quote_bs
+        return { ok: false, error: 'ASSET_SCALE_MISMATCH', asset: quote_asset,
+                 balance_scale: quote_bs, market_scale: ps }
+      end
+
+      { ok: true, base_factor: base_factor, quote_factor: quote_factor }
+    end
+
+    def monotonic_seconds
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+
     # Internal helper to execute the Lua script with typed arguments.
     def execute_order(symbol:, side:, order_type:, order_id:, user_id:, price_limit:, quantity:, timestamp_ms: nil)
       if maintenance.enabled?
         return { error: 'SYSTEM_MAINTENANCE' }
       end
 
-      # Duplicate order check (Ruby layer optimization)
-      if @redis.exists("order:#{order_id}", "order_tombstone:#{order_id}") > 0
-        return { error: 'DUPLICATE_ORDER_ID' }
-      end
+      # Duplicate id detection lives in match_order.lua (tombstone + order hash,
+      # returning DUPLICATE_ORDER_ID). Checking it again here only added a round
+      # trip to every order, so it is deliberately not repeated in Ruby.
 
       side_up = side.to_s.upcase
       raise ArgumentError, 'side must be BUY or SELL' unless RedisExchange::SIDES.include?(side_up)
@@ -1198,8 +1296,10 @@ module RedisExchange
         end
       end
 
-      # Market status pre-check: reject orders if market is HALTED or CLOSED
-      mc = market_config(symbol)
+      # Market status + asset scale + user fee checks, served from the config
+      # cache: one pipelined round trip on a miss, zero on a hit.
+      cfg = order_config(symbol, user_id)
+      mc = cfg[:market]
       return { error: 'UNKNOWN_MARKET' } if mc.empty?
 
       status_check = check_market_status(mc)
@@ -1207,11 +1307,13 @@ module RedisExchange
 
       # Asset scale compatibility pre-check: ensure asset balance scales are integer multiples
       # of market scales before invoking the Lua matcher. This surfaces friendly errors early.
-      scale_check = validate_asset_scales_for_market(
-        base_asset: mc[:base_asset],
-        quote_asset: mc[:quote_asset],
+      scale_check = validate_asset_scale_configs(
+        base_cfg: cfg[:base_asset],
+        quote_cfg: cfg[:quote_asset],
         price_scale: mc[:price_scale],
-        quantity_scale: mc[:quantity_scale]
+        quantity_scale: mc[:quantity_scale],
+        base_asset: mc[:base_asset],
+        quote_asset: mc[:quote_asset]
       )
       unless scale_check[:ok]
         err = { error: scale_check[:error] }
@@ -1225,8 +1327,7 @@ module RedisExchange
       ts = (timestamp_ms || current_millis).to_i
       
       # Load user-specific taker fee rate if configured
-      user_fees = get_user_fees(user_id: user_id)
-      user_taker_fee_bps = user_fees[:taker_fee_bps].to_s
+      user_taker_fee_bps = cfg[:user_fees][:taker_fee_bps].to_s
       
       keys = market_keys(symbol: symbol, user_id: user_id)
       script_payload = {
@@ -1392,11 +1493,14 @@ module RedisExchange
       else
         Array(raw).each_slice(2).to_a
       end
-      list = pairs.map do |member, score|
-        price_str = member.to_s
+      prices = pairs.map { |member, _score| member.to_s }
+      # One HMGET instead of one HGET per level: a 20-level book used to cost 20
+      # round trips per side, dominate the read path, and now costs one.
+      volumes = prices.empty? ? [] : Array(@redis.hmget(volume_key, *prices))
+      list = pairs.each_with_index.map do |(member, score), idx|
         {
-          price: price_str.to_i,
-          volume: @redis.hget(volume_key, price_str).to_i,
+          price: member.to_s.to_i,
+          volume: volumes[idx].to_i,
           score: score.to_f
         }
       end
