@@ -1,0 +1,54 @@
+# Publishes the gem to rubygems.org via OIDC Trusted Publishing — no API key
+# is stored anywhere. Requires a one-time "Trusted Publisher" registration on
+# rubygems.org matching: repo ShiningRay/redis-exchange, workflow release.yml,
+# environment left empty. Fire by pushing a tag: git tag v0.3.0 && git push origin v0.3.0
+
+name: RubyGems Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: read
+
+# A tag event and a manual re-run can collide; only one release per ref.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Test + Publish to rubygems.org
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC token for rubygems.org trusted publishing
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: '3.4'
+        bundler-cache: true
+    - name: Run tests
+      env:
+        SPEC_REDIS_URL: redis://localhost:6379/15
+      run: bundle exec rake
+    - name: Configure RubyGems credentials
+      # No floating tags exist for this action; pin an exact version.
+      uses: rubygems/configure-rubygems-credentials@v2.1.0
+    - name: Build and push gem
+      run: |
+        gem build redis_exchange.gemspec
+        gem push "redis_exchange-$(ruby -r ./lib/redis_exchange/version -e 'puts RedisExchange::VERSION').gem"
