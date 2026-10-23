@@ -14,7 +14,7 @@ require_relative '../lib/redis_exchange'
 # Usage:
 #   ruby script/random_bot.rb [--redis-url redis://127.0.0.1:6379/0] \
 #     [--symbol BTCUSDT] [--iterations 100] [--sleep-min 0.2] [--sleep-max 1.5] \
-#     [--users alice,bob,charlie] [--flush] [--no-seed]
+#     [--users alice,bob,charlie] [--flush] [--no-seed] [--quiet]
 #
 # Notes:
 # - Seeds BTC/USDT assets and BTCUSDT market by default unless --no-seed.
@@ -30,7 +30,8 @@ options = {
   users: %w[alice bob charlie],
   flush: false,
   seed: true,
-  color: true
+  color: true,
+  quiet: false
 }
 
 OptionParser.new do |opts|
@@ -45,6 +46,8 @@ OptionParser.new do |opts|
   opts.on('--no-seed', 'Do not seed assets/market') { options[:seed] = false }
   # 新增选项：禁用彩色输出
   opts.on('--no-color', 'Disable colored output') { options[:color] = false }
+  # 新增选项：静默模式（仅输出 INIT/AUDIT/ERROR 等关键信息，适合 CI）
+  opts.on('--quiet', 'Suppress per-operation output (CI friendly)') { options[:quiet] = true }
   # 新增选项：显示合并深度
   opts.on('--merge-depth [BUCKET_SIZE]', Integer, 'Show merged depth with specified bucket size') { |v| options[:merge_depth] = v || 1000 }
   # 新增选项：运行结束后执行余额审计
@@ -65,6 +68,8 @@ raise ArgumentError, 'sleep-max must be >= sleep-min' if options[:sleep_max] < o
 
 # 彩色输出开关（TTY 且未禁用时启用）
 $color_enabled = options[:color] && $stdout.isatty
+# 静默模式开关（CI 下减少日志量）
+$quiet_enabled = options[:quiet]
 
 # 彩色输出辅助方法（需在首次使用前定义）
 COLORS = {
@@ -85,6 +90,11 @@ def c(str, *styles)
   "#{codes}#{str}#{COLORS[:reset]}"
 end
 
+def log(str)
+  return if $quiet_enabled
+  puts str
+end
+
 # Main setup (single threaded)
 redis_main = Redis.new(url: options[:redis_url])
 exchange_main = RedisExchange::Client.new(redis: redis_main)
@@ -103,7 +113,7 @@ QUANTITY_SCALE = 100_000_000
 audit_baseline_balances = {}
 audit_baseline_id = '0-0'
 
-if options[:audit_interval]
+if options[:audit_interval] || options[:audit]
   puts "#{c('[AUDIT]', :cyan)} Initializing baseline snapshot..."
   # Capture initial state for replay audit
   audit_baseline_balances = exchange_main.maintenance.snapshot_balances
@@ -168,11 +178,11 @@ if options[:seed]
     # Deposit some USDT: between 5_000 and 50_000
     usdt_amount = (5_000 + rand(0..45_000)) * ASSET_SCALES['USDT']
     res1 = exchange_main.add_funds(user_id: u, asset: 'USDT', amount: usdt_amount)
-    puts "#{c('[DEPOSIT]', :green)} user=#{u} asset=USDT amount=#{format_asset_amount('USDT', usdt_amount)} => #{JSON.pretty_generate(res1)}"
+    log "#{c('[DEPOSIT]', :green)} user=#{u} asset=USDT amount=#{format_asset_amount('USDT', usdt_amount)} => #{JSON.pretty_generate(res1)}"
     # Deposit some BTC: between 0.05 and 0.5 BTC
     btc_amount = (5 + rand(0..45)) * (ASSET_SCALES['BTC'] / 100) # 0.05..0.5 BTC in minor units
     res2 = exchange_main.add_funds(user_id: u, asset: 'BTC', amount: btc_amount)
-    puts "#{c('[DEPOSIT]', :green)} user=#{u} asset=BTC amount=#{format_asset_amount('BTC', btc_amount)} => #{JSON.pretty_generate(res2)}"
+    log "#{c('[DEPOSIT]', :green)} user=#{u} asset=BTC amount=#{format_asset_amount('BTC', btc_amount)} => #{JSON.pretty_generate(res2)}"
   end
 end
 
@@ -183,6 +193,22 @@ if options[:merge_depth]
 end
 
 # Balance Conservation Audit Helper
+
+# Read an entire stream with cursor pagination; a bare `count:` cap would
+# silently truncate and skew audit totals on dense runs (ledger can exceed 10k).
+def scan_stream_all(redis, key, batch_size: 1000)
+  entries = []
+  last_id = '-'
+  loop do
+    batch = redis.xrange(key, last_id == '-' ? '-' : "(#{last_id}", '+', count: batch_size)
+    break if batch.empty?
+    entries.concat(batch)
+    last_id = batch.last[0]
+    break if batch.size < batch_size
+  end
+  entries
+end
+
 def run_balance_conservation_audit(redis, exchange, symbol, initial_balances, assets, initial_ledger_id)
   puts "#{c('[AUDIT]', :cyan, :bold)} Running balance conservation check..."
   puts
@@ -215,7 +241,7 @@ def run_balance_conservation_audit(redis, exchange, symbol, initial_balances, as
   
   # Use XRANGE to get all entries from the trade stream
   # XRANGE returns entries in chronological order
-  trade_entries = redis.xrange(trade_stream_key, '-', '+', count: 10000)
+  trade_entries = scan_stream_all(redis, trade_stream_key)
   
   # Get quote asset from market config
   market_config = redis.hgetall("market:#{symbol}")
@@ -258,17 +284,17 @@ def run_balance_conservation_audit(redis, exchange, symbol, initial_balances, as
   external_withdrawals = {}
   
   # Use XRANGE to get ledger entries after initial ledger ID
-  ledger_entries = redis.xrange('account_ledger', '-', '+', count: 10000)
+  ledger_entries = scan_stream_all(redis, 'account_ledger')
   
   processed_count = 0
   skipped_count = 0
+  initial_parts = initial_ledger_id.split('-').map(&:to_i)
   ledger_entries.each do |entry_id, fields|
-    # Skip entries that were already accounted for in initial balances
-    # We compare to timestamp part of the ID (second number in "timestamp-sequence")
-    entry_timestamp = entry_id.split('-').first.to_i
-    initial_timestamp = initial_ledger_id.split('-').first.to_i
-    
-    if entry_timestamp <= initial_timestamp
+    # Skip entries that were already accounted for in initial balances.
+    # Compare full stream IDs (ms-seq) so same-second entries are judged exactly.
+    entry_parts = entry_id.split('-').map(&:to_i)
+
+    if (entry_parts <=> initial_parts) <= 0
       skipped_count += 1
       next
     end
@@ -427,6 +453,7 @@ end
 
 # Helper: pretty print trade results
 def print_trade_results(ts, res, thread_id)
+  return if $quiet_enabled
   return if res.nil?
   return if res[:error]
   status = res[:status].to_s
@@ -434,7 +461,7 @@ def print_trade_results(ts, res, thread_id)
 
   trades = Array(res[:trades])
   prefix = "[#{ts}] [T#{thread_id}]"
-  
+
   if trades.empty?
     puts "#{prefix} #{c('TRADES', :yellow)} none (executed_quantity=#{format_quantity(res[:executed_quantity] || 0)})"
     return
@@ -580,10 +607,10 @@ run_worker = lambda do |thread_id, iterations, shared_options|
           quantity: quantity
         )
         local_placed_order_ids << order_id if res[:status] == 'OPEN' || res[:status] == 'PARTIALLY_FILLED'
-        puts "#{prefix} #{c('LIMIT', :blue)} #{c(side, (side == 'BUY' ? :green : :red))} user=#{user} price=#{format_price(price)} qty=#{format_quantity(quantity)} id=#{order_id} => #{JSON.pretty_generate(res)}"
+        log "#{prefix} #{c('LIMIT', :blue)} #{c(side, (side == 'BUY' ? :green : :red))} user=#{user} price=#{format_price(price)} qty=#{format_quantity(quantity)} id=#{order_id} => #{JSON.pretty_generate(res)}"
         print_trade_results(ts, res, thread_id)
-        
-        if %w[OPEN PARTIALLY_FILLED FILLED].include?(res[:status].to_s)
+
+        if !$quiet_enabled && %w[OPEN PARTIALLY_FILLED FILLED].include?(res[:status].to_s)
           if shared_options[:merge_depth]
             print_merged_order_book(ts, local_exchange, shared_options[:symbol], bucket_size: shared_options[:merge_depth], depth_limit: 10)
           else
@@ -606,10 +633,10 @@ run_worker = lambda do |thread_id, iterations, shared_options|
           price_cap: price_cap
         )
         cap_str = price_cap.to_i > 0 ? format_price(price_cap) : 'none'
-        puts "#{prefix} #{c('MARKET', :blue)} #{c(side, (side == 'BUY' ? :green : :red))} user=#{user} qty=#{format_quantity(quantity)} cap=#{cap_str} id=#{order_id} => #{JSON.pretty_generate(res)}"
+        log "#{prefix} #{c('MARKET', :blue)} #{c(side, (side == 'BUY' ? :green : :red))} user=#{user} qty=#{format_quantity(quantity)} cap=#{cap_str} id=#{order_id} => #{JSON.pretty_generate(res)}"
         print_trade_results(ts, res, thread_id)
 
-        if %w[OPEN PARTIALLY_FILLED FILLED].include?(res[:status].to_s)
+        if !$quiet_enabled && %w[OPEN PARTIALLY_FILLED FILLED].include?(res[:status].to_s)
           if shared_options[:merge_depth]
             print_merged_order_book(ts, local_exchange, shared_options[:symbol], bucket_size: shared_options[:merge_depth], depth_limit: 10)
           else
@@ -621,21 +648,21 @@ run_worker = lambda do |thread_id, iterations, shared_options|
         asset = %w[USDT BTC].sample
         amount = asset == 'USDT' ? rand_usdt_amount.call : rand_btc_amount.call
         res = local_exchange.add_funds(user_id: user, asset: asset, amount: amount)
-        puts "#{prefix} #{c('DEPOSIT', :green)} user=#{user} asset=#{asset} amount=#{format_asset_amount(asset, amount)} => #{JSON.pretty_generate(res)}"
+        log "#{prefix} #{c('DEPOSIT', :green)} user=#{user} asset=#{asset} amount=#{format_asset_amount(asset, amount)} => #{JSON.pretty_generate(res)}"
         
       when :sub_funds
         asset = %w[USDT BTC].sample
         amount = asset == 'USDT' ? rand_usdt_amount.call : rand_btc_amount.call
         res = local_exchange.sub_funds(user_id: user, asset: asset, amount: amount)
-        puts "#{prefix} #{c('WITHDRAW', :magenta)} user=#{user} asset=#{asset} amount=#{format_asset_amount(asset, amount)} => #{JSON.pretty_generate(res)}"
+        log "#{prefix} #{c('WITHDRAW', :magenta)} user=#{user} asset=#{asset} amount=#{format_asset_amount(asset, amount)} => #{JSON.pretty_generate(res)}"
         
       when :cancel_one
         if local_placed_order_ids.empty?
-          puts "#{prefix} #{c('CANCEL', :yellow)} skip (no known resting orders)"
+          log "#{prefix} #{c('CANCEL', :yellow)} skip (no known resting orders)"
         else
           target = local_placed_order_ids.sample
           res = local_exchange.cancel_order(target)
-          puts "#{prefix} #{c('CANCEL', :yellow)} id=#{target} => #{JSON.pretty_generate(res)}"
+          log "#{prefix} #{c('CANCEL', :yellow)} id=#{target} => #{JSON.pretty_generate(res)}"
           if res[:status] == 'CANCELLED' || res[:error] == 'NOT_FOUND'
             local_placed_order_ids.delete(target)
           end
@@ -697,14 +724,15 @@ threads.each(&:join)
 if options[:audit]
   puts
   puts c('[AUDIT]', :cyan, :bold) + " Starting post-run ledger replay check..."
-  
+  audit_failures = 0
+
   # 1. Capture current end state
   current_last_entry = redis_main.xrevrange('account_ledger', '+', '-', count: 1).first
   current_end_id = current_last_entry ? current_last_entry[0] : '0-0'
-  
+
   # 2. Capture current actual balances
   current_actual_balances = exchange_main.maintenance.snapshot_balances
-  
+
   # 3. Run replay
   audit_res = exchange_main.maintenance.replay_ledger_audit(
     initial_balances: audit_baseline_balances,
@@ -712,10 +740,11 @@ if options[:audit]
     end_id: current_end_id,
     actual_balances: current_actual_balances
   )
-  
+
   if audit_res[:success]
     puts "#{c('✅', :green)} Ledger replay check passed! (Range: #{audit_baseline_id} -> #{current_end_id})"
   else
+    audit_failures += 1
     puts "#{c('❌', :red)} Ledger replay check FAILED!"
     audit_res[:discrepancies].each do |d|
       puts "  User #{d[:user_id]} #{d[:asset]} #{d[:bucket]}: Expected #{d[:expected]}, Actual #{d[:actual]}"
@@ -754,11 +783,15 @@ if options[:audit]
       end
     end
   rescue => e
+    audit_failures += 1
     puts "#{c('❌', :red)} Audit failed: #{e.message}"
   end
 
   puts
-  run_balance_conservation_audit(redis_main, exchange_main, options[:symbol], initial_balances_by_asset, ASSET_SCALES.keys, initial_ledger_id)
+  conservation_res = run_balance_conservation_audit(redis_main, exchange_main, options[:symbol], initial_balances_by_asset, ASSET_SCALES.keys, initial_ledger_id)
+  audit_failures += 1 unless conservation_res && conservation_res[:success]
+
+  exit 1 if audit_failures.positive?
 end
 
 puts c('[DONE]', :green)
