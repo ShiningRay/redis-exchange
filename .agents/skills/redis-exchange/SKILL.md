@@ -12,7 +12,7 @@ description: >-
 
 Redis 单实例上的中央限价订单簿（CLOB）+ 双桶（available/reserved）账户系统。
 全部撮合与资金变动在 Lua 脚本内原子完成；Ruby `RedisExchange::Client` 是薄封装，只做预检与查询。
-gem `redis_exchange` 0.2.16.x；Ruby >= 3.0（仓内 .ruby-version 3.4.5）；redis-rb >= 5；Redis >= 6。
+gem `redis_exchange` 0.2.16.x；Ruby >= 3.0（CI 验 3.2/3.4/4.0，仓内 .ruby-version 4.0.7）；redis-rb >= 5；Redis >= 6。
 
 ## 代码地图
 

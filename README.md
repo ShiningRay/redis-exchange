@@ -15,6 +15,8 @@ Redis Exchange is a Ruby gem that bundles a Redis-backed central limit order boo
 
 ## Installation
 
+**Requirements:** Ruby >= 3.0 (CI verifies 3.2, 3.4 and 4.0), Redis >= 6.
+
 Add this line to your application's `Gemfile`:
 
 ```ruby
@@ -317,13 +319,19 @@ ruby script/random_bot.rb
 # Run heavily concurrent load (5 threads, 1000 iterations each) with final audit
 ruby script/random_bot.rb --concurrency 5 --iterations 1000 --audit
 
+# CI shape: dense ops without sleeps, quiet logs; exits non-zero if any audit fails
+ruby script/random_bot.rb --flush --concurrency 5 --iterations 1000 \
+  --sleep-min 0 --sleep-max 0 --quiet --audit
+
 # Options:
 #   --redis-url URL       Redis connection string
 #   --symbol SYMBOL       Market symbol (default: BTCUSDT)
 #   --iterations N        Number of operations per thread
 #   --concurrency N       Number of concurrent worker threads
-#   --audit               Run full balance audit and ledger replay check after completion
+#   --audit               Run full balance audit and ledger replay check after completion;
+#                         exits with status 1 if any check fails
 #   --audit-interval N    (Single-thread only) Run partial replay audit every N operations
+#   --quiet               Suppress per-operation output (INIT/AUDIT/ERROR only)
 #   --no-seed             Skip initial asset/market seeding
 #   --flush               Flush DB before starting
 ```

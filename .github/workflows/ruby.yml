@@ -31,8 +31,9 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     strategy:
+      fail-fast: false
       matrix:
-        ruby-version: ['3.2']
+        ruby-version: ['3.2', '3.4', '4.0']
 
     steps:
     - uses: actions/checkout@v4
@@ -56,3 +57,41 @@ jobs:
       env:
         SPEC_REDIS_URL: redis://localhost:6379/15
       run: bundle exec rake
+
+  # Dense random trading operations against a real Redis, then replay the
+  # account ledger and reconcile balances. Fails the build on any discrepancy.
+  random-audit:
+    name: Random ops + ledger replay audit (ruby ${{ matrix.ruby-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby-version: ['3.2', '4.0']
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ matrix.ruby-version }}
+        bundler-cache: true # runs 'bundle install' and caches installed gems automatically
+    - name: Run dense random operations with final ledger replay audit
+      run: |
+        bundle exec ruby script/random_bot.rb \
+          --redis-url redis://localhost:6379/15 \
+          --flush \
+          --concurrency 5 \
+          --iterations 1000 \
+          --sleep-min 0 --sleep-max 0 \
+          --quiet \
+          --audit
