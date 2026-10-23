@@ -1,6 +1,6 @@
 {
   "name": "redis-exchange",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Redis-backed matching engine client (TypeScript) powered by the same Lua scripts as the redis_exchange Ruby gem",
   "license": "MIT",
   "author": "ShiningRay",
