@@ -87,7 +87,7 @@ jobs:
         bundler-cache: true # runs 'bundle install' and caches installed gems automatically
     - name: Run dense random operations with final ledger replay audit
       run: |
-        ruby script/random_bot.rb \
+        bundle exec ruby script/random_bot.rb \
           --redis-url redis://localhost:6379/15 \
           --flush \
           --concurrency 5 \
