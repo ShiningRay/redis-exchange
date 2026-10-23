@@ -13,7 +13,9 @@ Gem::Specification.new do |spec|
   spec.homepage      = 'https://github.com/ShiningRay/redis-exchange'
   spec.license       = 'MIT'
   spec.metadata["github_repo"] = "https://github.com/ShiningRay/redis-exchange"
-  spec.metadata["allowed_push_host"] = "https://rubygems.pkg.github.com/ShiningRay"
+  # No allowed_push_host: the gem publishes to both rubygems.org (release.yml)
+  # and GitHub Packages (gem-push.yml passes an explicit --host, which does not
+  # need this metadata). An allowed_push_host here would block rubygems.org.
   spec.required_ruby_version = '>= 3.0'
 
   spec.files = Dir.chdir(File.expand_path(__dir__)) do
