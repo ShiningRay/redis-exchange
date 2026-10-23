@@ -16,5 +16,5 @@ Gemfile.lock
 # Node / TypeScript
 /node_modules/
 /dist/
-/package-lock.json
+
 /vitest.config.ts.timestamp-*.mjs
