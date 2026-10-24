@@ -169,6 +169,35 @@ module RedisExchange
       }
     end
 
+    # 清理“活跃订单索引里存在、但订单哈希已不存在”的幽灵条目。
+    # 正常路径下（cancel_order / force_cancel_order / 成交）都会先 ZREM 再 DEL，
+    # 但线上确实观察到少量只留下索引条目的订单，会让客户端每次对账都拿到不存在的订单。
+    # 这里做一次幂等兜底：扫索引、批量 EXISTS、把不存在的 id 从 ZSET 移除。
+    def purge_stale_user_orders(symbol: nil, batch_size: 500)
+      pattern = symbol ? "user_orders:*:#{symbol}" : 'user_orders:*'
+      scanned = 0
+      removed = 0
+      cursor = '0'
+
+      loop do
+        cursor, keys = @redis.scan(cursor, match: pattern, count: batch_size)
+        keys.each do |key|
+          ids = @redis.zrange(key, 0, -1)
+          next if ids.empty?
+
+          exists = @redis.pipelined do |pipe|
+            ids.each { |id| pipe.exists("order:#{id}") }
+          end
+          stale = ids.each_with_index.reject { |_id, idx| exists[idx].to_i.positive? }.map(&:first)
+          scanned += ids.size
+          removed += @redis.zrem(key, stale) if stale.any?
+        end
+        break if cursor.to_s == '0'
+      end
+
+      { scanned: scanned, removed: removed }
+    end
+
     # Force cancel an order, bypassing status checks.
     # @param order_id [String]
     # @param mode [Symbol] :delete_only or :best_effort_unlock

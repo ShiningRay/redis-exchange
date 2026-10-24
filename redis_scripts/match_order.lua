@@ -1003,6 +1003,10 @@ redis.call('XADD', orders_key, 'MAXLEN', '~', orders_maxlen, '*',
 -- Delete terminal taker orders to keep memory bounded
 if order_type == 'MARKET' or order_status == 'FILLED' or order_status == 'NO_LIQUIDITY' then
   mark_tombstone(order_id, order_status)
+  -- 终态 taker 单不再活跃，必须同时从用户活跃订单索引移除。
+  -- 只 DEL 订单哈希会在这里留下永久幽灵条目：订单已不存在，
+  -- 但 user_orders 里仍在，active_orders 查询会不断返回不存在的订单。
+  redis.call('ZREM', taker_index_key, order_id)
   redis.call('DEL', order_key)
 end
 
