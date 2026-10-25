@@ -6,12 +6,13 @@ Redis Exchange is a Ruby gem that bundles a Redis-backed central limit order boo
 
 - Lua matching engine stored in `redis_scripts/match_order.lua`
 - Unified atomic balance operations (`redis_scripts/balance_op.lua`) supporting LOCK, UNLOCK, ADD, SUB
-- Atomic cancellation scripts (`redis_scripts/cancel_order.lua`) and bulk cancellations (`redis_scripts/cancel_all_orders.lua`)
+- Atomic cancellation scripts (`redis_scripts/cancel_order.lua`, `redis_scripts/force_cancel_order.lua`) and a Ruby-driven bulk canceller (`cancel_all_orders`)
 - Ruby client (`RedisExchange::Client`) for seeding markets, managing balances, submitting orders, and querying tickers
 - Comprehensive maintenance tools: balance audit, ledger replay, market precision updates
 - Per-market ticker hash exposing last trade plus top-of-book bid/ask
 - RSpec suite covering core behaviours (matching, balance ops, audits)
 - Documentation of Redis data layout in [`docs/architecture.md`](docs/architecture.md)
+- Production Redis configuration guide ([`docs/redis_configuration.md`](docs/redis_configuration.md)) and AWS ElastiCache compatibility notes ([`docs/aws_compatibility.md`](docs/aws_compatibility.md)) — ElastiCache must run with cluster mode disabled
 
 ## Installation
 

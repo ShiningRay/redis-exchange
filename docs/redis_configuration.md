@@ -131,6 +131,11 @@ If horizontal scale is ever needed, shard at the *market* level by running
 separate Redis instances per symbol group (one engine process per
 instance), not via Redis Cluster.
 
+Running on AWS? The managed-service mapping of these recommendations
+(ElastiCache parameter groups, restricted commands, failover without
+Sentinel) is covered in [aws_compatibility.md](aws_compatibility.md) —
+the same rule applies: only ElastiCache with cluster mode disabled works.
+
 ## Replication & failover
 
 - One primary, ≥1 replica, Sentinel (or equivalent) for automatic failover.
